@@ -1,7 +1,7 @@
-name: Sync upstream (clout2buy/Ares → Th3Sp3ct3R/M3TA)
+name: Sync upstream (clout2buy/Ares → Th3Sp3ct3R/AZA-app)
 
 # Pulls new commits from clout2buy/Ares (the upstream source-of-truth) and
-# opens a PR into Th3Sp3ct3R/M3TA (this fork). Direction is one-way:
+# opens a PR into Th3Sp3ct3R/AZA-app (this fork). Direction is one-way:
 # upstream never receives anything from this repo.
 #
 # Triggers:
@@ -92,7 +92,7 @@ jobs:
         run: |
           git merge --ff-only upstream/main
           git push origin main
-          echo "Fast-forwarded Th3Sp3ct3R/M3TA main to upstream/main."
+          echo "Fast-forwarded Th3Sp3ct3R/AZA-app main to upstream/main."
 
       - name: Create sync branch for diverged merge
         if: steps.ff.outputs.fast_forward == 'false' && steps.diverge.outputs.behind != '0'

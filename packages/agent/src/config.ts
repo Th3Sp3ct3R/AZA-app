@@ -46,10 +46,13 @@ export function defaultAgentConfig(home = aresAgentHome()): AresAgentConfig {
   const paths = agentPaths(home);
   return {
     slots: {
-      reasoner: { provider: "openai-oauth", model: "gpt-5.5" },
-      apply: { provider: "openai-oauth", model: "gpt-5.1-codex" },
-      summarize: { provider: "ollama-local", model: "gemma4:26b", host: "http://localhost:11434" },
-      embed: { provider: "ollama-local", model: "bge-m3", host: "http://localhost:11434", device: "cuda:1" },
+      reasoner: { provider: "custom", model: "gpt-5.5" },
+      apply: { provider: "custom", model: "gpt-5.1-codex" },
+      summarize: { provider: "custom", model: "gpt-4o-mini" },
+      // embed runs lexical-only by default (no Ollama). Vector embeddings are
+      // opt-in via ARES_AGENT_OLLAMA_RECALL=1; without it, recallForTurn uses
+      // lexicalEmbedding() and never touches localhost:11434.
+      embed: { provider: "lexical", model: "lexical" },
     },
     memory: {
       dbPath: paths.vectorsDb,
