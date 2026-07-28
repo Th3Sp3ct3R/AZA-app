@@ -36,6 +36,7 @@ export async function ensureAgentScaffold(opts: { home?: string; workspace?: str
   await mkdir(paths.memoryDir, { recursive: true });
   await mkdir(paths.transcriptsDir, { recursive: true });
   await mkdir(paths.skillsDir, { recursive: true });
+  await ensureBuiltInBrowserSkills(paths.skillsDir);
   await mkdir(paths.dreamsDir, { recursive: true });
   await loadAgentConfig(home);
 
@@ -63,6 +64,8 @@ export async function completeBootstrap(profile: BootstrapProfile, opts: { home?
   const home = aresAgentHome(opts.home);
   const paths = agentPaths(home);
   await mkdir(paths.home, { recursive: true });
+  await mkdir(paths.skillsDir, { recursive: true });
+  await ensureBuiltInBrowserSkills(paths.skillsDir);
   const born = (profile.bornAt ?? new Date()).toISOString();
   const vibe = profile.vibe.trim() || "direct";
   const values = {
@@ -153,3 +156,38 @@ function clean(value: string, fallback = "unknown"): string {
   return trimmed.length > 0 ? trimmed : fallback;
 }
 
+async function ensureBuiltInBrowserSkills(skillsDir: string): Promise<void> {
+  const skills: Record<string, string> = {
+    "browser-x": `---
+description: Safe DOM-first playbook for operating x.com with Browser
+status: active
+version: 1
+---
+# X browser playbook
+
+- Start with Browser handshake/tabs/attach; never assume a normal Chrome profile is controllable.
+- Read the accessibility tree before acting. Prefer role/name or stable selectors over pixels.
+- Use one Browser act transaction for compose/reply flows and include a final eval/tree observation.
+- Treat Reply/Post/Send as outward actions. After committing, verify the posted text is visible before any retry.
+- If the composer, passcode gate, rate limit, or closed-DM state is visible, stop and report that state; do not click-loop.
+- Never repeat an identical submit unless the owner explicitly requests it and allowRepeat is set.
+`,
+    "browser-discord": `---
+description: Safe DOM-first playbook for operating Discord web with Browser
+status: active
+version: 1
+---
+# Discord browser playbook
+
+- Attach to the intended existing Discord tab, then confirm server/channel/DM from the accessibility tree.
+- Prefer accessible names and stable selectors. Use Browser act for focus, fill, and send in one transaction.
+- Before sending, verify the recipient/channel in page state. After sending, verify the exact message appears once.
+- A disabled composer, missing message box, or closed DM is an outcome to report, not a reason to pixel-click repeatedly.
+- Do not re-send after a timeout until the message list has been inspected for the intended text.
+`,
+  };
+  for (const [name, content] of Object.entries(skills)) {
+    const file = path.join(skillsDir, name, "SKILL.md");
+    if (!(await exists(file))) await writeFileAtomic(file, content);
+  }
+}

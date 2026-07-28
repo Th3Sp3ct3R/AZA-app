@@ -86,6 +86,23 @@ test("OpenRouter: sends Bearer auth + translates tool_result to role:tool", asyn
   assert.equal(asst.tool_calls[0].function.name, "ls");
 });
 
+test("OpenRouter: forwards act-first tool forcing to the wire", async () => {
+  let body;
+  const fetchImpl = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return sse([{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }, "[DONE]"]);
+  };
+  const provider = new OpenRouterProvider({ apiKey: "k", model: "x/y", fetchImpl });
+  for await (const _ of provider.stream({
+    model: "x/y",
+    system: "",
+    messages: [],
+    tools: [{ name: "Read", description: "read", input_schema: { type: "object" } }],
+    toolChoice: "any",
+  })) { /* drain */ }
+  assert.equal(body.tool_choice, "required");
+});
+
 test("OpenRouter: replays reasoning with a valid tool-call chain", async () => {
   let captured;
   const fetchImpl = async (_url, init) => {

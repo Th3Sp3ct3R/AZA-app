@@ -17,6 +17,7 @@
   "dependencies": {
     "@ares/agent": "workspace:*",
     "@ares/channels": "workspace:*",
+    "@ares/browser-extension-connector": "workspace:*",
     "@ares/connectors": "workspace:*",
     "@ares/core": "workspace:*",
     "@ares/effects": "workspace:*",
@@ -27,6 +28,7 @@
     "@ares/tools": "workspace:*",
     "ink": "^7.0.4",
     "react": "^19.2.6",
+    "vanguard": "file:../../vendor/vanguard",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },

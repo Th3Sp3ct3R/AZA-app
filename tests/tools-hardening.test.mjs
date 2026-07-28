@@ -394,6 +394,21 @@ test("ComputerUse: ARES_COMPUTERUSE_ALLOW_TYPING=0 blocks type/key with an expla
   assert.equal(on.ok, true, "default is allowed");
 });
 
+test("ComputerUse: browser-window activation is owner-gated via ARES_COMPUTERUSE_ALLOW_BROWSER", async () => {
+  const tool = makeComputerUseTool(fakeRunner([]));
+  delete process.env.ARES_COMPUTERUSE_ALLOW_BROWSER;
+  const blocked = await tool.validateInput({ action: "activate", text: "Home / X - Google Chrome" });
+  assert.equal(blocked.ok, false, "default-closed: web content must not reach the physical mouse");
+  assert.match(blocked.message, /Desktop control of browser windows/);
+  process.env.ARES_COMPUTERUSE_ALLOW_BROWSER = "1";
+  try {
+    const allowed = await tool.validateInput({ action: "activate", text: "Home / X - Google Chrome" });
+    assert.equal(allowed.ok, true, "the owner toggle lifts the gate");
+  } finally {
+    delete process.env.ARES_COMPUTERUSE_ALLOW_BROWSER;
+  }
+});
+
 // ─── ComputerUse: keyboard audit line ────────────────────────────────────────
 
 test("ComputerUse: type carries a 'typed N chars into <window>' audit line", async () => {

@@ -79,7 +79,7 @@ export {
 } from "./ShellRegistry.js";
 export { makeBashOutputTool, type BashOutputResult } from "./BashOutput.js";
 export { makeKillShellTool, type KillShellOutput } from "./KillShell.js";
-export { McpListToolsTool, McpCallTool, HttpMcpClient, type McpListOutput, type McpCallOutput } from "./Mcp.js";
+export { McpListToolsTool, McpCallTool, HttpMcpClient, listMcpServerTools, type McpListOutput, type McpCallOutput } from "./Mcp.js";
 export { SkillsListTool, SkillReadTool, type SkillsListOutput, type SkillReadOutput, type SkillSummary } from "./Skills.js";
 export { MemoryTool, type MemoryOutput, type MemoryItem } from "./Memory.js";
 export {
@@ -87,8 +87,10 @@ export {
   makeComputerUseTool,
   mapImageToVirtual,
   shotScale,
+  normalizeActionCoords,
   type ComputerActionRunner,
   type ComputerUseOutput,
+  type RunnerInput,
   type ShotMeta,
 } from "./ComputerUse.js";
 export { DeployTool, type DeployOutput } from "./Deploy.js";

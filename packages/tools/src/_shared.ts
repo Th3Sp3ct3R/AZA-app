@@ -232,6 +232,11 @@ export function toolError(message: string): Error {
   return new Error(`<tool_use_error>${message}</tool_use_error>`);
 }
 
+/** Tool names the user clicked "Allow always" on this process run. Backs the
+ *  non-command allow_always path in adaptToolForEngine — session-scoped on
+ *  purpose (a fresh daemon starts guarded again). */
+const toolAlwaysGrants = new Set<string>();
+
 export function adaptToolForEngine(
   tool: Tool<z.ZodTypeAny, unknown>,
   enrich: (base: ToolCallContext) => RichToolContext,
@@ -258,7 +263,15 @@ export function adaptToolForEngine(
         const verdict = await tool.validateInput(parsed, rich);
         if (!verdict.ok) throw toolError(verdict.message);
       }
-      const decision = await tool.checkPermissions(parsed, rich);
+      let decision = await tool.checkPermissions(parsed, rich);
+      // "Allow always" for non-command tools (ComputerUse, Browser, …) grants
+      // the TOOL for the rest of the process. Before this, allow_always was a
+      // silent no-op for any tool without commandFor — the user clicked Always
+      // and got re-prompted on the very next action (mid-automation, moving
+      // their mouse to the dialog and wrecking the run).
+      if (decision.kind === "ask" && toolAlwaysGrants.has(tool.schema.name)) {
+        decision = { kind: "allow" };
+      }
       if (decision.kind === "deny") {
         // A policy deny ("Read the file first", "disabled in plan mode") is a
         // correctable signal — envelope it like the validation gate so the model
@@ -283,12 +296,13 @@ export function adaptToolForEngine(
         // Persist an explicit "always allow this command" so the next session
         // doesn't re-ask. Path tools self-persist inside call() via
         // resolveWorkspacePath; command tools (Bash/PowerShell) route through
-        // here. No-op when the host store is read-only or the tool isn't
-        // command-shaped — i.e. exactly the old behavior in those cases.
+        // here. Non-command tools get a process-lifetime tool-name grant.
         if (answer === "allow_always") {
           const command = tool.commandFor?.(parsed);
           if (command !== undefined) {
             await rich.commandPermissions?.grant?.(tool.schema.name, command, "always");
+          } else {
+            toolAlwaysGrants.add(tool.schema.name);
           }
         }
       }

@@ -15,8 +15,8 @@ test("trivial greetings drop to 'off' regardless of ceiling", () => {
   assert.equal(adaptiveReasoningLevel("max", "ok cool"), "off");
 });
 
-test("short single-clause asks drop one rung (max -> high)", () => {
-  assert.equal(adaptiveReasoningLevel("max", "rename this variable to userId"), "high");
+test("short single-clause asks drop one rung (max -> xhigh)", () => {
+  assert.equal(adaptiveReasoningLevel("max", "rename this variable to userId"), "xhigh");
 });
 
 test("deep-work verbs keep the full ceiling even when short", () => {

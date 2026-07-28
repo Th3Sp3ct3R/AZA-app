@@ -50,6 +50,11 @@ export { SelfEvolveTool, type SelfEvolveOutput } from "./tools/SelfEvolve.js";
 export { SkillCraftTool, type SkillCraftOutput } from "./tools/SkillCraft.js";
 export { RunSkillTool, type RunSkillOutput } from "./tools/RunSkill.js";
 export { runSkill, type RunSkillOptions, type SkillRunResult } from "./skills/runtime.js";
+export { makeSkillHubTool, type SkillHubOutput } from "./tools/SkillHub.js";
+export {
+  skillHubProbe, skillHubList, skillHubGet, skillHubPublish, installHubSkill, readLocalSkillFiles,
+  skillHubBase, type HubSkillMeta, type HubSkillFiles,
+} from "./skills/hub.js";
 export {
   emptyModel,
   loadSelfModel,

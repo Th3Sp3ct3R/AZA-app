@@ -153,13 +153,15 @@ test("subagent: out-of-workspace read bubbles a permission prompt and succeeds o
   );
 });
 
-// ── Deny: the user's "no" stops the child, with the denial named in the trail ──
-// A permission denial is a user STOP signal — the engine interrupts the turn
-// (same as the parent session) rather than letting the child route around the
-// refusal. The contract here: the child dies AS A DENIAL (visible reason in
-// its transcript for the parent's handoff), not as the no-prompt hard-fail.
+// ── Deny: the child SURVIVES the denial and reports it ──
+// A permission denial inside a child engine is an ordinary tool error the
+// model can route around — NOT a turn interrupt. One denied out-of-workspace
+// path used to kill an entire researcher fleet with "(subagent produced no
+// text output)" (bug 96ca5473). The contract now: the denial is named in the
+// child's transcript, the file never leaks, and the child still completes
+// with a summary the parent can read.
 
-test("subagent: a denied out-of-workspace read stops the child with the denial on record", async () => {
+test("subagent: a denied out-of-workspace read is recorded but does not kill the child", async () => {
   const workspace = await makeTmp("ws2");
   const outside = await makeTmp("outside2");
   const file = path.join(outside, "secret.lua");
@@ -182,7 +184,7 @@ test("subagent: a denied out-of-workspace read stops the child with the denial o
   const out = await toolEndOutput(r.transcriptPath);
   assert.match(out, /denied outside workspace/, "the tool error names the denial");
   assert.doesNotMatch(out, /no permission prompt is available/, "denial ≠ the no-prompt hard-fail");
-  assert.equal(r.status, "failed", "deny is a user stop signal — the child run ends, reason on record");
+  assert.equal(r.status, "completed", "denial is survivable — the child routes around it and still reports");
 });
 
 // ── Headless: no prompt anywhere keeps today's hard deny (no silent bypass) ──

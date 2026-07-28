@@ -1010,6 +1010,10 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
           append("verify", event.text, event.source);
         } else if (event.source === "compaction") {
           append("muted", event.text.split("\n")[0].slice(0, 120), "compaction");
+        } else if (event.source === "instructions" && /retrying|stalled|provider hiccup|switched to/i.test(event.text)) {
+          // Provider retry/stall/failover notes are the only heartbeat the user
+          // gets during dead air — swallowing them read as a frozen turn.
+          append("muted", event.text.split("\n")[0].slice(0, 120), "retry");
         }
         // Everything else (memory weave, identity anchor, foreground framing) is
         // INTERNAL prompt plumbing with zero user value. It is NOT shown — dumping

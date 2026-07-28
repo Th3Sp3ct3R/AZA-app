@@ -1,6 +1,6 @@
 // Extracted from entry.ts — providers.
 
-import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
+import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchOllamaLibraryModels, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, fetchCodexModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { type SubModelPool } from "@ares/tools";
@@ -20,6 +20,12 @@ export interface ProviderSelection {
   provider: Provider;
   model: string;
   source: string;
+  /** Canonical product-facing provider identity. Never infer this from the
+   * transport adapter: Ares and DeepSeek both deliberately reuse the hardened
+   * Anthropic wire client, but they are not Anthropic accounts. */
+  family?: TerminalProviderId;
+  /** Cheap validation run before a user-selected model is committed. */
+  preflight?: () => Promise<{ ok: true } | { ok: false; error: string }>;
   subModel?: SubModelPool;
 }
 
@@ -42,9 +48,16 @@ interface DaemonModelOption {
   capabilities?: string[];
   /** Rich prose (OpenRouter) for the discovery cards. */
   description?: string;
+  /** Structured stats for the discovery panel (the hint string keeps a packed
+   *  copy for old clients, but the UI wants real numbers). */
+  contextLength?: number;
+  pricing?: { input?: number; output?: number };
+  /** Ollama library meta: human pull count + relative updated age. */
+  pulls?: string;
+  updated?: string;
 }
 
-export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "ares", "custom", "moa", "mock"] as const;
+export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "kimi", "openrouter", "ares", "custom", "moa", "mock"] as const;
 
 // Mixture-of-Agents ensembles — pickable "models" under the `moa` provider.
 // Each reference drafts independently; the aggregator (tool-capable) synthesizes.
@@ -79,24 +92,31 @@ export const MOA_ENSEMBLES: Record<string, MoaEnsembleSpec> = {
   },
 };
 
-type TerminalProviderId = (typeof TERMINAL_PROVIDERS)[number];
+export type TerminalProviderId = (typeof TERMINAL_PROVIDERS)[number];
 
 export const ROUTE_LANES = ["chat", "coding", "research", "tool-use"] as const;
 
 const STATIC_MODEL_CATALOG: Record<"openai" | "anthropic" | "mock", DaemonModelOption[]> = {
   openai: [
-    { id: "gpt-5.5", hint: "flagship deep reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "gpt-5.5-codex", hint: "agentic coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5.1", hint: "previous flagship", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "gpt-5.1-codex", hint: "coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5", hint: "stable baseline", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5-mini", hint: "fast + cheap", group: "OpenAI", capabilities: ["tools"] },
+    // Verified working through ChatGPT Codex OAuth (probed live). Luna and the
+    // bare gpt-5.6 alias are NOT supported on a ChatGPT account (API-only), so
+    // they're omitted. The daemon also live-fetches the account's real list;
+    // this is the fallback when signed out / the endpoint is unreachable.
+    { id: "gpt-5.6-sol", label: "5.6 Sol", hint: "flagship — deepest reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.6-terra", label: "5.6 Terra", hint: "balanced — ~5.5 quality, 2× cheaper", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.5", label: "5.5", hint: "previous flagship", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.4", label: "5.4", hint: "stable baseline", group: "OpenAI", capabilities: ["tools", "reasoning"] },
+    { id: "gpt-5.4-mini", label: "5.4 Mini", hint: "fast + cheap", group: "OpenAI", capabilities: ["tools"] },
+    { id: "gpt-5.3-codex-spark", label: "5.3 Codex Spark", hint: "agentic coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
   ],
   anthropic: [
-    { id: "claude-fable-5", hint: "flagship adaptive thinking", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "claude-opus-4-8", hint: "deep reasoning workhorse · 1M context", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "claude-sonnet-4-6", hint: "balanced speed / depth", group: "Anthropic", capabilities: ["tools", "reasoning"] },
-    { id: "claude-haiku-4-5-20251001", hint: "fast + cheap", group: "Anthropic", capabilities: ["tools"] },
+    { id: "claude-fable-5", label: "Claude Fable 5", hint: "flagship · adaptive extended thinking", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "frontier Sonnet · coding + agents", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-8", label: "Claude Opus 4.8", hint: "deep reasoning workhorse · 1M context", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-7", label: "Claude Opus 4.7", hint: "prior Opus · deep reasoning", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-6", label: "Claude Opus 4.6", hint: "earlier Opus", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "balanced speed / depth", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", hint: "fastest · cheap + capable", group: "Anthropic", capabilities: ["tools", "vision"] },
   ],
   mock: [{ id: "mock-echo", hint: "offline echo provider for UI testing", group: "Mock", capabilities: [] }],
 };
@@ -269,8 +289,31 @@ export function defaultTerminalModel(provider: string, settings: UiSettings): st
 export async function daemonModelCatalog(provider: string): Promise<DaemonModelOption[]> {
   const settings = await loadUiSettings();
 
-  if (provider === "openai" || provider === "mock") {
-    return STATIC_MODEL_CATALOG[provider];
+  if (provider === "mock") {
+    return STATIC_MODEL_CATALOG.mock;
+  }
+
+  if (provider === "openai") {
+    // Ask the authenticated ChatGPT/Codex account for its REAL model list —
+    // exact ids the backend accepts, never guessed from display labels or an
+    // app-update-stale hardcoded list. Falls back to the static catalog when
+    // signed out or the endpoint is unreachable.
+    const live = await fetchCodexModels().catch(() => []);
+    if (live.length > 0) {
+      const staticHints = new Map(STATIC_MODEL_CATALOG.openai.map((m) => [m.id, m]));
+      return live.map((m) => {
+        const known = staticHints.get(m.id);
+        return {
+          id: m.id,
+          label: m.label ?? known?.label ?? m.id,
+          hint: m.description?.slice(0, 80) ?? known?.hint ?? "",
+          group: "OpenAI",
+          capabilities: known?.capabilities ?? ["tools", "reasoning", "vision"],
+          description: m.description,
+        };
+      });
+    }
+    return STATIC_MODEL_CATALOG.openai;
   }
 
   if (provider === "moa") {
@@ -321,6 +364,11 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
       ],
       // OpenRouter ships a rich blurb per model — the heart of the discovery UI.
       description: model.description?.trim() || undefined,
+      contextLength: model.contextLength || undefined,
+      pricing: {
+        input: model.promptPrice != null ? Number(model.promptPrice) * 1e6 : undefined,
+        output: model.completionPrice != null ? Number(model.completionPrice) * 1e6 : undefined,
+      },
     }));
   }
 
@@ -336,6 +384,50 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
       group: "DeepSeek",
       capabilities: ["tools", "reasoning"],
     }));
+  }
+
+  if (provider === "kimi") {
+    // Live discovery from the signed-in Kimi account (via the embedded
+    // Vanguard module, which owns the OAuth store) — surfaces the account's
+    // real roster (kimi-for-coding, k3, ...). Static row otherwise so the
+    // picker is never empty.
+    const KIMI_LABELS: Record<string, string> = {
+      "kimi-for-coding": "Kimi for Coding",
+      "kimi-for-coding-highspeed": "Kimi for Coding · Highspeed",
+      k3: "Kimi K3",
+    };
+    const kimiLabel = (id: string): string =>
+      KIMI_LABELS[id] ?? `Kimi ${id.replace(/^kimi-/u, "").replace(/\bk(\d)/u, "K$1")}`;
+    try {
+      const vanguard = await import("vanguard") as {
+        fetchKimiModels: () => Promise<ReadonlyArray<{
+          id: string; contextLength?: number; supportsReasoning?: boolean; thinkingType?: string;
+        }> | null>;
+      };
+      const live = await vanguard.fetchKimiModels().catch(() => null);
+      if (live !== null && live.length > 0) {
+        return live.map((model) => ({
+          id: model.id,
+          label: kimiLabel(model.id),
+          hint: [
+            model.supportsReasoning === false || model.thinkingType === "no" ? "fast, no extended thinking" : "agentic coding + reasoning",
+            model.contextLength !== undefined ? `${Math.round(model.contextLength / 1024)}K context` : undefined,
+          ].filter(Boolean).join(" · "),
+          group: "Kimi",
+          capabilities: model.supportsReasoning === false ? ["tools"] : ["tools", "reasoning"],
+          ...(model.contextLength !== undefined ? { contextLength: model.contextLength } : {}),
+        }));
+      }
+    } catch {
+      // vanguard module unavailable or signed out — fall through to static
+    }
+    return [{
+      id: "kimi-for-coding",
+      label: "Kimi for Coding",
+      hint: "agentic coding · 256K context",
+      group: "Kimi",
+      capabilities: ["tools", "reasoning"],
+    }];
   }
 
   if (provider === "ares") {
@@ -367,6 +459,7 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     const apiKey = settings.ollamaApiKey || process.env.OLLAMA_API_KEY || "";
     const response = await fetch("https://ollama.com/api/tags", {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(8_000),
     }).catch(() => null);
     if (response?.ok) {
       const payload = await response.json() as {
@@ -390,12 +483,38 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     }
   }
 
+  // The FULL public library (ollama.com/library) — every model, pulled or not,
+  // with the same blurb/pulls/updated meta the website shows. Degrades to
+  // nothing on network failure; never blocks the rest of the catalog.
+  const library = await fetchOllamaLibraryModels().catch(() => []);
+  for (const entry of library) {
+    if (entry.capabilities.includes("embedding")) continue; // not chat-pickable
+    const caps = [
+      ...(entry.capabilities.includes("tools") ? ["tools"] : []),
+      ...(entry.capabilities.includes("thinking") ? ["reasoning"] : []),
+      ...(entry.capabilities.includes("vision") ? ["vision"] : []),
+    ];
+    put({
+      // Cloud-hosted library models run as name:cloud; local-only ones by name
+      // (which works once pulled — the UI shows pulled state).
+      id: entry.cloud ? `${entry.name}:cloud` : entry.name,
+      label: entry.name,
+      hint: [entry.pulls ? `${entry.pulls} pulls` : "", entry.tagCount ? `${entry.tagCount} tag${entry.tagCount === 1 ? "" : "s"}` : "", entry.updated ? `updated ${entry.updated}` : ""].filter(Boolean).join(" · "),
+      group: entry.cloud ? "Ollama Library · cloud" : "Ollama Library",
+      capabilities: caps,
+      description: entry.description,
+      pulls: entry.pulls,
+      updated: entry.updated,
+    });
+  }
+
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 export function providerFamilyForSelection(selection: ProviderSelection): string {
+  if (selection.family) return selection.family;
   const fromSource = selection.source.split(":").at(-1);
-  if (fromSource && ["openai", "ollama", "anthropic", "deepseek", "openrouter", "mock"].includes(fromSource)) {
+  if (fromSource && TERMINAL_PROVIDERS.includes(fromSource as TerminalProviderId)) {
     return fromSource;
   }
   const name = selection.provider.name.toLowerCase();
@@ -403,6 +522,21 @@ export function providerFamilyForSelection(selection: ProviderSelection): string
   if (name.startsWith("ollama")) return "ollama";
   if (name.startsWith("mock")) return "mock";
   return name;
+}
+
+/** Validate a newly requested provider/model without sending conversation data.
+ * Selection is only committed after this succeeds, so a typo, expired key, or
+ * unpulled Ollama model cannot mutate the session and trigger surprise routing. */
+export async function preflightProviderSelection(selection: ProviderSelection): Promise<void> {
+  if (!selection.preflight) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${selection.family ?? "provider"} preflight timed out after 8 seconds`)), 8_000);
+  });
+  const result = await Promise.race([selection.preflight(), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+  if (!result.ok) throw new Error(result.error);
 }
 
 /** Resolve a MoA ensemble's members into concrete Providers by re-entering
@@ -430,6 +564,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: new MockEchoProvider(),
       model: requestedModel ?? "mock-echo",
       source: "explicit:mock",
+      family: "mock",
     };
   }
 
@@ -439,6 +574,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider,
       model: requestedModel ?? process.env.ARES_OPENAI_MODEL ?? settings.lastOpenAIModel ?? "gpt-5.5",
       source: explicit ? "explicit:openai" : preferred ? "settings:openai" : "auto:openai",
+      family: "openai",
     };
   }
 
@@ -449,6 +585,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: new OpenRouterProvider({ apiKey: settings.openRouterKey ?? "", model }),
       model,
       source: explicit ? "explicit:openrouter" : "settings:openrouter",
+      family: "openrouter",
     };
   }
 
@@ -469,6 +606,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       }),
       model,
       source: explicit ? "explicit:custom" : "settings:custom",
+      family: "custom",
     };
   }
 
@@ -485,6 +623,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       }),
       model,
       source: explicit ? "explicit:ares" : "settings:ares",
+      family: "ares",
     };
   }
 
@@ -496,17 +635,64 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
     // budget_tokens. x-api-key skips the OAuth identity branch (no Claude-Code
     // leak). ARES_DEEPSEEK_DIALECT=openai forces the legacy OpenAI-compat path.
     const useOpenAiDialect = process.env.ARES_DEEPSEEK_DIALECT === "openai";
+    const deepSeekKey = settings.deepSeekKey || process.env.DEEPSEEK_API_KEY || "";
     return {
       provider: useOpenAiDialect
-        ? new DeepSeekProvider({ apiKey: settings.deepSeekKey, model })
+        ? new DeepSeekProvider({ apiKey: deepSeekKey, model })
         : new AnthropicProvider({
-            apiKey: settings.deepSeekKey || undefined,
+            apiKey: deepSeekKey || undefined,
             // /anthropic is the base; the Messages API path appends like Anthropic's own.
             endpointUrl: "https://api.deepseek.com/anthropic/v1/messages",
             dialect: "deepseek",
           }),
       model,
       source: explicit ? "explicit:deepseek" : "settings:deepseek",
+      family: "deepseek",
+      preflight: async () => {
+        if (!deepSeekKey) return { ok: false, error: "DeepSeek API key is missing. Add it in Settings → API Keys." };
+        try {
+          const models = await fetchDeepSeekModels({ apiKey: deepSeekKey });
+          if (!models.some((item) => item.id === model)) {
+            return { ok: false, error: `DeepSeek model \"${model}\" is not enabled for this API key.` };
+          }
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, error: `DeepSeek connection failed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+      },
+    };
+  }
+  if (preferred === "kimi") {
+    const model = requestedModel ?? settings.lastKimiModel ?? "kimi-for-coding";
+    // Kimi's coding endpoint is plain Chat Completions with Bearer auth, so the
+    // hardened OpenAI-compat client drives it directly. Credential order: the
+    // Ares-stored key, the env key, then the subscription token minted by the
+    // Kimi OAuth sign-in (owned by the embedded Vanguard module's store).
+    let kimiCredential = settings.kimiKey || process.env.KIMI_API_KEY || "";
+    if (!kimiCredential) {
+      try {
+        const vanguard = await import("vanguard") as { resolveKimiAccessToken: () => Promise<string | null> };
+        kimiCredential = (await vanguard.resolveKimiAccessToken()) ?? "";
+      } catch {
+        // vanguard module unavailable — the empty key surfaces as no_auth
+      }
+    }
+    return {
+      provider: new OpenRouterProvider({
+        apiKey: kimiCredential,
+        model,
+        baseUrl: "https://api.kimi.com/coding/v1",
+        providerName: "kimi",
+      }),
+      model,
+      source: explicit ? "explicit:kimi" : "settings:kimi",
+      family: "kimi",
+      preflight: async () => {
+        if (!kimiCredential) {
+          return { ok: false, error: "Kimi is not connected. Sign in with Kimi in Settings → API Keys, or add a Kimi API key." };
+        }
+        return { ok: true };
+      },
     };
   }
 
@@ -518,6 +704,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: new AnthropicProvider({ apiKey: settings.anthropicKey || undefined }),
       model,
       source: explicit ? "explicit:anthropic" : "settings:anthropic",
+      family: "anthropic",
     };
   }
 
@@ -528,6 +715,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: await buildMoaProvider(ensembleName),
       model: ensembleName,
       source: explicit ? "explicit:moa" : "settings:moa",
+      family: "moa",
     };
   }
 
@@ -553,6 +741,21 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: pool.provider("reasoner"),
       model: slots.reasoner.model,
       source: explicit ? "explicit:ollama" : preferred ? "settings:ollama" : "auto:ollama",
+      family: "ollama",
+      preflight: async () => {
+        const health = await pool.health();
+        if (!health.reachable) {
+          return { ok: false, error: `Ollama is not reachable at ${health.host}. Start Ollama or check OLLAMA_HOST.` };
+        }
+        if (!health.availableModels.includes(slots.reasoner.model)) {
+          const available = health.availableModels.slice(0, 6).join(", ");
+          return {
+            ok: false,
+            error: `Ollama model \"${slots.reasoner.model}\" is not installed or available${available ? `. Available now: ${available}` : ""}. Pull it before selecting it.`,
+          };
+        }
+        return { ok: true };
+      },
       subModel: {
         apply: (req) => pool.apply(req),
         summarize: (req) => pool.summarize(req),

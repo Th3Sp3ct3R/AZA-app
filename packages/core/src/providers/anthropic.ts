@@ -31,11 +31,11 @@ import type {
   StreamEvent,
   Usage,
 } from "@ares/protocol";
-import { reasoningEnabled, thinkingBudgetTokens } from "@ares/protocol";
+import { anthropicReasoningEffort, deepSeekReasoningEffort, reasoningEnabled, thinkingBudgetTokens } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { createStallGuard, stallErrorEvent, type StallGuard } from "./stallGuard.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
-import { coerceToolArgs, sanitizeToolPairs, TOOL_ARGS_ERROR_KEY } from "./_toolPairs.js";
+import { coerceToolArgs, sanitizeToolPairs, toolResultsFirst, TOOL_ARGS_ERROR_KEY } from "./_toolPairs.js";
 import {
   resolveAnthropicAccessToken,
   ANTHROPIC_OAUTH_BETA,
@@ -54,6 +54,16 @@ export function usesAdaptiveThinking(model: string): boolean {
   // Substring match: any model id CONTAINING "fable" routes to the adaptive
   // branch (covers fable-class ids); no capability lookup.
   return /fable|claude-fable/i.test(model);
+}
+
+/** Claude families with native adaptive thinking. */
+export function usesNativeAdaptiveThinking(model: string): boolean {
+  return /(?:fable|mythos)-?5|opus-4-[678]|sonnet-(?:4-6|5)/i.test(model);
+}
+
+/** Claude families with native output_config.effort support. */
+export function supportsAnthropicEffort(model: string): boolean {
+  return /(?:fable|mythos)-?5|opus-4-[5-8]|sonnet-(?:4-6|5)/i.test(model);
 }
 
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -149,6 +159,7 @@ export class AnthropicProvider implements Provider {
     // window so a hung connection becomes a retriable error, not a freeze.
     const guard = createStallGuard(req.signal);
     let response: Response;
+    let consumedErrorText: string | undefined;
     for (;;) {
       try {
         response = await this.fetchImpl(url, {
@@ -197,13 +208,41 @@ export class AnthropicProvider implements Provider {
         body.thinking = { type: "enabled" };
         continue;
       }
+      // Cross-provider/model thinking blocks carry signatures Anthropic can't
+      // validate ("Invalid `signature` in `thinking` block") — this happens
+      // after a model/provider switch replays another engine's reasoning. Strip
+      // EVERY thinking block from history and retry once; they're the model's
+      // own scratch reasoning, never required for a correct fresh answer.
+      if (!response.ok && response.status === 400) {
+        const errText = await response.text().catch(() => "");
+        if (/signature/i.test(errText) && /thinking/i.test(errText)) {
+          let stripped = false;
+          for (const msg of (body.messages as Array<{ content?: unknown }>)) {
+            if (Array.isArray(msg.content)) {
+              const content = msg.content as Array<{ type?: string }>;
+              const kept = content.filter((b) => b.type !== "thinking");
+              if (kept.length !== content.length) {
+                msg.content = kept;
+                stripped = true;
+              }
+            }
+          }
+          if (stripped) {
+            body.thinking = undefined; // don't re-request thinking on the clean retry
+            continue;
+          }
+        }
+        // Not a signature issue (or nothing left to strip) — surface it with the
+        // text we already read (can't re-read a consumed body).
+        consumedErrorText = errText;
+      }
       break;
     }
 
     if (!response.ok) {
       // Surface the body verbatim: the engine's context-limit matcher
       // reads it ("prompt is too long"), and 529s carry overloaded_error.
-      const text = await response.text().catch(() => "");
+      const text = consumedErrorText ?? await response.text().catch(() => "");
       yield {
         type: "error",
         error: {
@@ -434,26 +473,117 @@ export class AnthropicProvider implements Provider {
 // sanitizeToolPairs lives in ./_toolPairs.js — shared with the deepseek dialect
 // and ollama's Anthropic-compat path so a fix can't miss a sibling.
 
+/** A single Anthropic wire message: role + already-mapped content blocks. */
+interface WireMessage {
+  role: "assistant" | "user";
+  content: Record<string, unknown>[];
+}
+
+/**
+ * Enforce tool-call adjacency on the FINAL wire messages — the last line of
+ * defense against the "tool_use ids without tool_result immediately after" 400
+ * that permanently bricks a session (every resend re-emits the same body). Runs
+ * on the built structure, so it catches orphans introduced AFTER
+ * sanitizeToolPairs by mapping/filtering, not just those present in the source
+ * history.
+ *
+ * A tool_use survives only if the very next message carries its tool_result; a
+ * tool_result survives only if the previous message emitted its tool_use.
+ * Anything else becomes plain text (context preserved, request valid). Messages
+ * emptied by the rewrite are dropped, and — since dropping can itself break a
+ * newly-adjacent pair — the sweep repeats until it reaches a fixed point.
+ */
+export function stripUnpairedWireToolBlocks(messages: WireMessage[]): WireMessage[] {
+  let current = messages;
+  for (let pass = 0; pass < 6; pass++) {
+    const pairedUses = new Set<Record<string, unknown>>();
+    const pairedResults = new Set<Record<string, unknown>>();
+    for (let i = 0; i < current.length - 1; i++) {
+      const source = current[i];
+      const target = current[i + 1];
+      if (source.role !== "assistant" || target.role !== "user") continue;
+      const resultsById = new Map<string, Record<string, unknown>>();
+      for (const block of target.content) {
+        if (block.type === "tool_result" && typeof block.tool_use_id === "string" && !resultsById.has(block.tool_use_id)) {
+          resultsById.set(block.tool_use_id, block);
+        }
+      }
+      const seenUses = new Set<string>();
+      for (const block of source.content) {
+        if (block.type !== "tool_use" || typeof block.id !== "string" || seenUses.has(block.id)) continue;
+        seenUses.add(block.id);
+        const result = resultsById.get(block.id);
+        if (result) {
+          pairedUses.add(block);
+          pairedResults.add(result);
+        }
+      }
+    }
+    let changed = false;
+    const rewritten = current.map((m) => {
+      const content = m.content.map((b) => {
+        if (b.type === "tool_use" && typeof b.id === "string" && !pairedUses.has(b)) {
+          changed = true;
+          return { type: "text", text: `[earlier ${String(b.name ?? "tool")} call — result not retained]` };
+        }
+        if (b.type === "tool_result" && typeof b.tool_use_id === "string" && !pairedResults.has(b)) {
+          changed = true;
+          const c = b.content;
+          const text =
+            typeof c === "string"
+              ? c
+              : Array.isArray(c)
+                ? c.map((x) => (x && typeof x === "object" && "text" in x ? String((x as { text: unknown }).text) : "[content]")).join("\n")
+                : "";
+          return { type: "text", text: `[earlier tool result]\n${text}` };
+        }
+        return b;
+      });
+      return { role: m.role, content };
+    });
+    const filtered = rewritten.filter((m) => m.content.length > 0);
+    current = filtered;
+    if (!changed) break;
+  }
+  // Ordering, not just presence: a tool_result behind a text block 400s the
+  // same way as a missing one ("tool_use ids … without tool_result blocks
+  // immediately after"). The rewrite above can itself create that shape (an
+  // orphaned result converted to text ahead of a surviving result), and
+  // poisoned histories persisted by older builds already have it — so the last
+  // touch on the wire is always results-first.
+  return current.map((m) => (m.role === "user" ? { role: m.role, content: toolResultsFirst(m.content) } : m));
+}
+
 function buildMessagesBody(
   req: ProviderRequest,
   dialect: AnthropicDialect = "anthropic",
 ): Record<string, unknown> {
   const isDeepseek = dialect === "deepseek";
   const outputAllowance = req.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  const wireMessages = sanitizeToolPairs(req.messages)
+    .map((m) => ({
+      // Anthropic accepts only user/assistant; stray system-role history
+      // (rare — the prompt rides req.system) folds into the user turn.
+      role: m.role === "assistant" ? "assistant" : ("user" as "assistant" | "user"),
+      content: m.content
+        .map((b) => toAnthropicContentBlock(b, dialect))
+        .filter((b): b is Record<string, unknown> => b !== null),
+    }))
+    .filter((m) => m.content.length > 0);
   const body: Record<string, unknown> = {
     model: req.model,
     max_tokens: outputAllowance,
     stream: true,
-    messages: sanitizeToolPairs(req.messages)
-      .map((m) => ({
-        // Anthropic accepts only user/assistant; stray system-role history
-        // (rare — the prompt rides req.system) folds into the user turn.
-        role: m.role === "assistant" ? "assistant" : "user",
-        content: m.content
-          .map((b) => toAnthropicContentBlock(b, dialect))
-          .filter((b): b is Record<string, unknown> => b !== null),
-      }))
-      .filter((m) => m.content.length > 0),
+    // Final adjacency sweep on the ACTUAL wire messages. sanitizeToolPairs runs
+    // on req.messages, but the .map/.filter above can still empty and DROP a
+    // message afterwards (e.g. an assistant turn whose only siblings were
+    // unsigned thinking blocks that map to null) — which re-orphans a tool_use
+    // sanitize had certified against the pre-filter layout. Anthropic then 400s
+    // on exactly this built body, permanently bricking the session because the
+    // poison is reintroduced after the repair on every resend. Sweeping the wire
+    // structure last guarantees what we send is valid no matter how upstream
+    // reshaped it.
+    messages: stripUnpairedWireToolBlocks(wireMessages),
   };
 
   // Reasoning dial → extended thinking. Fable-class models removed
@@ -463,7 +593,9 @@ function buildMessagesBody(
   // reasoningEnabled() (not bare truthiness) so "off" sends NO thinking block on
   // any branch — presence of the field, even enabled with a 0 budget, turns
   // thinking back on / 400s the adaptive-only models.
-  if (reasoningEnabled(req.reasoningLevel)) {
+  if (isDeepseek && req.reasoningLevel === "off") {
+    body.thinking = { type: "disabled" };
+  } else if (reasoningEnabled(req.reasoningLevel)) {
     if (isDeepseek) {
       // DeepSeek ignores budget_tokens; enable thinking and do NOT inflate
       // max_tokens (the budget branch would grow the ceiling for nothing).
@@ -478,14 +610,19 @@ function buildMessagesBody(
       if (req.reasoningPhase !== "routine") {
         body.thinking = { type: "enabled" };
       }
-    } else if (usesAdaptiveThinking(req.model)) {
-      // Fable-class models are intentionally adaptive — the API picks the depth,
-      // so the dial collapses to on/off here (the level isn't threaded in).
+      body.output_config = { effort: deepSeekReasoningEffort(req.reasoningLevel) };
+    } else if (usesNativeAdaptiveThinking(req.model)) {
+      // Current Claude families pair adaptive thinking with a real effort wire.
+      // This is the control the old desktop dial claimed to expose but never sent.
       body.thinking = { type: "adaptive" };
+      body.output_config = { effort: anthropicReasoningEffort(req.reasoningLevel, req.model) };
     } else {
       const budget = thinkingBudgetTokens(req.reasoningLevel);
       body.thinking = { type: "enabled", budget_tokens: budget };
       body.max_tokens = budget + outputAllowance;
+      if (supportsAnthropicEffort(req.model)) {
+        body.output_config = { effort: anthropicReasoningEffort(req.reasoningLevel, req.model) };
+      }
     }
   }
 

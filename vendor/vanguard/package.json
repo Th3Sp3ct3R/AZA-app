@@ -1,0 +1,17 @@
+{
+  "name": "vanguard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A clean-room, verification-first coding agent kernel. Closed source: distributed compiled, embedded via its documented engine surface.",
+  "license": "SEE LICENSE IN LICENSE",
+  "exports": {
+    ".": {
+      "types": "./engine/src/index.d.ts",
+      "import": "./engine/src/index.js"
+    }
+  },
+  "dependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

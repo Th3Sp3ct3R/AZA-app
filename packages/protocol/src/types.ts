@@ -176,6 +176,8 @@ export type TurnEvent =
   | {
       type: "turn_end";
       status: TurnEndStatus;
+      /** Coding/work truth, independent of transport completion. */
+      workStatus?: WorkStatus;
       usage: Usage;
       durationMs: number;
       /** Added by Session persistence for accurate historical attribution. */
@@ -184,6 +186,12 @@ export type TurnEvent =
     };
 
 export type TurnEndStatus = "completed" | "interrupted" | "failed";
+
+/** Outcome of the requested work, separate from transport/execution status.
+ * A turn can execute normally (`completed`) while its code remains red or has
+ * no post-edit proof. Keeping the axes separate prevents provider failover from
+ * treating an ordinary verification failure as a provider outage. */
+export type WorkStatus = "verified" | "unverified" | "blocked" | "not_applicable";
 
 // ─── Tools (schema-side; implementation lives in @ares/tools) ───────────
 

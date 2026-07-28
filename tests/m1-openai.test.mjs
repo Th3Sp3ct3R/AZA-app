@@ -252,8 +252,22 @@ test("OpenAIResponsesProvider: sends reasoning effort but not unsupported output
   }
 
   assert.equal(events.at(-1).type, "message_done");
-  assert.deepEqual(captured.body.reasoning, { effort: "high" });
+  assert.deepEqual(captured.body.reasoning, { effort: "xhigh" });
   assert.equal(Object.hasOwn(captured.body, "max_output_tokens"), false);
+});
+
+test("OpenAIResponsesProvider: forwards act-first tool forcing to the wire", async () => {
+  const sse = `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r", status: "completed", usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`;
+  const captured = {};
+  const provider = new OpenAIResponsesProvider({ auth, fetchImpl: captureFetch(sse, captured), endpointUrl: "http://x" });
+  for await (const _ of provider.stream({
+    model: "gpt-5.5",
+    system: "test",
+    messages: [{ id: "u", role: "user", content: [{ type: "text", text: "act" }], createdAt: "now" }],
+    tools: [{ name: "Read", description: "read", input_schema: { type: "object" } }],
+    toolChoice: "any",
+  })) { /* drain */ }
+  assert.equal(captured.body.tool_choice, "required");
 });
 
 test("OpenAIResponsesProvider: emits error event on HTTP failure", async () => {

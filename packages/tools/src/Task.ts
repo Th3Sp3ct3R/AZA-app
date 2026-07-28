@@ -53,6 +53,7 @@ export interface TaskOutput {
   toolCallCount: number;
   durationMs: number;
   transcriptPath: string;
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; modelCalls?: number };
 }
 
 const inputSchema = z
@@ -80,10 +81,12 @@ export function makeTaskTool(runner: SubagentRunner) {
   return buildTool({
     name: "Task",
     description: buildTaskDescription(runner),
-    // The Task wrapper itself is read-only from the parent's perspective.
-    // Child tool calls still enforce their own permissions through the
-    // scoped QueryEngine, including plan-mode write blocking.
-    safety: "read-only",
+    // General-purpose children can write the parent workspace. Classify the
+    // wrapper conservatively so the parent takes a full pre-tool checkpoint;
+    // Session diffs it afterward and promotes exact child edits into journal +
+    // verifier evidence. Read-only researchers pay a cached checkpoint, but no
+    // delegated writer can bypass parent completion proof.
+    safety: "workspace-write",
     // Parallel-safe so adjacent Task calls batch and fan out concurrently
     // (subagents are isolated engines; researcher/code-reviewer are read-only).
     // The engine now solos any tool that declares "exclusive", so this is the
@@ -144,6 +147,7 @@ export function makeTaskTool(runner: SubagentRunner) {
           toolCallCount: result.toolCallCount,
           durationMs: result.durationMs,
           transcriptPath: result.transcriptPath,
+          usage: result.usage,
         },
         display: `${result.type} → ${result.status} (${result.toolCallCount} tool calls, ${(result.durationMs / 1000).toFixed(1)}s)`,
       };
@@ -156,16 +160,17 @@ function buildTaskDescription(runner: SubagentRunner): string {
   const typeList = types.map((t) => `- ${t.name}: ${t.description}`).join("\n");
   return `Spawn a subagent to handle a focused sub-task autonomously. The subagent has its OWN context (no shared memory with you) and returns a single summary string when done.
 
-WHEN TO USE (use this VERY frequently):
+WHEN TO USE (delegate when it creates parallelism or protects the parent context):
 - "find all uses of X" / "where is Y handled" / "how does Z work" — use 'researcher'
 - Review pending changes — use 'code-reviewer'
-- Tasks needing 5+ tool calls — use 'general-purpose' to keep your context clean
+- A bounded subsystem task with a clear handoff that would otherwise consume 5+ noisy tool calls — use 'general-purpose'
 - Anything where the raw tool output would otherwise bloat YOUR context
 
 WHEN NOT TO USE:
 - Reading a single known file (use Read directly)
 - One-off Grep with a known pattern
 - Simple edits in the current conversation
+- Work whose conclusion or file ownership you have not defined yet — investigate/decide at the parent first
 
 Each subagent invocation is STATELESS. Make the prompt SELF-CONTAINED — the subagent cannot see your conversation. Brief it like a capable colleague with ZERO context on this task: state WHAT to do and WHY, hand over anything you already ruled out or discovered so it doesn't repeat your work, and say exactly what format to return in.
 

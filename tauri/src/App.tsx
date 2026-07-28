@@ -33,8 +33,10 @@ import { buildHolotableHtml, validateHoloSpec, type HoloSpec } from "../../packa
 import { redactSecrets } from "../../packages/protocol/src/secretRedact";
 import { UpdateBanner } from "./UpdateBanner";
 import { WhatsNew } from "./WhatsNew";
+import { LivingSurface } from "./LivingSurface";
 import { StyleCtx, SpringNumber, SpringHeight, TokenFlowStrip, pushTokenFlow, useNewStyle } from "./newStyle";
 import { CHANGELOG } from "./changelog";
+import { useTts, sidecarListen, wakeListen, fetchVoices, setVoiceToken, setVoiceEndpoint, type VoiceInfo, type WakeHandle } from "./voice";
 import "./styles.css";
 
 // The app version, injected by Vite's `define`. Guarded with typeof so that even
@@ -58,6 +60,8 @@ interface AresEvent {
   level?: string;
   provider?: string;
   model?: string;
+  currentProvider?: string;
+  currentModel?: string;
   code?: number | null;
   durationMs?: number;
   touchedFiles?: string[];
@@ -68,7 +72,7 @@ interface AresEvent {
   /** tool_use_input_delta — partial JSON of the tool input being authored. */
   deltaJson?: string;
   /** tool_progress — live sub-tool output (shell chunks, grep ticks, subagent activity, live browser frames, Conductor fleet activity). */
-  data?: { kind?: string; stream?: string; text?: string; total?: number; activity?: string; tool?: string; image?: string; agentId?: string; event?: string; role?: string; phase?: string; status?: string; fleetId?: string; backend?: string; label?: string; line?: string; filesTouched?: number; version?: string };
+  data?: { kind?: string; stream?: string; text?: string; total?: number; activity?: string; tool?: string; image?: string; url?: string; title?: string; agentId?: string; event?: string; role?: string; phase?: string; status?: string; fleetId?: string; backend?: string; label?: string; line?: string; filesTouched?: number; version?: string };
   /** compaction event fields */
   summarizedMessages?: number;
   tokensBefore?: number;
@@ -165,13 +169,40 @@ interface OAuthProviderVm {
   hasApp: boolean;
 }
 
-/** A connected remote MCP server (the /mcp Directory). */
+/** A connected remote MCP server (the /mcp explorer). */
 interface McpConnectorVm {
   name: string;
   url: string;
   displayName?: string;
   oauth?: boolean;
   connectedAt?: string | null;
+  /** false = paused via the explorer toggle (tokens kept, tools unloaded). */
+  enabled?: boolean;
+}
+
+/** A composer "/" command (rendered in the slash menu, Enter runs it). */
+interface SlashAction {
+  id: string;
+  icon: string;
+  label: string;
+  hint: string;
+  run: () => void;
+}
+
+/** A connect-able remote server from the public MCP registry. */
+interface McpRegistryResult {
+  name: string;
+  fullName: string;
+  description: string;
+  url: string;
+  needsKey: boolean;
+}
+
+/** One connector's live tool listing, as fetched for the explorer's expand row. */
+interface McpToolsVm {
+  loading: boolean;
+  tools: Array<{ name: string; description?: string }>;
+  error?: string | null;
 }
 
 /** Ares Gateway account snapshot (doingteam.com /me via the daemon bridge). */
@@ -216,6 +247,15 @@ interface OllamaDiscovery {
   error?: string | null;
 }
 
+type PresenceMode = "idle" | "listening" | "working" | "speaking" | "heard";
+
+interface PresenceSnapshot {
+  visible: boolean;
+  mode: PresenceMode;
+  caption: string;
+  detail: string;
+}
+
 function hasNativeBridge(): boolean {
   try {
     return isTauri();
@@ -224,25 +264,143 @@ function hasNativeBridge(): boolean {
   }
 }
 
+const STREAM_SPEECH_SENTENCE_MIN = 16;
+const STREAM_SPEECH_RELAXED_MIN = 72;
+const STREAM_SPEECH_HARD_MAX = 180;
+// After the FIRST spoken chunk (which fires small so speech starts fast), batch
+// subsequent chunks into larger spans. Each provider (Piper/API) synth is a
+// round-trip with real per-call overhead, so 3 sentences in one call ≈ 1/3 the
+// latency of one call each — the biggest lever on "it's delayed".
+const STREAM_SPEECH_BATCH_MIN = 150;
+
+function codeBlockSummary(body: string, lang: string): string {
+  const lines = body.split(/\r?\n/).filter((line) => line.trim()).length;
+  const label = lang ? `${lang} code block` : "code block";
+  return ` (${label}, ${lines} line${lines === 1 ? "" : "s"}) `;
+}
+
+function normalizeCompletedSpeechFences(raw: string, force = false): string {
+  let out = "";
+  let pos = 0;
+  while (pos < raw.length) {
+    const start = raw.indexOf("```", pos);
+    if (start < 0) {
+      out += raw.slice(pos);
+      break;
+    }
+    out += raw.slice(pos, start);
+    const headerStart = start + 3;
+    const newline = raw.indexOf("\n", headerStart);
+    const close = raw.indexOf("```", headerStart);
+    const hasHeaderLine = newline >= 0 && (close < 0 || newline < close);
+    const headerEnd = hasHeaderLine ? newline : headerStart;
+    const bodyStart = hasHeaderLine ? newline + 1 : headerStart;
+    const lang = raw.slice(headerStart, headerEnd).trim().split(/\s+/)[0] ?? "";
+    if (close < 0) {
+      if (force) out += codeBlockSummary(raw.slice(bodyStart), lang);
+      else out += raw.slice(start);
+      break;
+    }
+    out += codeBlockSummary(raw.slice(bodyStart, close), lang);
+    pos = close + 3;
+  }
+  return out;
+}
+
+function firstUnclosedFence(raw: string): number {
+  let pos = 0;
+  while (pos < raw.length) {
+    const start = raw.indexOf("```", pos);
+    if (start < 0) return -1;
+    const close = raw.indexOf("```", start + 3);
+    if (close < 0) return start;
+    pos = close + 3;
+  }
+  return -1;
+}
+
+function boundaryAfter(text: string, min: number): number {
+  const sentence = /[.!?…]["')\]]?\s+/g;
+  for (let match = sentence.exec(text); match; match = sentence.exec(text)) {
+    const end = match.index + match[0].length;
+    if (end >= min) return end;
+  }
+  const paragraph = /\n{2,}/g;
+  for (let match = paragraph.exec(text); match; match = paragraph.exec(text)) {
+    const end = match.index + match[0].length;
+    if (end >= min) return end;
+  }
+  return 0;
+}
+
+function relaxedBoundary(text: string): number {
+  if (text.length < STREAM_SPEECH_RELAXED_MIN) return 0;
+  const phrase = /[,;:]\s+/g;
+  for (let match = phrase.exec(text); match; match = phrase.exec(text)) {
+    const end = match.index + match[0].length;
+    if (end >= STREAM_SPEECH_RELAXED_MIN) return end;
+  }
+  const target = Math.min(text.length, STREAM_SPEECH_HARD_MAX);
+  const beforeTarget = text.slice(0, target).search(/\s+\S*$/);
+  if (beforeTarget >= STREAM_SPEECH_RELAXED_MIN) return beforeTarget;
+  const afterMin = text.slice(STREAM_SPEECH_RELAXED_MIN).search(/\s/);
+  return afterMin >= 0 ? STREAM_SPEECH_RELAXED_MIN + afterMin + 1 : 0;
+}
+
+function takeStreamSpeechChunk(raw: string, force = false, relaxed = false, min = STREAM_SPEECH_SENTENCE_MIN): { chunk: string; rest: string } {
+  const normalized = normalizeCompletedSpeechFences(raw, force);
+  const fenceAt = firstUnclosedFence(normalized);
+  const held = fenceAt >= 0 ? normalized.slice(fenceAt) : "";
+  const speakable = fenceAt >= 0 ? normalized.slice(0, fenceAt) : normalized;
+  if (force) return { chunk: speakable.trim(), rest: held };
+  const boundary = boundaryAfter(speakable, min) || (relaxed ? relaxedBoundary(speakable) : 0);
+  if (!boundary) return { chunk: "", rest: normalized };
+  return { chunk: speakable.slice(0, boundary).trim(), rest: speakable.slice(boundary) + held };
+}
+
 // ─── View model ────────────────────────────────────────────────────────────
 
-type ReasoningLevel = "low" | "medium" | "high" | "max";
-const REASONING_LEVELS: ReasoningLevel[] = ["low", "medium", "high", "max"];
+type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+// Preview iframes ran with only `allow-scripts`, so previewed apps lived in an
+// opaque origin where localStorage/IndexedDB/cookies, alert/confirm/prompt,
+// forms, popups and same-origin fetch all threw or no-op'd — the app "broke"
+// vs. running standalone. Grant the fuller set (same posture as the embedded
+// browser) so a previewed app behaves the way it does on its own. This is the
+// user's OWN generated code in their OWN desktop app, so same-origin is fine.
+const PREVIEW_SANDBOX = "allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-pointer-lock allow-downloads";
 
-// The effort SLIDER: model reasoning low→max, plus ULTRA at the very top — which
-// is not a model dial but a posture: unleash a background fleet (the orchestrator).
-// "ultra" is kept as a separate Prefs.ultra flag so a daemon reasoning echo can
-// never clobber it; when ultra is on, the model dial is pinned to "max".
-const EFFORT_STEPS = ["low", "medium", "high", "max", "ultra"] as const;
-type EffortStep = (typeof EFFORT_STEPS)[number];
-const EFFORT_META: Record<EffortStep, { label: string; hint: string }> = {
-  low: { label: "low", hint: "snappy — minimal deliberation" },
-  medium: { label: "medium", hint: "balanced thinking for everyday work" },
-  high: { label: "high", hint: "deep passes for hard problems" },
-  max: { label: "max", hint: "everything the model has" },
-  ultra: { label: "ULTRA", hint: "unleash the fleet — background agents orchestrated in parallel" },
+const REASONING_LEVELS: ReasoningLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_META: Record<ReasoningLevel, { label: string; hint: string }> = {
+  off: { label: "Off", hint: "no deliberate reasoning; fastest response" },
+  minimal: { label: "Minimal", hint: "a featherweight reasoning pass" },
+  low: { label: "Low", hint: "fast, economical, and direct" },
+  medium: { label: "Medium", hint: "balanced depth for everyday work" },
+  high: { label: "High", hint: "deep reasoning for difficult work" },
+  xhigh: { label: "X-High", hint: "long-horizon agentic reasoning" },
+  max: { label: "Max", hint: "the provider's absolute capability ceiling" },
 };
 
+function effortLevelsFor(provider: string, model: string): ReasoningLevel[] {
+  const p = provider.toLowerCase();
+  const m = model.toLowerCase();
+  if (/deepseek-v4|deepseek-v3\.2/.test(m) || p === "deepseek") return ["off", "high", "max"];
+  if (/claude|fable|mythos|opus|sonnet/.test(m) || p === "anthropic") {
+    if (/(?:fable|mythos)-?5|opus-4-[78]|sonnet-5/.test(m)) return ["low", "medium", "high", "xhigh", "max"];
+    if (/opus-4-6|sonnet-4-6/.test(m)) return ["low", "medium", "high", "max"];
+    return ["off", "low", "medium", "high", "max"];
+  }
+  if (/gpt-|o[134](?:-|$)/.test(m) || p === "openai") return ["off", "minimal", "low", "medium", "high", "xhigh"];
+  if (p === "ollama") return ["off", "low", "medium", "high"];
+  return ["off", "low", "medium", "high", "xhigh", "max"];
+}
+
+function effortWireLabel(provider: string, model: string, level: ReasoningLevel): string {
+  const m = model.toLowerCase();
+  if (/deepseek-v4|deepseek-v3\.2/.test(m) || provider.toLowerCase() === "deepseek") return level === "off" ? "thinking.disabled" : `reasoning_effort: ${level === "max" || level === "xhigh" ? "max" : "high"}`;
+  if (/claude|fable|mythos|opus|sonnet/.test(m) || provider.toLowerCase() === "anthropic") return `output_config.effort: ${level}`;
+  if (/gpt-|o[134](?:-|$)/.test(m) || provider.toLowerCase() === "openai") return `reasoning.effort: ${level === "off" ? "none" : level === "max" ? "xhigh" : level}`;
+  return `native effort: ${level}`;
+}
 interface ToolStep {
   id: string;
   label: string;
@@ -262,7 +420,7 @@ interface ToolStep {
 }
 
 type Item =
-  | { kind: "user"; key: string; text: string }
+  | { kind: "user"; key: string; text: string; images?: string[] }
   | { kind: "steer"; key: string; text: string; landed?: boolean }
   | { kind: "assistant"; key: string; text: string; thinking: string; streaming: boolean; model?: string; lane?: string; provider?: string; proactive?: boolean }
   | { kind: "tools"; key: string; steps: ToolStep[]; startedAt: number; finishedAt?: number }
@@ -292,6 +450,8 @@ interface SessionVm {
   items: Item[];
   busy: boolean;
   tokensIn: number;
+  /** Portion of tokensIn served from the provider prompt cache. */
+  cacheReadTokens: number;
   tokensOut: number;
   /** Live one-liner of what the agent is doing right now (the activity ticker). */
   activity?: string;
@@ -369,6 +529,7 @@ function freshSession(): SessionVm {
     items: [],
     busy: false,
     tokensIn: 0,
+    cacheReadTokens: 0,
     tokensOut: 0,
     todos: [],
     loaded: true,
@@ -396,6 +557,7 @@ function sessionFromSummary(summary: SessionSummaryWire): SessionVm {
     items: [],
     busy: false,
     tokensIn: 0,
+    cacheReadTokens: 0,
     tokensOut: 0,
     todos: [],
     loaded: false,
@@ -429,8 +591,21 @@ function sessionFromHistory(id: string, rawMessages: unknown, meta: unknown): Se
       continue;
     }
     if (message.role === "user") {
-      const text = blocks.filter((b) => b.type === "text").map((b) => String(b.text ?? "")).join("\n").trim();
-      if (text) items.push({ kind: "user", key: nextKey(), text });
+      const rawText = blocks.filter((b) => b.type === "text").map((b) => String(b.text ?? "")).join("\n").trim();
+      // Real image content blocks from the saved turn, plus any data URLs that
+      // were embedded in the text — both become visible thumbnails, not blobs.
+      const blockImages = blocks
+        .filter((b) => b.type === "image")
+        .map((b) => {
+          const src = b as { source?: { data?: string; media_type?: string; type?: string; url?: string } };
+          if (src.source?.url) return src.source.url;
+          if (src.source?.data) return `data:${src.source.media_type ?? "image/png"};base64,${src.source.data}`;
+          return "";
+        })
+        .filter(Boolean);
+      const { text, images: inlineImages } = splitDataImages(rawText);
+      const images = [...blockImages, ...inlineImages];
+      if (text || images.length) items.push({ kind: "user", key: nextKey(), text, images: images.length ? images : undefined });
       // system_reminder blocks on saved user turns are internal context assembly
       // (memory/instructions/recall) — never user-facing. Don't replay them.
     }
@@ -443,6 +618,7 @@ function sessionFromHistory(id: string, rawMessages: unknown, meta: unknown): Se
     items,
     busy: false,
     tokensIn: 0,
+    cacheReadTokens: 0,
     tokensOut: 0,
     todos: [],
     loaded: true,
@@ -741,19 +917,13 @@ function foldEvent(s: SessionVm, e: AresEvent): SessionVm {
       break;
     }
     case "system_reminder_injected": {
-      // Most injected context is prompt assembly — memory recall, loaded
-      // instructions, the foreground-intent reminder, dream/heartbeat/skill/hook
-      // notes. It steers the model but is pure noise in the transcript: a bare
-      // "hi" was dumping the whole "Loaded global memory… / Foreground request
-      // (greeting): hi" trace. Hide that, but KEEP the genuinely user-facing
-      // runtime notices (provider failover, token-cap, loop/circuit guards).
-      // The model still receives every reminder — only the UI rendering changes.
-      const src = e.source ?? "context";
+      // Injected reminders are model plumbing, not chat. Surface only the small
+      // operational allowlist that needs owner attention; durable state,
+      // repository maps, verifier output and loop guards stay in diagnostics.
       const text = e.text ?? "";
-      const NOISE = new Set(["memory", "recall", "dream", "heartbeat", "hook", "skill", "compaction", "undo"]);
-      const isStartupNoise = src === "instructions" && /^(Loaded |Foreground request)/i.test(text);
-      if (NOISE.has(src) || isStartupNoise) break;
-      const tone = src === "verifier" ? "warn" : "dim";
+      const visible = /^(?:Provider failed|All configured providers failed|Your Ares account couldn't run|Image attached|Garrison is down)|retrying with a smaller recent-history window/i.test(text);
+      if (!visible) break;
+      const tone = /failed|couldn't run|down/i.test(text) ? "warn" : "dim";
       items.push({ kind: "notice", key: nextKey(), text: compact(text, 400), tone });
       break;
     }
@@ -826,6 +996,7 @@ function foldEvent(s: SessionVm, e: AresEvent): SessionVm {
       session.busy = false;
       session.steerQueued = 0;
       session.tokensIn += input;
+      session.cacheReadTokens += e.usage?.cacheReadTokens ?? 0;
       session.tokensOut += output;
       if (session.fleet) {
         // If any leaf failed/aborted (or never finished), keep the board up with a
@@ -847,6 +1018,9 @@ function foldEvent(s: SessionVm, e: AresEvent): SessionVm {
       session.activity = "steering";
       break;
     }
+    case "steer_queued":
+      session.activity = "steer queued";
+      break;
     case "daemon_error":
       items.push({ kind: "notice", key: nextKey(), text: compact(stringify(e.error ?? "daemon error"), 500), tone: "bad" });
       break;
@@ -981,6 +1155,13 @@ function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
+}
+
+/** Total estimated spend across providers with known pricing; "—" if nothing priced. */
+function fmtSpend(usage: { providers?: Array<{ costUsd?: number }> }): string {
+  const known = (usage.providers ?? []).filter((p) => p.costUsd !== undefined);
+  if (known.length === 0) return "—";
+  return `≈$${known.reduce((total, p) => total + (p.costUsd ?? 0), 0).toFixed(2)}`;
 }
 
 function fmtMs(ms: number): string {
@@ -1163,6 +1344,20 @@ interface Prefs {
   uiStyle: "legacy" | "new";
   /** Advanced engine knobs (mirrors the daemon's EngineConfig). */
   engine: EngineConfig;
+  /** Voice: speak Ares's replies aloud via the local sidecar (Kokoro TTS). */
+  voiceEnabled?: boolean;
+  /** Chosen TTS voice id (from the sidecar /voices catalog, or a skill provider). */
+  voiceId?: string;
+  /** Speech rate multiplier (0.5–2.0). */
+  voiceSpeed?: number;
+  /** Hands-free: "Hey Ares" wake word arms the mic (needs voice + sidecar). */
+  wakeWord?: boolean;
+  /** Speak a short heads-up when a background/other-session turn finishes. */
+  voiceNotify?: boolean;
+  /** Starred models in the discovery panel, as "provider/model" keys. */
+  favoriteModels?: string[];
+  /** Last-used models (newest first, max 6), as "provider/model" keys. */
+  recentModels?: string[];
 }
 
 type ThemeName = "rage" | "bronze" | "crimson" | "steel" | "nightfall" | "verdant" | "daylight";
@@ -1183,6 +1378,8 @@ interface EngineConfig {
   operatorAutotick?: boolean;
   operatorTickMinutes?: number;
   subagentTurnLimit?: number;
+  /** Owner opt-in: ComputerUse may drive real browser windows with the mouse. */
+  computerUseBrowser?: boolean;
 }
 
 // WebKitGTK (the Linux webview) composites backdrop-filter and the edge-flame
@@ -1215,7 +1412,10 @@ function loadPrefs(): Prefs {
       provider: raw.provider ?? fallback.provider,
       model: raw.model ?? fallback.model,
       reasoning: REASONING_LEVELS.includes(raw.reasoning as ReasoningLevel) ? (raw.reasoning as ReasoningLevel) : "medium",
-      ultra: raw.ultra === true,
+      // The old global "mode" dial mixed provider reasoning with fleet
+      // orchestration and could silently stay ultra after the control vanished.
+      // Autonomy is selected by the task/router now, never by stale UI state.
+      ultra: false,
       routing,
       // Auto-routing is OPT-IN, never inferred. Previously an unset routingMode
       // flipped to "auto" whenever any lane assignment existed — so a user who
@@ -1229,6 +1429,12 @@ function loadPrefs(): Prefs {
       theme: themeOk ? (raw.theme as ThemeName) : "rage",
       uiStyle: raw.uiStyle === "legacy" ? "legacy" : "new",
       engine: raw.engine && typeof raw.engine === "object" ? raw.engine : {},
+      voiceEnabled: raw.voiceEnabled === true,
+      voiceId: typeof raw.voiceId === "string" ? raw.voiceId : undefined,
+      voiceSpeed: typeof raw.voiceSpeed === "number" && raw.voiceSpeed >= 0.5 && raw.voiceSpeed <= 2 ? raw.voiceSpeed : 1,
+      wakeWord: raw.wakeWord === true,
+      voiceNotify: raw.voiceNotify !== false, // default ON — a spoken heads-up is the point of voice
+
     };
   } catch {
     return fallback;
@@ -1256,6 +1462,9 @@ interface ModelOption {
   contextLength?: number;
   /** $ per million tokens (OpenRouter): input = prompt, output = completion. */
   pricing?: { input?: number; output?: number };
+  /** Ollama library meta: human pull count ("225.9K") + relative updated age. */
+  pulls?: string;
+  updated?: string;
 }
 
 const OLLAMA_CLOUD_MODELS: ModelOption[] = [
@@ -1302,19 +1511,24 @@ const OLLAMA_CLOUD_MODELS: ModelOption[] = [
 ];
 
 const OPENAI_MODELS: ModelOption[] = [
-  { id: "gpt-5.5", hint: "flagship — deep reasoning", group: "OpenAI" },
-  { id: "gpt-5.5-codex", hint: "agentic coding tuned", group: "OpenAI" },
-  { id: "gpt-5.1", hint: "previous flagship", group: "OpenAI" },
-  { id: "gpt-5.1-codex", hint: "coding tuned", group: "OpenAI" },
-  { id: "gpt-5", hint: "stable baseline", group: "OpenAI" },
-  { id: "gpt-5-mini", hint: "fast + cheap", group: "OpenAI" },
+  // Verified working through ChatGPT Codex OAuth. The daemon live-fetches the
+  // account's real list; this is the offline fallback.
+  { id: "gpt-5.6-sol", label: "5.6 Sol", hint: "flagship — deepest reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "gpt-5.6-terra", label: "5.6 Terra", hint: "balanced — ~5.5 quality, 2× cheaper", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "gpt-5.5", label: "5.5", hint: "previous flagship", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "gpt-5.4", label: "5.4", hint: "stable baseline", group: "OpenAI", capabilities: ["tools", "reasoning"] },
+  { id: "gpt-5.4-mini", label: "5.4 Mini", hint: "fast + cheap", group: "OpenAI", capabilities: ["tools"] },
+  { id: "gpt-5.3-codex-spark", label: "5.3 Codex Spark", hint: "agentic coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
 ];
 
 const ANTHROPIC_MODELS: ModelOption[] = [
-  { id: "claude-fable-5", hint: "flagship — adaptive thinking", group: "Anthropic" },
-  { id: "claude-opus-4-8", hint: "deep reasoning workhorse", group: "Anthropic" },
-  { id: "claude-sonnet-4-6", hint: "balanced speed / depth", group: "Anthropic" },
-  { id: "claude-haiku-4-5-20251001", hint: "fast + cheap", group: "Anthropic" },
+  { id: "claude-fable-5", label: "Claude Fable 5", hint: "flagship — adaptive extended thinking", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "frontier Sonnet — coding + agents", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "claude-opus-4-8", label: "Claude Opus 4.8", hint: "deep reasoning workhorse — 1M context", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "claude-opus-4-7", label: "Claude Opus 4.7", hint: "prior Opus — deep reasoning", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "claude-opus-4-6", label: "Claude Opus 4.6", hint: "earlier Opus", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "balanced speed / depth", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", hint: "fastest — cheap + capable", group: "Anthropic", capabilities: ["tools", "vision"] },
 ];
 
 const DEEPSEEK_MODELS: ModelOption[] = [
@@ -1456,6 +1670,12 @@ function useModelCatalog(provider: string, native: boolean) {
         requestDaemonCatalog();
         return;
       }
+      if (provider === "kimi") {
+        // Static row instantly; the daemon merges the live account catalog.
+        setModels([{ id: "kimi-for-coding", label: "Kimi for Coding", hint: "agentic coding · 256K context", group: "Kimi", capabilities: ["tools", "reasoning"] }]);
+        requestDaemonCatalog();
+        return;
+      }
       if (provider === "openrouter") {
         setLoading(true);
         setModels([]);
@@ -1494,7 +1714,12 @@ function useModelCatalog(provider: string, native: boolean) {
           capabilities: m.capabilities ?? [],
         }));
         setModels((current) => mergeModelOptions(current, local));
-        if (found.error && !found.reachable) setError(found.error);
+        // Local daemon down is NORMAL for cloud-key users — say so gently
+        // instead of surfacing the raw "connection timed out" as an error
+        // banner over a perfectly usable cloud + library catalog.
+        if (found.error && !found.reachable) {
+          setError("Local Ollama isn't running — showing cloud + library models. Start the Ollama app to use your pulled models.");
+        }
       } catch (err) {
         if (live) setError(String(err));
       } finally {
@@ -1547,6 +1772,26 @@ interface ForgeState {
   open: boolean;
   tab: ForgeTab;
   artifact?: { path: string; label: string };
+}
+
+function launchableUrl(raw: string): string {
+  const value = raw.trim();
+  if (!value) return "";
+  if (/^(https?|file):\/\//i.test(value)) return value;
+  return `http://${value}`;
+}
+
+function forgeFrameUrl(url: string, native: boolean, revision: number): string {
+  if (/^file:\/\//i.test(url) && native) {
+    try {
+      const parsed = new URL(url);
+      let filePath = decodeURIComponent(parsed.pathname);
+      if (/^\/[A-Za-z]:\//.test(filePath)) filePath = filePath.slice(1);
+      return `${convertFileSrc(filePath)}?forge=${revision}`;
+    } catch { return url; }
+  }
+  const join = url.includes("?") ? "&" : "?";
+  return `${url}${join}ares_forge=${revision}`;
 }
 
 // ─── Demo feed (browser preview) ───────────────────────────────────────────
@@ -1712,14 +1957,49 @@ function App() {
   // The embedded live browser: latest JPEG frame Ares streamed while driving its
   // own browser (cursor, clicks, navigation) — shown in the Forge "Live" tab.
   const [liveBrowser, setLiveBrowser] = useState<{ frame: string; at: number } | null>(null);
+  const [liveTarget, setLiveTarget] = useState<{ url: string; title: string; at: number } | null>(null);
+  const [liveUrl, setLiveUrl] = useState("http://127.0.0.1:3000");
+  const [liveRevision, setLiveRevision] = useState(0);
   // The INTERACTIVE embedded browser — Ares drives its own self-contained HTML
   // apps/games in-window (same-origin), no Playwright. Driven via webview_cmd.
   const embeddedRef = useRef<EmbeddedBrowserHandle>(null);
   const [embeddedActive, setEmbeddedActive] = useState(false);
   const [embeddedActivity, setEmbeddedActivity] = useState("");
-  const [forge, setForge] = useState<ForgeState>({ open: false, tab: "sandbox" });
+  const [forge, setForge] = useState<ForgeState>({ open: false, tab: "preview" });
   const [forgeWidth, setForgeWidth] = useState(() => Math.min(560, Math.round(window.innerWidth * 0.36)));
+  // True only during an active grip drag — flips off the 280ms grid transition
+  // so the panel tracks the pointer 1:1 instead of rubber-banding behind it.
+  const [forgeDragging, setForgeDragging] = useState(false);
+  // The forge must never crush the chat below a usable width. This is the max
+  // forge width the CURRENT window allows (rail 264 + a min chat of 360).
+  const maxForgeFor = (winW: number) => Math.max(300, winW - 264 - 360);
+  // Re-clamp the forge as the window shrinks — without this the forge kept its
+  // px width while the window narrowed, overflowing the grid and clipping the
+  // right half of the UI (the "UI gets cut off when smaller" bug).
+  useEffect(() => {
+    const onResize = () => setForgeWidth((w) => Math.min(w, maxForgeFor(window.innerWidth)));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Buffers only the active session's assistant text, then flushes natural
+  // phrases to TTS while tokens stream. A ref avoids chat-wide re-renders.
+  const spokenBuf = useRef("");
+  const spokenFlushTimer = useRef<number | null>(null);
+  // How many chunks we've spoken this turn — the first fires small (fast start),
+  // the rest batch larger to cut provider round-trips (the delay lever).
+  const spokenChunkCount = useRef(0);
   const [view, setView] = useState<"chat" | "artifacts" | "helm">("chat");
+  // Vanguard drive mode per session, confirmed by the daemon's ack — plus the
+  // one-shot shield/shockwave burst played when a session switches engines.
+  const [vgModes, setVgModes] = useState<Record<string, boolean>>({});
+  const [vgBurst, setVgBurst] = useState(false);
+  const vgBurstTimer = useRef<number | null>(null);
+  // The Vanguard beat of the boot sequence — plays once, right after <Boot/>.
+  const [vgIntroDone, setVgIntroDone] = useState(false);
+  // Where each session's drive is working (from vanguard_mode acks) — shown
+  // in the header badge. The workspace follows chat ("work in C:\path").
+  const [vgWorkspaces, setVgWorkspaces] = useState<Record<string, string>>({});
   const [sessionQuery, setSessionQuery] = useState("");
   const [garrisonOpen, setGarrisonOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -1733,12 +2013,21 @@ function App() {
   // Connector Directory (/mcp): remote MCP servers connected via OAuth.
   const [directoryOpen, setDirectoryOpen] = useState(false);
   const [mcpConnectors, setMcpConnectors] = useState<McpConnectorVm[]>([]);
+  const [mcpTools, setMcpTools] = useState<Record<string, McpToolsVm>>({});
+  /** Ollama library downloads in flight: model → progress (done/error terminal). */
+  const [ollamaPulls, setOllamaPulls] = useState<Record<string, { pct: number | null; status: string; done?: boolean; error?: string }>>({});
+  /** MCP registry search results for the /mcp explorer. */
+  const [mcpSearch, setMcpSearch] = useState<{ text: string; searching: boolean; results: McpRegistryResult[] }>({ text: "", searching: false, results: [] });
   const [mcpConnecting, setMcpConnecting] = useState<string | null>(null);
   // Floating-pill mode: shrink the window to an always-on-top mic bar.
   const [pill, setPill] = useState(false);
-  const [pinTop, setPinTop] = useState(true);
+  const [railCollapsed, setRailCollapsed] = useState(() => window.localStorage.getItem("ares.rail.collapsed") === "1");
   const prePillGeom = useRef<{ size: PhysicalSize; pos: PhysicalPosition } | null>(null);
   const [anthropicAuth, setAnthropicAuth] = useState<{ open: boolean; status: "idle" | "opening" | "waiting" | "done" | "error"; error?: string }>({ open: false, status: "idle" });
+  // ChatGPT (OpenAI) OAuth — routes GPT usage through the user's ChatGPT
+  // subscription via the Codex backend; no API key.
+  const [openaiAuth, setOpenaiAuth] = useState<{ signingIn: boolean; connected: boolean; email: string | null; plan: string | null }>({ signingIn: false, connected: false, email: null, plan: null });
+  const [kimiAuth, setKimiAuth] = useState<{ signingIn: boolean; connected: boolean; detail: string | null }>({ signingIn: false, connected: false, detail: null });
   const oauthCtx = useRef<{ verifier: string; state: string }>({ verifier: "", state: "" });
   const [logLines, setLogLines] = useState<string[]>([]);
   const [bootGone, setBootGone] = useState(false);
@@ -1751,9 +2040,16 @@ function App() {
   const lastSeq = useRef(0);
   const scroller = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef("");
+  // While the experimental Living Surface owns this session it owns narration
+  // too. The hidden Classic window must not read the JSON patch stream aloud.
+  const livingSessionRef = useRef<string | null>(null);
+  // The daemon's bootstrap conversation is stable even while the owner opens
+  // and focuses other cards. Untagged legacy events belong here, never to the
+  // card that happens to be active when they arrive.
+  const primarySessionRef = useRef(sessions[0]?.id ?? "");
   const prefsRef = useRef(prefs);
   const restartAttempts = useRef(0);
-  const pendingGoal = useRef<{ goal: string; sessionId: string } | null>(null);
+  const pendingGoal = useRef<{ goal: string; sessionId: string; voice?: boolean } | null>(null);
   const stderrTail = useRef<string[]>([]);
   prefsRef.current = prefs;
 
@@ -1770,12 +2066,11 @@ function App() {
     setSessions((prev) => {
       const hit = prev.some((s) => s.id === sessionId);
       if (!hit) {
-        // Untagged/legacy event: route to the ACTIVE card, else the one that's
-        // busy, else the first. (New cards unshift to index 0, so prev[0] is the
-        // newest empty card — the wrong target.)
-        const target =
-          prev.find((s) => s.id === activeRef.current) ?? prev.find((s) => s.busy) ?? prev[0];
-        return prev.map((s) => (s === target ? fn(s) : s));
+        // A background session may emit before sessions_list hydrates its rail
+        // row. Adopt it as its own card; routing an unknown id into the focused
+        // card is the exact cross-session bleed this registry exists to prevent.
+        const adopted = fn({ ...freshSession(), id: sessionId, title: "Background session" });
+        return [...prev, adopted];
       }
       return prev.map((s) => (s.id === sessionId ? fn(s) : s));
     });
@@ -1843,6 +2138,345 @@ function App() {
     [native],
   );
 
+  // Slash-command palette for the composer: typing "/" surfaces these, Enter
+  // runs them. The composer stays dumb — it just renders and fires `run`.
+  const slashActions = useMemo<SlashAction[]>(
+    () => [
+      { id: "mcp", icon: "🔌", label: "Connectors", hint: "Open the MCP explorer — connect, toggle & inspect tools", run: () => { setDirectoryOpen(true); daemonCmd({ type: "mcp_list" }); } },
+      { id: "model", icon: "🧠", label: "Models", hint: "Open the model discovery panel", run: () => setModelPopOpen(true) },
+      { id: "helm", icon: "🛡️", label: "HELM", hint: "Open the war room — missions, usage, autonomy", run: () => setView("helm") },
+      { id: "settings", icon: "⚙️", label: "Settings", hint: "Open settings", run: () => setSettingsOpen(true) },
+      { id: "bug", icon: "🐛", label: "Report a bug", hint: "Send a bug report with this session's log", run: () => setReportOpen(true) },
+    ],
+    [daemonCmd],
+  );
+
+  // Promise-correlated skill invocation: send skill_invoke with a unique id and
+  // resolve when the matching skill_result comes back. Powers TTS-provider
+  // skills (op:"tts") and tray surface-button clicks over one channel.
+  const skillInvokePending = useRef(new Map<string, { resolve: (r: { ok: boolean; result?: unknown; error?: string }) => void; timer: number }>());
+  const skillInvoke = useCallback(
+    (name: string, input: unknown, timeoutMs = 60_000): Promise<{ ok: boolean; result?: unknown; error?: string }> => {
+      if (!native) return Promise.resolve({ ok: false, error: "no daemon attached" });
+      const invokeId = `si_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      return new Promise((resolve) => {
+        const timer = window.setTimeout(() => {
+          skillInvokePending.current.delete(invokeId);
+          resolve({ ok: false, error: "skill timed out" });
+        }, timeoutMs);
+        skillInvokePending.current.set(invokeId, { resolve, timer });
+        daemonCmd({ type: "skill_invoke", name, input, invokeId });
+      });
+    },
+    [native, daemonCmd],
+  );
+
+  // ── Voice bus ──────────────────────────────────────────────────────────
+  // A toggled-on `provides:tts` skill overrides the built-in sidecar voice —
+  // Ares speaks through whatever engine the user installed (Piper, ElevenLabs…).
+  const ttsProviderSkill = skills.find((s) => s.enabled && (s.provides ?? []).includes("tts"));
+  // Karaoke: the sentence Ares is speaking RIGHT NOW (null = quiet).
+  const [nowSpeaking, setNowSpeaking] = useState<string | null>(null);
+  // The active provider's own voice catalog. Needed at CALL time: the saved
+  // voiceId often belongs to the PREVIOUS engine (e.g. Kokoro's "af_heart"
+  // sent to a Piper skill), which made every provider call fail and silently
+  // fall back to the robotic browser voice — "it's not using my skill".
+  const [providerVoices, setProviderVoices] = useState<VoiceInfo[] | null>(null);
+  // Throttled, not latched: the old one-shot flag surfaced only the FIRST
+  // provider failure ever — every later failure fell into the robot voice
+  // with zero explanation until the skill name changed.
+  const providerFailAt = useRef(0);
+  useEffect(() => {
+    providerFailAt.current = 0;
+    if (!ttsProviderSkill) { setProviderVoices(null); return; }
+    let cancelled = false;
+    void skillInvoke(ttsProviderSkill.name, { op: "voices" }).then((r) => {
+      if (cancelled) return;
+      const voices = r.ok ? (r.result as { voices?: VoiceInfo[] })?.voices : null;
+      setProviderVoices(Array.isArray(voices) ? voices : []);
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ttsProviderSkill?.name]);
+  const voice = useTts({
+    enabled: prefs.voiceEnabled ?? false,
+    voice: prefs.voiceId ?? "",
+    speed: prefs.voiceSpeed ?? 1,
+    onUtterance: setNowSpeaking,
+    provider: ttsProviderSkill
+      ? (text, v, speed) => {
+          // Only pass a voice the provider actually KNOWS; otherwise send ""
+          // so the skill uses its own default instead of erroring out.
+          const known = providerVoices;
+          const voiceForSkill = known && known.length > 0 ? (known.some((k) => k.id === v) ? v : "") : v;
+          return skillInvoke(ttsProviderSkill.name, { op: "tts", text, voice: voiceForSkill, speed }).then((r) => {
+            if (!r.ok) {
+              // Never fail silently into the robot voice — say why (at most
+              // once per 30s so a broken skill doesn't spam toasts).
+              const now = Date.now();
+              if (now - providerFailAt.current > 30_000) {
+                providerFailAt.current = now;
+                setSkillToast({ name: ttsProviderSkill.name, text: `Voice skill ${ttsProviderSkill.name} failed: ${(r.error ?? "unknown error").slice(0, 120)}`, ok: false });
+                window.setTimeout(() => setSkillToast(null), 5000);
+              }
+              // The failure may be a stale voice catalog (provider updated its
+              // voices in place) — refresh it so the next call self-heals.
+              void skillInvoke(ttsProviderSkill.name, { op: "voices" }).then((vr) => {
+                const voices = vr.ok ? (vr.result as { voices?: VoiceInfo[] })?.voices : null;
+                if (Array.isArray(voices)) setProviderVoices(voices);
+              });
+            }
+            return r.ok ? (r.result as { audio?: string; mime?: string }) : null;
+          });
+        }
+      : undefined,
+  });
+  const voiceRef = useRef(voice);
+  voiceRef.current = voice;
+
+  // ── STT provider skill (mirror of the TTS override) ──
+  // A toggled-on `provides:stt` skill transcribes the composer mic's recording
+  // instead of the cloud fallback: {op:"transcribe", audio,<b64>, mime} → {text}.
+  const sttProviderSkill = skills.find((s) => s.enabled && (s.provides ?? []).includes("stt"));
+  useEffect(() => {
+    globalSttProvider.current = sttProviderSkill
+      ? async (audio: string, mime: string) => {
+          const r = await skillInvoke(sttProviderSkill.name, { op: "transcribe", audio, mime });
+          const text = r.ok ? (r.result as { text?: string })?.text : null;
+          return typeof text === "string" ? text : null;
+        }
+      : null;
+  }, [sttProviderSkill?.name, skillInvoke]);
+
+  const clearSpokenFlushTimer = () => {
+    if (spokenFlushTimer.current !== null) {
+      window.clearTimeout(spokenFlushTimer.current);
+      spokenFlushTimer.current = null;
+    }
+  };
+
+  const flushSpokenBuffer = (force = false, relaxed = false) => {
+    if (force) clearSpokenFlushTimer();
+    let guard = 0;
+    while (guard < 8) {
+      // First chunk of the turn fires at the small min for a fast start; every
+      // chunk after batches to STREAM_SPEECH_BATCH_MIN so slow provider synths
+      // run a third as often.
+      const min = spokenChunkCount.current === 0 ? STREAM_SPEECH_SENTENCE_MIN : STREAM_SPEECH_BATCH_MIN;
+      const { chunk, rest } = takeStreamSpeechChunk(spokenBuf.current, force, relaxed, min);
+      spokenBuf.current = rest;
+      if (!chunk) break;
+      voiceRef.current.speak(chunk);
+      spokenChunkCount.current += 1;
+      guard += 1;
+      if (!force && !relaxed) continue;
+      if (!force) break;
+    }
+  };
+
+  const scheduleSpokenFlush = () => {
+    if (spokenFlushTimer.current !== null) return;
+    spokenFlushTimer.current = window.setTimeout(() => {
+      spokenFlushTimer.current = null;
+      // Never force a phrase boundary merely because the model paused to call a
+      // tool. A token such as "trouble" may still become "troubleshooting" in
+      // the next model round; sentence punctuation or turn_end is the safe cut.
+      flushSpokenBuffer(false, false);
+    }, 700);
+  };
+
+  const appendSpokenDelta = (text: string) => {
+    if (!text) return;
+    spokenBuf.current += text;
+    flushSpokenBuffer(false, false);
+    if (spokenBuf.current.trim()) scheduleSpokenFlush();
+  };
+
+  const resetSpokenStream = () => {
+    clearSpokenFlushTimer();
+    spokenBuf.current = "";
+    spokenChunkCount.current = 0;
+  };
+
+  // Native voice health gates every mic/wake connection. Previously the wake
+  // loop retried independently while Python was down, making the button flash
+  // between "starting" and "offline" every few seconds.
+  const [voiceEngine, setVoiceEngine] = useState<{ phase: string; detail: string }>({ phase: "idle", detail: "" });
+  useEffect(() => {
+    if (!native) return;
+    let alive = true;
+    void invoke<{ phase: string; detail: string; token?: string; port?: number }>("ares_voice_status")
+      .then((s) => {
+        if (!alive) return;
+        if (s?.token) setVoiceToken(s.token);
+        if (s?.port) setVoiceEndpoint(s.port);
+        if (s?.phase) setVoiceEngine({ phase: s.phase, detail: s.detail ?? "" });
+      })
+      .catch(() => { /* shell predates the command */ });
+    const un = listen<{ phase: string; detail: string }>("ares:voice-status", (e) => {
+      if (alive && e.payload?.phase) setVoiceEngine({ phase: e.payload.phase, detail: e.payload.detail ?? "" });
+    });
+    return () => { alive = false; void un.then((f) => f()); };
+  }, [native]);
+  const repairVoice = useCallback(() => {
+    setVoiceEngine({ phase: "starting", detail: "Restarting local speech…" });
+    void invoke("ares_voice_setup").catch(() => { /* ignore */ });
+  }, []);
+
+  // ── Conversation mode ─────────────────────────────────────────────────────
+  // Full-duplex hands-free: after Ares finishes SPEAKING a reply, auto-open the
+  // mic; the transcript is sent as the next message; a new send barges in. One
+  // switch on top of the STT + TTS halves. Off by default; needs voice on.
+  const [convoMode, setConvoMode] = useState(false);
+  const [convoListening, setConvoListening] = useState(false);
+  const convoRef = useRef<{ cancel: () => void } | null>(null);
+  const sendRef = useRef<(t: string, opts?: { voice?: boolean }) => void>(() => {});
+  // Voice presence: what the hands-free session is doing right now, plus the
+  // last thing Ares HEARD (flashed as a caption so you know it got you right).
+  const [presenceHeard, setPresenceHeard] = useState<string | null>(null);
+  const presenceHeardTimer = useRef<number | null>(null);
+  const flashHeard = useCallback((txt: string) => {
+    setPresenceHeard(txt);
+    if (presenceHeardTimer.current !== null) window.clearTimeout(presenceHeardTimer.current);
+    presenceHeardTimer.current = window.setTimeout(() => setPresenceHeard(null), 3200);
+  }, []);
+  const activeBusy = active?.busy ?? false;
+  // Mirror convoMode into a ref so async arms can re-check the CURRENT value at
+  // promise-resolution time instead of the value captured when the effect ran.
+  const convoModeRef = useRef(convoMode);
+  convoModeRef.current = convoMode;
+  // True while sidecarListen() is in flight (mic opening) but before the handle
+  // exists — closes the double-arm window without putting transient state in
+  // the effect's dependency array.
+  const convoArmingRef = useRef(false);
+  useEffect(() => {
+    if (!convoMode || !prefs.voiceEnabled) return;
+    // Enabling conversation mode opens the channel immediately; after every
+    // reply or empty utterance it re-arms once Ares is idle.
+    if (voice.speaking || convoListening || activeBusy || convoRef.current || convoArmingRef.current) return;
+    // NO cleanup-cancellation here, on purpose. This effect sets convoListening
+    // — one of its own dependencies — so React ALWAYS runs its cleanup right
+    // after the set. The old `cancelled` flag therefore tripped on every single
+    // arm: the mic-open promise resolved into the cancelled branch, skipped
+    // attaching the transcript handler, and convoListening was orphaned at true
+    // ("listening…" forever, mic dead). Stale arms are instead reconciled below
+    // by re-checking convoModeRef when the promise resolves.
+    convoArmingRef.current = true;
+    setConvoListening(true);
+    // AUTO listen: the sidecar's VAD ends the utterance the moment you stop
+    // talking (with its own no-speech + hard caps), so the reply sends itself —
+    // no fixed window, no waiting. The 30s client cap is pure belt-and-braces.
+    void sidecarListen(undefined, { auto: true }).then((handle) => {
+      convoArmingRef.current = false;
+      if (!convoModeRef.current) {
+        // Conversation was switched off while the mic was opening — walk the
+        // arm back completely instead of leaving "listening" stuck on.
+        void handle.cancel();
+        setConvoListening(false);
+        return;
+      }
+      convoRef.current = handle;
+      const cap = window.setTimeout(() => void handle.stop(), 30_000);
+      void handle.transcript.then((txt) => {
+        window.clearTimeout(cap);
+        convoRef.current = null;
+        setConvoListening(false);
+        if (txt.trim() && convoModeRef.current) {
+          flashHeard(txt.trim());
+          sendRef.current(txt.trim(), { voice: true });
+        }
+      });
+    }).catch(() => {
+      convoArmingRef.current = false;
+      // Avoid a hot reconnect loop while the local sidecar is being repaired.
+      window.setTimeout(() => setConvoListening(false), 1_500);
+    });
+  }, [voice.speaking, convoMode, prefs.voiceEnabled, convoListening, activeBusy, flashHeard]);
+
+  // ── Wake word: "Hey Ares" arms the mic hands-free ─────────────────────────
+  const wakeRef = useRef<WakeHandle | null>(null);
+  // Wake works WITHOUT the speak-replies toggle — hearing you and speaking to
+  // you are independent. (It was chained to voiceEnabled, so a reset voice
+  // toggle silently killed the wake word too.)
+  const wakeOn = (prefs.wakeWord ?? false) && native && voiceEngine.phase === "running";
+  // Surfaced in the dock: silence was the old failure mode — you toggled "Hey
+  // Ares" on, the sidecar was down, and NOTHING told you it couldn't hear.
+  const [wakeStatus, setWakeStatus] = useState<"off" | "arming" | "armed" | "offline">("off");
+  useEffect(() => {
+    if (!wakeOn) {
+      wakeRef.current?.dispose();
+      wakeRef.current = null;
+      setWakeStatus("off");
+      return;
+    }
+    let disposed = false;
+    let retry: number | null = null;
+    const arm = () => {
+      if (disposed) return;
+      setWakeStatus("arming");
+      wakeListen((_heard) => {
+        // Woken: cut any speech and open the command mic immediately. The
+        // monitor-edge pulse is the acknowledgement; a spoken "Yeah?" made us
+        // wait and then risked transcribing Ares through its own speaker.
+        voiceRef.current.stop();
+        setConvoListening(true);
+        // The wake stream closes before this event is emitted. One animation
+        // frame lets picky Windows audio drivers release the device cleanly.
+        window.setTimeout(() => {
+          if (!wakeRef.current) { setConvoListening(false); return; }
+          void sidecarListen(undefined, { auto: true }).then((handle) => {
+            const cap = window.setTimeout(() => void handle.stop(), 30_000);
+            void handle.transcript.then((txt) => {
+              window.clearTimeout(cap);
+              setConvoListening(false);
+              // Symmetric to the 32ms wake→stt handoff above: give the audio
+              // device a beat to release before the wake loop reopens it, or
+              // picky Windows drivers fail the reopen and kill wake listening.
+              window.setTimeout(() => wakeRef.current?.resume(), 120);
+              if (txt.trim()) {
+                flashHeard(txt.trim());
+                sendRef.current(txt.trim(), { voice: true });
+              }
+            });
+          }).catch(() => { setConvoListening(false); window.setTimeout(() => wakeRef.current?.resume(), 120); });
+        }, 32);
+      }, () => {
+        // Sidecar died AFTER arming (crash/restart). The old code left the UI
+        // claiming "· listening" forever — drop to offline and re-arm.
+        if (!disposed) {
+          wakeRef.current = null;
+          setWakeStatus("offline");
+          retry = window.setTimeout(arm, 5_000);
+        }
+      }).then((handle) => {
+        if (disposed) { handle.dispose(); return; }
+        wakeRef.current = handle;
+        setWakeStatus("armed");
+      }).catch(() => {
+        // Sidecar down / wake engine unavailable — SHOW it, then keep retrying.
+        if (!disposed) {
+          setWakeStatus("offline");
+          retry = window.setTimeout(arm, 30_000);
+        }
+      });
+    };
+    arm();
+    return () => {
+      disposed = true;
+      if (retry !== null) window.clearTimeout(retry);
+      wakeRef.current?.dispose();
+      wakeRef.current = null;
+    };
+  }, [wakeOn]);
+  // Leaving convo mode stops any listen in progress. Reset convoListening even
+  // when no handle exists — an arm may have died between setConvoListening(true)
+  // and the handle arriving, and this is the state's last line of defense.
+  useEffect(() => {
+    if (convoMode) return;
+    if (convoRef.current) { convoRef.current.cancel(); convoRef.current = null; }
+    setConvoListening(false);
+  }, [convoMode]);
+
   // HELM live feed: while the war room is visible, re-scry on open, every 5s,
   // and on every busy flip (turn start/end) so missions, todos, and cost move
   // without touching ⟳. Gated on view so the idle app costs nothing.
@@ -1881,11 +2515,13 @@ function App() {
     setDaemon("running");
     if (!native) return;
     if (event?.sessionId) {
+      const previousPrimary = primarySessionRef.current;
+      primarySessionRef.current = event.sessionId;
       setSessions((prev) => {
         if (prev.some((session) => session.id === event.sessionId)) return prev;
-        const emptyIndex = prev.findIndex(
-          (session) => session.loaded !== false && session.items.length === 0 && session.title === "New session",
-        );
+        // Replace only the bootstrap placeholder. A newly-created empty card may
+        // sit beside it while the daemon starts and must keep its own id/history.
+        const emptyIndex = prev.findIndex((session) => session.id === previousPrimary);
         if (emptyIndex < 0) return prev;
         const next = [...prev];
         const oldId = next[emptyIndex].id;
@@ -1925,7 +2561,7 @@ function App() {
     const queued = pendingGoal.current;
     if (queued) {
       pendingGoal.current = null;
-      void invoke("ares_send", { goal: queued.goal, sessionId: queued.sessionId }).catch((err) => {
+      void invoke("ares_send", { goal: queued.goal, sessionId: queued.sessionId, voice: queued.voice ?? false }).catch((err) => {
         applyTo(queued.sessionId, (s) => ({ ...foldEvent(s, { type: "desktop_error", text: String(err) }), busy: false }));
       });
     }
@@ -1963,7 +2599,6 @@ function App() {
         case "reasoning_set":
         case "routing_set":
         case "routing_mode_set":
-        case "model_switched":
         case "openrouter_key_set":
         case "provider_key_set":
         case "engine_config_set":
@@ -1974,6 +2609,22 @@ function App() {
           }
           if (e.type === "skill_toggle_set") daemonCmd({ type: "skills_list" });
           return true;
+        case "model_switched":
+          pushLog(`[garrison] model pinned · ${e.provider ?? ""}/${e.model ?? ""}`);
+          return true;
+        case "model_switch_failed": {
+          const currentProvider = String(e.currentProvider ?? prefsRef.current.provider);
+          const currentModel = String(e.currentModel ?? prefsRef.current.model);
+          const restored = { ...prefsRef.current, provider: currentProvider, model: currentModel };
+          setPrefs(restored);
+          savePrefs(restored);
+          applyTo(e.sessionId ?? activeRef.current, (s) => foldEvent({
+            ...s,
+            turnProvider: currentProvider,
+            turnModel: currentModel,
+          }, { type: "desktop_error", text: `Model selection kept on ${currentProvider}/${currentModel}: ${String(e.error ?? "provider preflight failed")}` }));
+          return true;
+        }
         case "anthropic_login_url": {
           // Daemon started the loopback server and opened the browser — just
           // show the waiting state. Code arrives automatically via the redirect.
@@ -1985,12 +2636,54 @@ function App() {
           if (e.ok) {
             setAnthropicAuth({ open: true, status: "done" });
             window.setTimeout(() => {
-              daemonCmd({ type: "model_switch", provider: prefsRef.current.provider, model: prefsRef.current.model });
+              daemonCmd({ type: "model_switch", provider: prefsRef.current.provider, model: prefsRef.current.model, sessionId: activeRef.current });
               setAnthropicAuth({ open: false, status: "idle" });
             }, 1400);
           } else {
             setAnthropicAuth({ open: true, status: "error", error: String(e.error ?? "sign-in failed") });
           }
+          return true;
+        }
+        case "openai_login_url": {
+          // Device-code flow: open the verification URL (code pre-filled) in the
+          // real browser; the daemon polls until the user approves.
+          const oe = e as { url?: unknown; userCode?: unknown };
+          if (oe.url) void invoke("ares_open_url", { url: String(oe.url) }).catch(() => null);
+          setOpenaiAuth((s) => ({ ...s, signingIn: true }));
+          pushGatewayToast(`Opened ChatGPT sign-in in your browser${oe.userCode ? ` — code ${String(oe.userCode)}` : ""}.`);
+          return true;
+        }
+        case "openai_login_done": {
+          const oe = e as { ok?: unknown; email?: unknown; plan?: unknown; error?: unknown };
+          setOpenaiAuth({ signingIn: false, connected: oe.ok === true, email: typeof oe.email === "string" ? oe.email : null, plan: typeof oe.plan === "string" ? oe.plan : null });
+          pushGatewayToast(oe.ok ? `🟢 ChatGPT connected${oe.plan ? ` — ${String(oe.plan)} plan` : ""}. GPT models use your subscription.` : `ChatGPT sign-in failed: ${oe.error ? stringify(oe.error) : "unknown"}`);
+          return true;
+        }
+        case "openai_auth_status": {
+          const oe = e as { configured?: unknown; email?: unknown; plan?: unknown };
+          setOpenaiAuth({ signingIn: false, connected: oe.configured === true, email: typeof oe.email === "string" ? oe.email : null, plan: typeof oe.plan === "string" ? oe.plan : null });
+          return true;
+        }
+        case "kimi_login_url": {
+          // Device flow: the verification URL arrives with the code pre-filled;
+          // open it in the real browser and show the waiting state.
+          const ke = e as { url?: unknown };
+          if (ke.url) void invoke("ares_open_url", { url: String(ke.url) }).catch(() => null);
+          setKimiAuth((s) => ({ ...s, signingIn: true }));
+          pushGatewayToast("Opened Kimi sign-in in your browser — approve to connect.");
+          return true;
+        }
+        case "kimi_login_done": {
+          const ke = e as { ok?: unknown; detail?: unknown; error?: unknown };
+          setKimiAuth({ signingIn: false, connected: ke.ok === true, detail: typeof ke.detail === "string" ? ke.detail : null });
+          pushGatewayToast(ke.ok === true
+            ? "🟢 Kimi connected. Kimi models use your subscription."
+            : `Kimi sign-in failed: ${ke.error ? stringify(ke.error) : "unknown"}`);
+          return true;
+        }
+        case "kimi_auth_status": {
+          const ke = e as { configured?: unknown; detail?: unknown };
+          setKimiAuth({ signingIn: false, connected: ke.configured === true, detail: typeof ke.detail === "string" ? ke.detail : null });
           return true;
         }
         case "consciousness_status": {
@@ -2063,6 +2756,38 @@ function App() {
         case "skills_list":
           setSkills(Array.isArray(e.skills) ? (e.skills as SkillInfo[]) : []);
           return true;
+        case "skill_result": {
+          const id = (e as { invokeId?: string }).invokeId;
+          const pending = id ? skillInvokePending.current.get(id) : undefined;
+          if (pending && id) {
+            clearTimeout(pending.timer);
+            skillInvokePending.current.delete(id);
+            pending.resolve({ ok: (e as { ok?: boolean }).ok === true, result: (e as { result?: unknown }).result, error: (e as { error?: string }).error });
+          } else {
+            const ok = (e as { ok?: boolean }).ok === true;
+            const result = (e as { result?: unknown }).result;
+            const text = ok
+              ? (typeof result === "string" ? result : `${e.name ?? "Skill"} is ready`)
+              : String((e as { error?: string }).error ?? "skill failed");
+            setSkillToast({ name: String(e.name ?? "Skill"), text: text.slice(0, 180), ok });
+            window.setTimeout(() => setSkillToast(null), 4500);
+          }
+          return true;
+        }
+        case "skillhub_list":
+        case "skillhub_installed":
+        case "skillhub_published":
+          // Bridge to the SkillHub browser component via a window event (avoids
+          // threading hub state through the settings tree). Refresh the local
+          // skills list after an install so a freshly-pulled skill shows at once.
+          window.dispatchEvent(new CustomEvent(`ares:${e.type}`, { detail: e }));
+          if (e.type === "skillhub_installed" && (e as { ok?: boolean }).ok) daemonCmd({ type: "skills_list" });
+          if (e.type === "skillhub_published") {
+            const ok = (e as { ok?: boolean }).ok === true;
+            setSkillToast({ name: "SkillHub", text: ok ? "Published to the SkillHub 🎉" : `Publish failed: ${(e as { error?: string }).error ?? "unknown"}`, ok });
+            window.setTimeout(() => setSkillToast(null), 4500);
+          }
+          return true;
         case "usage_stats":
           setUsageStats((e.stats as UsageStats | null) ?? null);
           return true;
@@ -2106,10 +2831,44 @@ function App() {
           if (Array.isArray(list)) setMcpConnectors(list as McpConnectorVm[]);
           return true;
         }
+        case "mcp_tools": {
+          const name = typeof (e as { name?: unknown }).name === "string" ? (e as { name: string }).name : "";
+          if (name) {
+            const tools = Array.isArray((e as { tools?: unknown }).tools) ? ((e as unknown as { tools: McpToolsVm["tools"] }).tools) : [];
+            const error = typeof (e as { error?: unknown }).error === "string" ? (e as { error: string }).error : null;
+            setMcpTools((prev) => ({ ...prev, [name]: { loading: false, tools, error } }));
+          }
+          return true;
+        }
         case "mcp_connect_result":
           setMcpConnecting(null);
           pushGatewayToast(e.ok ? `🔌 Connected ${e.name ?? "connector"} — its tools are live.` : `Connect failed: ${e.error ? stringify(e.error) : "unknown"}`);
           return true;
+        case "mcp_search_results": {
+          const text = typeof (e as { text?: unknown }).text === "string" ? (e as { text: string }).text : "";
+          const results = Array.isArray((e as { results?: unknown }).results) ? ((e as unknown as { results: McpRegistryResult[] }).results) : [];
+          setMcpSearch((prev) => (prev.text === text ? { ...prev, searching: false, results } : prev));
+          return true;
+        }
+        case "ollama_pull_progress": {
+          const model = typeof (e as { model?: unknown }).model === "string" ? (e as { model: string }).model : "";
+          if (model) {
+            const pct = typeof (e as { pct?: unknown }).pct === "number" ? (e as { pct: number }).pct : null;
+            const status = typeof (e as { status?: unknown }).status === "string" ? (e as { status: string }).status : "";
+            setOllamaPulls((prev) => ({ ...prev, [model]: { pct, status } }));
+          }
+          return true;
+        }
+        case "ollama_pull_done": {
+          const model = typeof (e as { model?: unknown }).model === "string" ? (e as { model: string }).model : "";
+          if (model) {
+            const ok = (e as { ok?: unknown }).ok !== false;
+            const error = typeof (e as { error?: unknown }).error === "string" ? (e as { error: string }).error : undefined;
+            setOllamaPulls((prev) => ({ ...prev, [model]: ok ? { pct: 100, status: "success", done: true } : { pct: null, status: "error", error } }));
+            pushGatewayToast(ok ? `🦙 Pulled ${model} — it's ready to use.` : `Pull failed: ${error ?? "unknown error"}`);
+          }
+          return true;
+        }
         case "oauth_status":
           if (Array.isArray(e.providers)) setOauthProviders(e.providers as OAuthProviderVm[]);
           return true;
@@ -2223,6 +2982,20 @@ function App() {
       if (!mounted || buffered.seq <= lastSeq.current) return;
       lastSeq.current = buffered.seq;
       if (handleShellEvent(buffered.event)) return;
+      // Vanguard drive-mode ack: flip the per-session badge, and play the
+      // engine-switch burst when a session powers up.
+      if ((buffered.event as { type?: unknown }).type === "vanguard_mode") {
+        const ack = buffered.event as unknown as { sessionId?: string; enabled?: boolean; workspace?: string };
+        const owner = ack.sessionId ?? primarySessionRef.current ?? "__primary__";
+        setVgModes((prev) => ({ ...prev, [owner]: ack.enabled === true }));
+        if (typeof ack.workspace === "string") setVgWorkspaces((prev) => ({ ...prev, [owner]: ack.workspace! }));
+        if (ack.enabled === true) {
+          setVgBurst(true);
+          if (vgBurstTimer.current !== null) window.clearTimeout(vgBurstTimer.current);
+          vgBurstTimer.current = window.setTimeout(() => setVgBurst(false), 2200);
+        }
+        return;
+      }
       // Route the event to the session it belongs to (multi-session daemon
       // tags every event with sessionId). Untagged events go to the active card.
       const sid = (buffered.event as { sessionId?: string }).sessionId;
@@ -2235,12 +3008,27 @@ function App() {
       if (!sid || sid === activeRef.current) {
         if ((ev.type === "text_delta" || ev.type === "thinking_delta") && ev.text) pushTokenFlow(ev.text.length);
         else if (ev.type === "tool_use_input_delta" && ev.deltaJson) pushTokenFlow(ev.deltaJson.length);
+        // Voice: speak natural phrases while reply text streams. Only the session
+        // you're looking at speaks; thinking + tool noise never do.
+        if (prefs.voiceEnabled && sid !== livingSessionRef.current) {
+          if (ev.type === "turn_start") resetSpokenStream();
+          else if (ev.type === "text_delta" && ev.text) appendSpokenDelta(ev.text);
+          else if (ev.type === "message_done" && spokenBuf.current && !/\s$/.test(spokenBuf.current)) {
+            // Separate assistant rounds around tool calls. Token deltas within a
+            // round still concatenate exactly, so BPE word pieces stay intact.
+            spokenBuf.current += " ";
+          } else if (ev.type === "turn_end") flushSpokenBuffer(true, true);
+        }
       }
       const elsewhere = document.hidden || (!!sid && sid !== activeRef.current);
       if (ev.type === "permission_request" && elsewhere) {
         fireNotification("Ares needs your approval", ev.reason || ev.toolName || "A tool needs your OK");
-      } else if (ev.type === "turn_end" && elsewhere) {
+      } else if (ev.type === "turn_end" && elsewhere && sid !== livingSessionRef.current) {
         fireNotification("Ares finished a task", "A background turn just completed.");
+        // Spoken heads-up: you're away from the window — say it out loud too.
+        if (prefsRef.current.voiceEnabled && prefsRef.current.voiceNotify !== false) {
+          voiceRef.current.speak("Heads up — a background task just finished.");
+        }
       }
       // Live browser frame — Ares driving its own embedded browser. Don't fold
       // into the transcript; push it to the Forge "Live" panel and open it.
@@ -2248,6 +3036,14 @@ function App() {
         setLiveBrowser({ frame: ev.data.image, at: Date.now() });
         setForge((f) => (f.open && f.tab === "live" ? f : { ...f, open: true, tab: "live" }));
         return;
+      }
+      if (ev.type === "tool_progress" && ev.data?.kind === "browser_target" && typeof ev.data.url === "string") {
+        const target = { url: ev.data.url, title: typeof ev.data.title === "string" ? ev.data.title : "", at: Date.now() };
+        setLiveTarget(target);
+        setLiveUrl(target.url);
+        setForge((f) => (f.open && f.tab === "live" ? f : { ...f, open: true, tab: "live" }));
+        // Do not return: the progress event also belongs in the running tool's
+        // activity stream, so the transcript and Forge stay in sync.
       }
       // Embedded-browser command from the daemon — drive Ares's in-app browser and
       // return the result over the same channel. This is the request/response
@@ -2287,8 +3083,11 @@ function App() {
         }
         return next;
       };
-      if (sid) applyTo(sid, fold);
-      else apply(fold);
+      // Modern turn events are tagged. Legacy/daemon-global events are pinned
+      // to the bootstrap card instead of whichever session the owner is viewing.
+      const owner = sid ?? primarySessionRef.current;
+      if (owner) applyTo(owner, fold);
+      else pushLog(`[routing] quarantined unowned event ${buffered.event.type}`);
     };
 
     const poll = async () => {
@@ -2358,9 +3157,13 @@ function App() {
   }, []);
 
   // ── intents ──────────────────────────────────────────────────────────────
-  const send = useCallback((text: string) => {
+  const send = useCallback((text: string, opts?: { voice?: boolean; images?: string[] }) => {
     const trimmed = text.trim();
     if (!trimmed) return;
+    // Barge-in: sending a new message cuts any reply still being spoken, and
+    // resets the spoken buffer so the next turn starts clean.
+    voiceRef.current.stop();
+    resetSpokenStream();
     // Slash command: "/mcp" (or /connectors) opens the connector Directory
     // instead of sending a message — the one-word way in the user asked for.
     if (/^\/(mcp|connectors?)$/i.test(trimmed)) {
@@ -2375,22 +3178,27 @@ function App() {
     const ultraDirective = prefsRef.current.ultra
       ? "[ULTRA MODE — fleet by default] Run this task as a parallel agent FLEET unless it is trivial or purely conversational (a one-line answer, a single tiny edit, a greeting). Your FIRST move should be the Conductor tool: author a FleetSpec that fans out the independent angles, then reduce:\"judge\" to synthesize — do NOT do it as one linear pass and do NOT hand-roll what a fleet should do. Any task with research, multi-file or multi-angle review, design options, audits, refactors, or broad sweeps QUALIFIES — when in doubt, spawn the fleet. If you genuinely cannot decompose it, say so in one line, then proceed normally.\n\n---\n\n"
       : "";
-    const goal = ultraDirective + trimmed;
+    // Images ride along to the daemon appended to the goal (its
+    // contentFromUserInput parses data:image URLs into image blocks), but are
+    // stored on the item separately so the bubble renders thumbnails.
+    const images = (opts?.images ?? []).filter((u) => u.startsWith("data:image/"));
+    const imagePart = images.length ? "\n" + images.join("\n") : "";
+    const goal = ultraDirective + trimmed + imagePart;
     applyTo(sid, (s) => ({
       ...s,
-      title: s.title === "New session" ? compact(trimmed, 42) : s.title,
-      items: [...s.items, { kind: "user", key: nextKey(), text: trimmed }],
+      title: s.title === "New session" ? compact(trimmed || "image", 42) : s.title,
+      items: [...s.items, { kind: "user", key: nextKey(), text: trimmed, images: images.length ? images : undefined }],
       busy: true,
     }));
     if (native) {
       if (daemon !== "running") {
-        pendingGoal.current = { goal, sessionId: sid };
+        pendingGoal.current = { goal, sessionId: sid, voice: opts?.voice === true };
         applyTo(sid, (s) => foldEvent(s, { type: "system_reminder_injected", source: "verifier", text: "Garrison is down — restarting, your message is queued." }));
         restartDaemon();
         return;
       }
-      void invoke("ares_send", { goal, sessionId: sid }).catch((err) => {
-        pendingGoal.current = { goal: trimmed, sessionId: sid };
+      void invoke("ares_send", { goal, sessionId: sid, voice: opts?.voice === true }).catch((err) => {
+        pendingGoal.current = { goal, sessionId: sid, voice: opts?.voice === true };
         applyTo(sid, (s) => ({ ...foldEvent(s, { type: "desktop_error", text: `${String(err)} — restarting the Garrison, message queued.` }), busy: true }));
         restartDaemon();
       });
@@ -2454,18 +3262,22 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [native, daemon, applyTo]);
+  // Conversation mode auto-sends the recognized transcript through the same path.
+  sendRef.current = send;
 
   /** Steer: queue a message mid-turn; the daemon folds it in at a safe boundary. */
-  const steer = useCallback((text: string) => {
+  const steer = useCallback((text: string, images?: string[]) => {
     const trimmed = text.trim();
-    if (!trimmed) return;
+    const imgs = (images ?? []).filter((u) => u.startsWith("data:image/"));
+    if (!trimmed && imgs.length === 0) return;
     const sid = activeRef.current;
     applyTo(sid, (s) => ({
       ...s,
       items: [...s.items, { kind: "steer", key: nextKey(), text: trimmed }],
       steerQueued: (s.steerQueued ?? 0) + 1,
     }));
-    if (native) void invoke("ares_daemon_command", { command: { type: "steer", text: trimmed, sessionId: sid } }).catch(() => null);
+    const steerText = trimmed + (imgs.length ? "\n" + imgs.join("\n") : "");
+    if (native) void invoke("ares_daemon_command", { command: { type: "steer", text: steerText, sessionId: sid } }).catch(() => null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [native, applyTo]);
 
@@ -2499,6 +3311,26 @@ function App() {
     else setAnthropicAuth({ open: true, status: "error", error: "sign-in needs the daemon (installed app)." });
   }, [native, daemonCmd]);
 
+  const startOpenaiSignIn = useCallback(() => {
+    if (!native) { pushGatewayToast("ChatGPT sign-in needs the installed app."); return; }
+    setOpenaiAuth((s) => ({ ...s, signingIn: true }));
+    daemonCmd({ type: "openai_login_start" });
+  }, [native, daemonCmd, pushGatewayToast]);
+
+  const startKimiSignIn = useCallback(() => {
+    if (!native) { pushGatewayToast("Kimi sign-in needs the installed app."); return; }
+    setKimiAuth((s) => ({ ...s, signingIn: true }));
+    daemonCmd({ type: "kimi_login_start" });
+  }, [native, daemonCmd, pushGatewayToast]);
+
+  // Reflect existing ChatGPT / Kimi connections when the daemon comes up.
+  useEffect(() => {
+    if (native && daemon === "running") {
+      daemonCmd({ type: "openai_auth_status" });
+      daemonCmd({ type: "kimi_auth_status" });
+    }
+  }, [native, daemon, daemonCmd]);
+
   // finishAnthropicSignIn no longer needed — loopback flow handles it automatically.
 
   const openSession = useCallback((id: string) => {
@@ -2521,6 +3353,14 @@ function App() {
     setSessions((prev) => [fresh, ...prev]);
     openSession(fresh.id);
   };
+
+  const toggleRail = useCallback(() => {
+    setRailCollapsed((current) => {
+      const next = !current;
+      window.localStorage.setItem("ares.rail.collapsed", next ? "1" : "0");
+      return next;
+    });
+  }, []);
 
   const respondPermission = (id: string, decision: string) => {
     // Route the answer to the session that actually raised this prompt (B4) —
@@ -2558,29 +3398,20 @@ function App() {
       await invoke("ares_set_reasoning", { level: next.reasoning }).catch(() => null);
       if (next.provider !== prefs.provider || next.model !== prefs.model) {
         await invoke("ares_daemon_command", {
-          command: { type: "model_switch", provider: next.provider, model: next.model },
+          command: { type: "model_switch", provider: next.provider, model: next.model, sessionId: activeRef.current },
         }).catch(() => null);
       }
     };
     void applyLive();
   };
 
-  const currentEffort: EffortStep = prefs.ultra ? "ultra" : prefs.reasoning;
-  // One control for the whole slider. ULTRA pins the model dial to "max" and
-  // raises the fleet flag; every other step is a plain reasoning level.
-  const setEffort = (step: EffortStep) => {
-    const ultra = step === "ultra";
-    const reasoning: ReasoningLevel = ultra ? "max" : step;
-    const p = { ...prefs, reasoning, ultra };
-    setPrefs(p);
-    savePrefs(p);
-    // The daemon only knows the four model levels — ultra rides as "max" until
-    // the orchestrator is wired to consume the fleet flag.
-    if (native) void invoke("ares_set_reasoning", { level: reasoning }).catch(() => null);
-  };
-  const cycleReasoning = () => {
-    const next = EFFORT_STEPS[(EFFORT_STEPS.indexOf(currentEffort) + 1) % EFFORT_STEPS.length];
-    setEffort(next);
+  const chooseReasoning = (level: ReasoningLevel) => {
+    const next = { ...prefs, reasoning: level };
+    setPrefs(next);
+    savePrefs(next);
+    if (native) void invoke("ares_set_reasoning", { level }).catch((err) => {
+      apply((s) => foldEvent(s, { type: "desktop_error", text: `effort change failed: ${String(err)}` }));
+    });
   };
 
   const FLAME_MODES: Prefs["flameMode"][] = ["immersive", "clean", "combat"];
@@ -2591,10 +3422,69 @@ function App() {
     savePrefs(p);
   };
 
+  const setVoiceEnabled = (on: boolean) => {
+    const p = { ...prefs, voiceEnabled: on };
+    setPrefs(p); savePrefs(p);
+    if (!on) { setConvoMode(false); voiceRef.current.stop(); resetSpokenStream(); }
+  };
+  const setWakeWord = (on: boolean) => {
+    const p = { ...prefs, wakeWord: on };
+    setPrefs(p); savePrefs(p);
+  };
+
+  // ── Read-aloud selection: select reply text → a floating 🔊 Speak button ──
+  const [readAloud, setReadAloud] = useState<{ x: number; y: number; text: string } | null>(null);
+  useEffect(() => {
+    const onMouseUp = () => {
+      // Defer a tick so the selection is final before we read it.
+      window.setTimeout(() => {
+        const sel = window.getSelection();
+        const text = sel?.toString().trim() ?? "";
+        if (!sel || !text || text.length < 8 || sel.rangeCount === 0) { setReadAloud(null); return; }
+        // Only offer it for selections inside the chat transcript.
+        const anchor = sel.anchorNode instanceof Element ? sel.anchorNode : sel.anchorNode?.parentElement;
+        if (!anchor?.closest(".chat")) { setReadAloud(null); return; }
+        const rect = sel.getRangeAt(0).getBoundingClientRect();
+        setReadAloud({
+          x: Math.min(window.innerWidth - 110, Math.max(8, rect.left + rect.width / 2 - 40)),
+          y: Math.max(8, rect.top - 38),
+          text: text.slice(0, 4000),
+        });
+      }, 0);
+    };
+    const dismiss = () => setReadAloud(null);
+    document.addEventListener("mouseup", onMouseUp);
+    document.addEventListener("keydown", dismiss);
+    document.addEventListener("scroll", dismiss, true);
+    return () => {
+      document.removeEventListener("mouseup", onMouseUp);
+      document.removeEventListener("keydown", dismiss);
+      document.removeEventListener("scroll", dismiss, true);
+    };
+  }, []);
+  // Fetch skills for the tray whenever the daemon attaches.
+  useEffect(() => { if (native) daemonCmd({ type: "skills_list" }); }, [native, daemonCmd]);
+  const [skillToast, setSkillToast] = useState<{ name: string; text: string; ok: boolean } | null>(null);
+  const runSurface = (skill: SkillInfo, surface: SkillSurface) => {
+    setSkillToast({ name: skill.name, text: `Running ${surface.label}…`, ok: true });
+    void skillInvoke(skill.name, surface.input ?? { op: surface.id }).then((r) => {
+      const result = r.result as { audio?: string; mime?: string; message?: string } | string | undefined;
+      if (r.ok && result && typeof result === "object" && result.audio) {
+        voiceRef.current.playAudio(result.audio, result.mime);
+      }
+      const text = r.ok
+        ? (typeof result === "string" ? result : result?.message ?? (result?.audio ? `${surface.label} playing` : `${surface.label} done`))
+        : (r.error ?? "failed");
+      setSkillToast({ name: skill.name, text: String(text).slice(0, 160), ok: r.ok });
+      window.setTimeout(() => setSkillToast(null), 4000);
+    });
+  };
+
   // ── the Forge ─────────────────────────────────────────────────────────────
   const [sandboxCode, setSandboxCode] = useState(SANDBOX_SEED);
-  const [sandboxSrc, setSandboxSrc] = useState<{ src?: string; srcdoc?: string } | null>(null);
-  const [holoSrc, setHoloSrc] = useState<{ src?: string; srcdoc?: string } | null>(null);
+  const [sandboxSrc, setSandboxSrc] = useState<{ src?: string; srcdoc?: string; path?: string } | null>(null);
+  const [holoSrc, setHoloSrc] = useState<{ src?: string; srcdoc?: string; path?: string } | null>(null);
+  const [previewRevision, setPreviewRevision] = useState(0);
 
   const [holoMeta, setHoloMeta] = useState<string>("MECH MK I — built-in showpiece");
 
@@ -2608,7 +3498,7 @@ function App() {
         const html = buildHolotableHtml({ spec });
         if (native) {
           const out = await invoke<string>("ares_forge_write", { name: "holo-spec", html });
-          setHoloSrc({ src: `${convertFileSrc(out)}?t=${Date.now()}` });
+          setHoloSrc({ src: `${convertFileSrc(out)}?t=${Date.now()}`, path: out });
         } else {
           setHoloSrc({ srcdoc: html });
         }
@@ -2630,7 +3520,7 @@ function App() {
     // section, not the flat preview — otherwise the holo panel looks redundant.
     if (/holo[\w-]*\.html?$/i.test(path)) {
       if (native) {
-        setHoloSrc({ src: `${convertFileSrc(path)}?t=${Date.now()}` });
+        setHoloSrc({ src: `${convertFileSrc(path)}?t=${Date.now()}`, path });
         setHoloMeta(label);
         setForge({ open: true, tab: "holo", artifact: { path, label } });
         return;
@@ -2644,7 +3534,7 @@ function App() {
       if (native) {
         try {
           const path = await invoke<string>("ares_forge_write", { name: "sandbox", html: code });
-          setSandboxSrc({ src: `${convertFileSrc(path)}?t=${Date.now()}` });
+          setSandboxSrc({ src: `${convertFileSrc(path)}?t=${Date.now()}`, path });
         } catch (err) {
           apply((s) => foldEvent(s, { type: "desktop_error", text: String(err) }));
         }
@@ -2660,7 +3550,7 @@ function App() {
     if (native) {
       try {
         const path = await invoke<string>("ares_forge_write", { name: "holo", html: holoDefaultHtml() });
-        setHoloSrc({ src: `${convertFileSrc(path)}?t=${Date.now()}` });
+        setHoloSrc({ src: `${convertFileSrc(path)}?t=${Date.now()}`, path });
       } catch (err) {
         apply((s) => foldEvent(s, { type: "desktop_error", text: String(err) }));
       }
@@ -2671,7 +3561,6 @@ function App() {
 
   useEffect(() => {
     if (forge.open && forge.tab === "holo") void igniteHolo();
-    if (forge.open && forge.tab === "sandbox" && !sandboxSrc) void runSandbox(SANDBOX_SEED);
   }, [forge, igniteHolo, runSandbox, sandboxSrc]);
 
   // Web links in the transcript/vault are <a target="_blank">, which a Tauri
@@ -2713,13 +3602,17 @@ function App() {
 
   const onForgeGrip = (down: React.PointerEvent) => {
     down.preventDefault();
+    setForgeDragging(true);
     const startX = down.clientX;
     const startW = forgeWidth;
     const move = (e: PointerEvent) => {
-      const w = Math.min(Math.max(startW + (startX - e.clientX), 340), Math.round(window.innerWidth * 0.62));
+      // Cap by what actually fits (never past the chat's min width) instead of a
+      // flat 62% of the window, so dragging wide can't occlude the chat.
+      const w = Math.min(Math.max(startW + (startX - e.clientX), 340), maxForgeFor(window.innerWidth));
       setForgeWidth(w);
     };
     const up = () => {
+      setForgeDragging(false);
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };
@@ -2751,15 +3644,11 @@ function App() {
   const paletteActions: PaletteAction[] = [
     { label: "New session", hint: "fresh Garrison session", run: newSession },
     { label: "Undo last agent change", hint: "restore the latest workspace checkpoint", run: undoLastChange },
-    { label: forge.open ? "Close the Forge" : "Open the Forge", hint: "artifact / sandbox / holotable panel", run: () => setForge((f) => ({ ...f, open: !f.open })) },
-    { label: "Forge: preview", hint: "latest artifact", run: () => setForge((f) => ({ ...f, open: true, tab: "preview" })) },
-    { label: "Forge: sandbox", hint: "live HTML scratchpad", run: () => setForge((f) => ({ ...f, open: true, tab: "sandbox" })) },
-    { label: "Forge: holotable", hint: "3D build engine", run: () => setForge((f) => ({ ...f, open: true, tab: "holo" })) },
+    { label: forge.open ? "Close the Forge" : "Open the Forge", hint: "one live artifact and browser canvas", run: () => setForge((f) => ({ ...f, open: !f.open })) },
     { label: "Settings", hint: "provider · model · keys", run: () => setSettingsOpen(true) },
     { label: "Connectors — the Directory", hint: "/mcp · connect tools & apps", run: () => { setDirectoryOpen(true); daemonCmd({ type: "mcp_list" }); } },
     { label: "Switch model", hint: `current: ${prefs.routingMode === "auto" ? "routing (auto)" : prefs.model}`, run: () => setModelPopOpen(true) },
     { label: "Routing — the war table", hint: "per-lane model assignments", run: () => setRoutingOpen(true) },
-    { label: `Reasoning effort (now ${prefs.reasoning})`, hint: "low / medium / high / max", run: () => setReasoningOpen(true) },
     { label: "Garrison: restart", hint: "bounce the daemon", run: () => { restartAttempts.current = 0; restartDaemon(); } },
     { label: "Garrison: panel", hint: "status + live log", run: () => setGarrisonOpen(true) },
     ...sessions.map((s) => ({ label: `Jump: ${s.title}`, hint: "session", run: () => openSession(s.id) })),
@@ -2780,8 +3669,8 @@ function App() {
   };
 
   // ── floating pill: condense Ares to an always-on-top mic bar ───────────────
-  const PILL_W = 320;
-  const PILL_H = 60;
+  const PILL_W = 276;
+  const PILL_H = 42;
   const enterPill = useCallback(async () => {
     if (native) {
       try {
@@ -2789,7 +3678,8 @@ function App() {
         const [size, pos] = await Promise.all([w.outerSize(), w.outerPosition()]);
         prePillGeom.current = { size, pos };
         await w.setResizable(false);
-        await w.setAlwaysOnTop(pinTop);
+        // Pill is a persistent desktop control, never a second minimize state.
+        await w.setAlwaysOnTop(true);
         await w.setSize(new LogicalSize(PILL_W, PILL_H));
         // tuck it to the top-right of where the window was
         const sf = await w.scaleFactor();
@@ -2799,7 +3689,7 @@ function App() {
       }
     }
     setPill(true);
-  }, [native, pinTop]);
+  }, [native]);
 
   const exitPill = useCallback(async () => {
     if (native) {
@@ -2821,13 +3711,53 @@ function App() {
     setPill(false);
   }, [native]);
 
-  const togglePinTop = useCallback(async () => {
-    const next = !pinTop;
-    setPinTop(next);
-    if (native && pill) {
-      try { await getCurrentWindow().setAlwaysOnTop(next); } catch { /* noop */ }
+  const launchLivingSurface = useCallback(async () => {
+    let sid = activeRef.current;
+    if (!sid) {
+      const fresh = freshSession();
+      sid = fresh.id;
+      setSessions((current) => [fresh, ...current]);
+      setActiveId(sid);
+      activeRef.current = sid;
     }
-  }, [native, pill, pinTop]);
+    let unlistenReady: (() => void) | null = null;
+    try {
+      let acknowledge: (() => void) | null = null;
+      const ready = new Promise<void>((resolve) => { acknowledge = resolve; });
+      if (native) {
+        unlistenReady = await listen<{ sessionId?: string }>("ares:living-surface-ready", ({ payload }) => {
+          if (payload?.sessionId === sid) acknowledge?.();
+        });
+        await invoke("ares_living_surface_open", { sessionId: sid });
+        await Promise.race([
+          ready,
+          new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Living Surface did not finish booting within 8 seconds")), 8_000)),
+        ]);
+      }
+      livingSessionRef.current = sid;
+      setSettingsOpen(false);
+      await enterPill();
+    } catch (error) {
+      livingSessionRef.current = null;
+      if (native) void invoke("ares_living_surface_close").catch(() => null);
+      pushLog(`[living-surface] launch failed: ${String(error)}`);
+      apply((session) => foldEvent(session, { type: "desktop_error", text: `Living Surface failed to start: ${String(error)}` }));
+    } finally {
+      unlistenReady?.();
+    }
+  }, [apply, enterPill, native, pushLog]);
+
+  useEffect(() => {
+    if (!native) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listen("ares:living-surface-closed", () => {
+      if (disposed) return;
+      livingSessionRef.current = null;
+      void exitPill();
+    }).then((un) => { if (disposed) un(); else unlisten = un; });
+    return () => { disposed = true; unlisten?.(); };
+  }, [exitPill, native]);
 
   const routedLanes = ROUTE_LANES.filter((l) => prefs.routing[l]);
   // The model that ACTUALLY handled this session's last turn (sticky/lane/
@@ -2906,6 +3836,58 @@ function App() {
     if (active?.busy && activity) setStrike((n) => n + 1);
   }, [activity]);
 
+  // In pill mode presence belongs to the DESKTOP, not inside the controller.
+  // Rust owns a monitor-sized, click-through WebView so the pulse and captions
+  // remain visible over every application without intercepting the real mouse.
+  const overlayMode: PresenceMode = convoListening
+    ? "listening"
+    : voice.speaking
+      ? "speaking"
+      : activeBusy
+        ? "working"
+        : presenceHeard
+          ? "heard"
+          : "idle";
+  const overlayCaption = convoListening
+    ? "Listening…"
+    : nowSpeaking
+      ? nowSpeaking
+      : presenceHeard
+        ? `“${presenceHeard}”`
+        : activity || (activeBusy ? "Ares is working…" : "");
+  useEffect(() => {
+    if (!native) return;
+    if (!pill || overlayMode === "idle") {
+      void invoke("ares_presence_hide").catch(() => null);
+      return;
+    }
+    void invoke("ares_presence_update", {
+      mode: overlayMode,
+      caption: overlayCaption,
+      detail: activeBusy && activity && overlayCaption !== activity ? activity : "",
+    }).catch(() => null);
+  }, [native, pill, overlayMode, overlayCaption, activeBusy, activity]);
+  useEffect(() => () => {
+    if (native) void invoke("ares_presence_hide").catch(() => null);
+  }, [native]);
+
+  // Hands-free work narration: if a tool run goes quiet, read one concise
+  // activity update. Rapid tool sequences are rate-limited so this stays useful
+  // instead of becoming a stream of implementation noise.
+  const narratedActivity = useRef<{ text: string; at: number }>({ text: "", at: 0 });
+  useEffect(() => {
+    if (!prefs.voiceEnabled || !activeBusy || !(convoMode || pill || wakeOn) || !activity || voice.speaking) return;
+    const now = Date.now();
+    if (activity === narratedActivity.current.text || now - narratedActivity.current.at < 9_000) return;
+    const timer = window.setTimeout(() => {
+      if (spokenBuf.current.trim() || voiceRef.current.speaking) return;
+      narratedActivity.current = { text: activity, at: Date.now() };
+      const clean = activity.replace(/[…]+$/u, "").replace(/\s+/g, " ").trim();
+      if (clean) voiceRef.current.speak(`${clean}${/[.!?]$/.test(clean) ? "" : "."}`);
+    }, 850);
+    return () => window.clearTimeout(timer);
+  }, [prefs.voiceEnabled, activeBusy, convoMode, pill, wakeOn, activity, voice.speaking]);
+
   return (
     <StyleCtx.Provider value={prefs.uiStyle}>
     <div
@@ -2915,7 +3897,10 @@ function App() {
       data-flame={prefs.flameMode}
       data-style={prefs.uiStyle}
       data-panel={forge.open ? "1" : "0"}
+      data-rail={railCollapsed ? "collapsed" : "open"}
+      data-dragging={forgeDragging ? "1" : "0"}
       data-working={active?.busy ? "1" : "0"}
+      data-vanguard={vgModes[active?.id ?? "__primary__"] ? "1" : "0"}
       data-pill={pill ? "1" : "0"}
       data-ultra={prefs.ultra ? "1" : "0"}
       style={{ ["--forge-w" as string]: `${forgeWidth}px`, ["--heat" as string]: heat.toFixed(3), ["--draft" as string]: draft.toFixed(3) }}
@@ -2925,15 +3910,79 @@ function App() {
           daemon={daemon}
           busy={active?.busy ?? false}
           activity={activity ?? ""}
-          pinTop={pinTop}
-          onTogglePin={togglePinTop}
+          conversation={convoMode}
+          listening={convoListening}
+          speaking={voice.speaking}
+          wakeStatus={wakeStatus}
           onExpand={exitPill}
-          onSend={(t) => send(t)}
+          onToggleConversation={() => {
+            if (!convoMode && !prefsRef.current.voiceEnabled) setVoiceEnabled(true);
+            setConvoMode((current) => !current);
+          }}
           onStop={stopTurn}
           native={native}
         />
       ) : null}
       {!bootGone ? <Boot /> : null}
+      {bootGone && !vgIntroDone ? <VanguardBootIntro onDone={() => setVgIntroDone(true)} /> : null}
+      {vgBurst ? <VanguardBurst /> : null}
+      {native && !pill ? (
+        <SkillDock
+          voiceEnabled={prefs.voiceEnabled ?? false}
+          onToggleVoice={setVoiceEnabled}
+          speaking={voice.speaking}
+          listening={convoListening}
+          convoMode={convoMode}
+          onToggleConvo={setConvoMode}
+          wakeWord={prefs.wakeWord ?? false}
+          wakeStatus={wakeStatus}
+          onToggleWake={setWakeWord}
+          onStopVoice={() => { voiceRef.current.stop(); resetSpokenStream(); }}
+          providerLabel={ttsProviderSkill ? `via ${ttsProviderSkill.name}` : "built-in · local"}
+          skills={skills}
+          onSurface={runSurface}
+          toast={skillToast}
+          voiceEngine={voiceEngine}
+          onRepairVoice={repairVoice}
+        />
+      ) : null}
+      {/* Voice PRESENCE: the monitor edges glow while Ares listens (steel) or
+          speaks (ember) — the Gemini-style "I'm here" signal for hands-free. */}
+      {!pill && (convoListening || voice.speaking) ? (
+        <div className="presenceGlow" data-mode={convoListening ? "listening" : "speaking"} aria-hidden="true" />
+      ) : null}
+      {/* Hands-free captions: "listening…" while the mic is open, then a flash
+          of exactly what Ares heard, then the karaoke of what it's saying. */}
+      {!pill && convoListening ? (
+        <div className="presenceCaption" data-kind="listening" aria-live="off">
+          <span className="presenceDot" aria-hidden="true" />
+          listening…
+        </div>
+      ) : null}
+      {!pill && !convoListening && presenceHeard && !voice.speaking ? (
+        <div className="presenceCaption" data-kind="heard" aria-live="off">“{presenceHeard}”</div>
+      ) : null}
+      {/* Karaoke: the sentence being spoken right now, following the voice. */}
+      {!pill && voice.speaking && nowSpeaking ? (
+        <div className="speakingNow" aria-live="off">
+          <span className="speakingNowIcon" aria-hidden="true" />
+          <span className="speakingNowText">{nowSpeaking}</span>
+        </div>
+      ) : null}
+      {/* Read-aloud: select any reply text → a floating speak button. */}
+      {readAloud ? (
+        <button
+          className="readAloudBtn"
+          style={{ left: readAloud.x, top: readAloud.y }}
+          onMouseDown={(e) => e.preventDefault() /* keep the selection alive */}
+          onClick={() => {
+            voiceRef.current.speak(readAloud.text, { force: true });
+            setReadAloud(null);
+          }}
+        >
+          🔊 Speak
+        </button>
+      ) : null}
       <UpdateBanner />
       <WhatsNew />
       <FirstRunGate
@@ -2951,6 +4000,7 @@ function App() {
       <div className="embers" aria-hidden="true" />
       <div className="workGlow" aria-hidden="true" />
       <ScreenFlame />
+      <div className="vgWorkFrame" aria-hidden="true"><i /><i /><i /><b className="c tl" /><b className="c tr" /><b className="c bl" /><b className="c br" /></div>
       {prefs.ultra ? <HackerRain active={active?.busy ?? false} /> : null}
       {strike > 0 ? <div className="strikeFlash" key={strike} aria-hidden="true" /> : null}
       {/* Turbulence filter that makes the composer's flame rim actually lick + flicker. */}
@@ -3069,7 +4119,7 @@ function App() {
                             setPrefs(next as Prefs);
                             prefsRef.current = next as Prefs;
                             savePrefs(next as Prefs);
-                            daemonCmd({ type: "model_switch", provider: "ares", model: m.id });
+                            daemonCmd({ type: "model_switch", provider: "ares", model: m.id, sessionId: activeRef.current });
                             setAccountMenuOpen(false);
                           }}
                         >
@@ -3105,16 +4155,10 @@ function App() {
         </span>
         <div className="winControls">
           <button className="winPill" aria-label="condense to floating pill" title="Condense to a floating pill" onClick={() => void enterPill()}>
-            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="1.5" y="4.5" width="11" height="5" rx="2.5" />
-              <circle cx="4.2" cy="7" r="0.9" fill="currentColor" stroke="none" />
-            </svg>
+            <AresPillGlyph />
           </button>
           {native ? (
             <>
-            <button aria-label="minimize" onClick={() => void invoke("ares_window_minimize").catch(() => null)}>
-              <svg viewBox="0 0 10 10"><line x1="1" y1="5" x2="9" y2="5" /></svg>
-            </button>
             <button aria-label="maximize" onClick={() => void invoke("ares_window_toggle_maximize").catch(() => null)}>
               <svg viewBox="0 0 10 10"><rect x="1.5" y="1.5" width="7" height="7" rx="1" /></svg>
             </button>
@@ -3127,6 +4171,10 @@ function App() {
       </header>
 
       <aside className="rail">
+        <button className="railCollapse" onClick={toggleRail} title="Collapse navigation" aria-label="Collapse navigation">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.4"><path d="M11 4 6 9l5 5"/><path d="M15 3v12"/></svg>
+          <span>Collapse</span>
+        </button>
         <button className="primary" onClick={newSession}>
           + New session
         </button>
@@ -3190,7 +4238,7 @@ function App() {
           <button className="ghost" disabled={!native || daemon !== "running" || active?.busy} onClick={undoLastChange}>
             Undo last agent change
           </button>
-          <button className="ghost" onClick={() => setForge((f) => ({ ...f, open: !f.open, tab: f.open ? f.tab : f.artifact ? "preview" : "sandbox" }))}>
+          <button className="ghost" onClick={() => setForge((f) => ({ ...f, open: !f.open, tab: f.open ? f.tab : f.artifact ? "preview" : liveTarget ? "live" : "preview" }))}>
             {forge.open ? "Close the Forge" : "Open the Forge"}
           </button>
           <button className="ghost" onClick={() => setSettingsOpen(true)}>
@@ -3205,13 +4253,40 @@ function App() {
 
       <main className="stage" data-view={view}>
         <header className="stageHead">
+          {railCollapsed ? (
+            <button className="railReveal" onClick={toggleRail} title="Show navigation" aria-label="Show navigation">
+              <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.4"><path d="m7 4 5 5-5 5"/><path d="M3 3v12"/></svg>
+            </button>
+          ) : null}
           <div>
             <h2>{active?.title ?? "Session"}</h2>
             <span>
               {prefs.routingMode === "auto" ? `routing · ${liveModel}` : `${prefs.provider} / ${prefs.model}`}
               {prefs.routingMode === "auto" && routedLanes.length > 0 ? ` · ${routedLanes.length} lane${routedLanes.length === 1 ? "" : "s"}` : ""}
+              {vgModes[active?.id ?? "__primary__"]
+                ? ` · engine: VANGUARD${vgWorkspaces[active?.id ?? "__primary__"] ? ` · ${vgWorkspaces[active?.id ?? "__primary__"].split(/[\\/]/).filter(Boolean).pop()}` : ""}`
+                : ""}
             </span>
           </div>
+          {view === "chat" ? (
+            <button
+              className="vgDrive"
+              data-on={vgModes[active?.id ?? "__primary__"] ? "1" : "0"}
+              title={vgModes[active?.id ?? "__primary__"]
+                ? "Vanguard is driving — click to hand back to the Ares core"
+                : "Switch this session's engine to Vanguard — works wherever Ares works; say \"work in C:\\path\" to move it"}
+              onClick={() => {
+                const enabled = !vgModes[active?.id ?? "__primary__"];
+                daemonCmd({ type: "vanguard_mode", sessionId: active?.id, enabled });
+              }}
+            >
+              <svg viewBox="0 0 16 18" aria-hidden="true">
+                <path d="M8 1 15 3.6v5.2c0 4.4-2.9 7.1-7 8.2-4.1-1.1-7-3.8-7-8.2V3.6L8 1Z" fill="none" stroke="currentColor" strokeWidth="1.3" />
+                <path d="m5.2 6.2 2.8 5 2.8-5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              VANGUARD
+            </button>
+          ) : null}
         </header>
 
         {view === "helm" ? (
@@ -3292,16 +4367,15 @@ function App() {
             busy={active?.busy ?? false}
             model={liveModel}
             autoRouting={prefs.routingMode === "auto"}
-            reasoning={prefs.reasoning}
             routedLanes={routedLanes}
             todos={active?.todos ?? []}
             steerQueued={active?.steerQueued ?? 0}
-            onSend={send}
+            onSend={(t, imgs) => send(t, { images: imgs })}
             onSteer={steer}
             onStop={stopTurn}
             onModelChip={() => setModelPopOpen(true)}
-            onReasoningChip={cycleReasoning}
             onRoutingChip={() => setRoutingOpen(true)}
+            slashActions={slashActions}
           />
         ) : null}
 
@@ -3313,52 +4387,43 @@ function App() {
             <button className="statusSeg" onClick={() => setModelPopOpen(true)} title={prefs.routingMode === "auto" ? "auto-routing — model that handled the last turn" : "switch provider / model"}>
               <b>model</b><span>{liveModel}</span>
             </button>
-            <button className="statusSeg" data-ultra={prefs.ultra ? "1" : "0"} onClick={() => setReasoningOpen(true)} title="reasoning effort — slide to ULTRA to unleash the fleet">
-              <b>mode</b><span>{prefs.ultra ? "ultra" : prefs.reasoning}</span>
+            <button className="statusSeg effortStatus" onClick={() => setReasoningOpen(true)} title="Set the active model's native reasoning effort">
+              <b>effort</b><span>{EFFORT_META[prefs.reasoning].label.toLowerCase()}</span>
             </button>
             <button className="statusSeg" onClick={() => setRoutingOpen(true)} title="per-lane model routing">
               <b>route</b><span>{prefs.routingMode === "auto" ? `auto · ${routedLanes.length}` : routedLanes.length > 0 ? `ready · ${routedLanes.length}` : "off"}</span>
             </button>
-            <button
-              className="statusSeg"
-              onClick={() => {
-                daemonCmd({ type: "operator_status" });
-                setCronOpen(true);
-              }}
-              title="durable missions (Operator)"
-            >
-              <i className="dot" data-state={opStatus?.activeCount ? "running" : "stopped"} /><b>missions</b><span>{opStatus?.activeCount ?? 0}</span>
-            </button>
+            {opStatus?.activeCount ? (
+              <button
+                className="statusSeg"
+                onClick={() => {
+                  daemonCmd({ type: "operator_status" });
+                  setCronOpen(true);
+                }}
+                title="durable missions (Operator)"
+              >
+                <i className="dot" data-state="running" /><b>missions</b><span>{opStatus.activeCount}</span>
+              </button>
+            ) : null}
             <button className="statusSeg" onClick={cycleFlame} title="screen flame border — immersive / clean / combat">
               <b>flame</b><span>{prefs.flameMode}</span>
             </button>
           </div>
           <span className="grow" />
-          <div className="statusGroup">
+          <span className="hudReadout" title={`${fmtTokens(active?.cacheReadTokens ?? 0)} input tokens reused from cache`}>
+            ↑<SpringNumber value={Math.max(0, (active?.tokensIn ?? 0) - (active?.cacheReadTokens ?? 0))} format={fmtTokens} /> fresh ↓<SpringNumber value={active?.tokensOut ?? 0} format={fmtTokens} />
+          </span>
+          <div className="statusGroup statusActions">
             {native && daemon !== "running" && daemon !== "starting" ? (
-              <button className="statusAction" onClick={() => { restartAttempts.current = 0; restartDaemon(); }}>
-                ⟳ Restart
-              </button>
+              <button className="statusIcon" onClick={() => { restartAttempts.current = 0; restartDaemon(); }} title="Restart the Garrison" aria-label="Restart">⟳</button>
             ) : null}
-            <button className="statusAction" onClick={() => void exportSessionLog()} title="Export this session (chat + tool calls + errors) to a file for feedback">
-              ⤓ Export
+            <button className="statusIcon" onClick={() => void exportSessionLog()} title="Export this session (chat + tool calls + errors) to a file" aria-label="Export session">⤓</button>
+            <button className="statusIcon" onClick={() => setReportOpen(true)} disabled={!active?.id} title="Report a bug — upload this chat so the owner can diagnose it" aria-label="Report a bug">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"><path d="M8 5.5v6M4.5 8H2m12 0h-2.5M4.8 5.2 3.4 3.8m9.2 1.4 1.4-1.4M4.6 11l-1.4 1.4m9.6-1.4 1.4 1.4"/><rect x="5" y="4.5" width="6" height="7.5" rx="3"/></svg>
             </button>
-            <button
-              className="statusAction"
-              onClick={() => setReportOpen(true)}
-              disabled={!active?.id}
-              title="Report a bug — upload this whole chat (all code, tool calls, errors) so the owner can diagnose and improve Ares"
-            >
-              🐛 Report bug
-            </button>
-            <button className="statusAction" onClick={() => setPaletteOpen(true)} title="command palette">
-              ⌘ Ctrl+K
-            </button>
-            <span className="hudReadout" title="tokens in / out this session">
-              ↑<SpringNumber value={active?.tokensIn ?? 0} format={fmtTokens} /> ↓<SpringNumber value={active?.tokensOut ?? 0} format={fmtTokens} />
-            </span>
-            <span className="hudVersion">v{APP_VERSION}</span>
+            <button className="statusIcon" onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl+K)" aria-label="Command palette">⌘</button>
           </div>
+          <span className="hudVersion" title={`Ares v${APP_VERSION}`}>{APP_VERSION}</span>
         </footer>
       </main>
 
@@ -3367,13 +4432,9 @@ function App() {
           <div className="forgeGrip" onPointerDown={onForgeGrip} />
           <header>
             <strong>THE FORGE</strong>
-            <nav className="forgeTabs">
-              {(["preview", "sandbox", "holo", "live"] as ForgeTab[]).map((t) => (
-                <button key={t} data-on={forge.tab === t ? "1" : "0"} data-live={t === "live" && liveBrowser && Date.now() - liveBrowser.at < 4000 ? "1" : "0"} onClick={() => setForge((f) => ({ ...f, tab: t }))}>
-                  {t === "live" && liveBrowser && Date.now() - liveBrowser.at < 4000 ? "● live" : t}
-                </button>
-              ))}
-            </nav>
+            <span className="forgeSurfaceState" data-live={forge.tab === "live" && liveBrowser && Date.now() - liveBrowser.at < 4000 ? "1" : "0"}>
+              {forge.tab === "live" ? (embeddedActive ? "interactive canvas" : liveTarget ? "browser canvas" : "canvas ready") : forge.tab === "holo" ? "spatial artifact" : forge.artifact ? forge.artifact.label : "artifact canvas"}
+            </span>
             <button className="ghost" onClick={() => setForge((f) => ({ ...f, open: false }))}>
               Close
             </button>
@@ -3382,12 +4443,17 @@ function App() {
           {forge.tab === "preview" ? (
             forge.artifact ? (
               <div className="forgeBody">
-                <div className="forgeMeta">{forge.artifact.label}</div>
+                <div className="forgeToolbar">
+                  <span className="forgeMeta">{forge.artifact.label}</span>
+                  <button onClick={() => setPreviewRevision((n) => n + 1)}>↻ Refresh</button>
+                  {native ? <button onClick={() => void invoke("ares_open_path", { path: forge.artifact!.path })}>↗ Launch</button> : null}
+                </div>
                 <iframe
+                  key={`${forge.artifact.path}-${previewRevision}`}
                   title={forge.artifact.label}
-                  src={native ? convertFileSrc(forge.artifact.path) : undefined}
+                  src={native ? `${convertFileSrc(forge.artifact.path)}?forge=${previewRevision}` : undefined}
                   srcDoc={native ? undefined : holoDefaultHtml()}
-                  sandbox="allow-scripts"
+                  sandbox={PREVIEW_SANDBOX}
                 />
               </div>
             ) : (
@@ -3402,42 +4468,53 @@ function App() {
             <div className="forgeBody sandbox">
               <div className="sandboxBar">
                 <span>live HTML — scripts run for real</span>
-                <button className="primary tiny" onClick={() => void runSandbox(sandboxCode)}>
-                  ▶ Run
-                </button>
+                <span className="forgeActions">
+                  {native && sandboxSrc?.path ? <button onClick={() => void invoke("ares_open_path", { path: sandboxSrc.path })}>↗ Launch</button> : null}
+                  <button onClick={() => void runSandbox(sandboxCode)}>↻ Refresh</button>
+                  <button className="primary tiny" onClick={() => void runSandbox(sandboxCode)}>▶ Run</button>
+                </span>
               </div>
-              <textarea className="sandboxCode" value={sandboxCode} onChange={(e) => setSandboxCode(e.target.value)} spellCheck={false} />
-              <iframe title="sandbox" src={sandboxSrc?.src} srcDoc={sandboxSrc?.srcdoc} sandbox="allow-scripts" />
+              <textarea className="sandboxCode" value={sandboxCode} onChange={(e) => setSandboxCode(e.target.value)} onKeyDown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); void runSandbox(sandboxCode); } }} spellCheck={false} />
+              <iframe title="sandbox" src={sandboxSrc?.src} srcDoc={sandboxSrc?.srcdoc} sandbox={PREVIEW_SANDBOX} />
             </div>
           ) : null}
 
           {forge.tab === "holo" ? (
             <div className="forgeBody">
-              <div className="forgeMeta">{holoMeta}</div>
-              <iframe title="holo" src={holoSrc?.src} srcDoc={holoSrc?.srcdoc} sandbox="allow-scripts allow-pointer-lock allow-downloads" />
+              <div className="forgeToolbar">
+                <span className="forgeMeta">{holoMeta}</span>
+                <button onClick={() => setHoloSrc((current) => current?.src ? { ...current, src: `${current.src.split("?")[0]}?t=${Date.now()}` } : current)}>↻ Refresh</button>
+                {native && holoSrc?.path ? <button onClick={() => void invoke("ares_open_path", { path: holoSrc.path })}>↗ Launch</button> : null}
+              </div>
+              <iframe title="holo" src={holoSrc?.src} srcDoc={holoSrc?.srcdoc} sandbox={PREVIEW_SANDBOX} />
             </div>
           ) : null}
 
           {forge.tab === "live" ? (
             <div className="forgeBody liveBrowser">
+              <form className="liveToolbar" onSubmit={(e) => { e.preventDefault(); const url = launchableUrl(liveUrl); if (url) { setLiveTarget({ url, title: "Manual preview", at: Date.now() }); setLiveUrl(url); setLiveRevision((n) => n + 1); } }}>
+                <i className={embeddedActive || liveTarget ? "liveDot" : "idleDot"} />
+                <input aria-label="Preview URL" value={liveUrl} onChange={(e) => setLiveUrl(e.target.value)} placeholder="localhost:3000 or https://…" />
+                <button type="submit">Launch</button>
+                <button type="button" onClick={() => setLiveRevision((n) => n + 1)} disabled={!liveTarget}>↻</button>
+                {native && liveTarget && /^https?:/i.test(liveTarget.url) ? <button type="button" onClick={() => void invoke("ares_open_url", { url: liveTarget.url })}>↗</button> : null}
+              </form>
               <div className="forgeMeta">
-                {embeddedActive
-                  ? <><i className="liveDot" /> {embeddedActivity || "Ares is driving its own browser — in-window"}</>
-                  : liveBrowser && Date.now() - liveBrowser.at < 4000
-                    ? <><i className="liveDot" /> Ares is driving the browser — watch the cursor</>
-                    : "Ares's embedded browser — appears here when it tests a page or UI"}
+                {embeddedActive ? embeddedActivity || "Interactive app controlled by Ares" : liveTarget?.title || liveTarget?.url || "Launch a local app or let Ares open one"}
               </div>
               {/* interactive embedded browser (Ares's own HTML apps/games) */}
               <div className="liveStage embed" data-on={embeddedActive ? "1" : "0"}>
                 <EmbeddedBrowser ref={embeddedRef} onActivity={setEmbeddedActivity} />
               </div>
-              {/* streamed Playwright frames (localhost / real web), when not embedded */}
-              {!embeddedActive && liveBrowser ? (
-                <div className="liveStage">
-                  <img src={`data:image/jpeg;base64,${liveBrowser.frame}`} alt="Ares live browser" />
+              {/* Playwright publishes its actual target, so the Forge is an
+                  interactive document rather than a screenshot viewer. */}
+              {!embeddedActive && liveTarget ? (
+                <div className="liveStage interactive">
+                  <iframe key={`${liveTarget.url}-${liveRevision}`} title={liveTarget.title || "Live preview"} src={forgeFrameUrl(liveTarget.url, native, liveRevision)} sandbox={PREVIEW_SANDBOX} />
+                  {liveBrowser ? <img className="liveTelemetry" src={`data:image/jpeg;base64,${liveBrowser.frame}`} alt="Latest automation frame" title="Latest frame seen by Ares" /> : null}
                 </div>
               ) : null}
-              {!embeddedActive && !liveBrowser ? (
+              {!embeddedActive && !liveTarget ? (
                 <div className="forgeEmpty">
                   <div className="emptyEmblem" aria-hidden="true" />
                   <p>When Ares tests a page, app, or game it built, you'll watch it here — cursor moving, clicking, navigating at human speed. Just like it has its own browser.</p>
@@ -3482,6 +4559,23 @@ function App() {
           }}
           onAnthropicSignIn={startAnthropicSignIn}
           initialTab={settingsTab}
+          onPreviewVoice={(id) => voiceRef.current.preview(id)}
+          voiceEngine={voiceEngine}
+          onRepairVoice={repairVoice}
+          onOpenModelBrowser={() => setModelPopOpen(true)}
+          openaiAuth={openaiAuth}
+          onOpenaiSignIn={startOpenaiSignIn}
+          kimiAuth={kimiAuth}
+          onKimiSignIn={startKimiSignIn}
+          onLaunchLivingSurface={() => void launchLivingSurface()}
+          listProviderVoices={
+            ttsProviderSkill
+              ? () => skillInvoke(ttsProviderSkill.name, { op: "voices" }).then((r) => {
+                  const voices = r.ok ? (r.result as { voices?: VoiceInfo[] })?.voices : null;
+                  return Array.isArray(voices) ? voices : [];
+                })
+              : undefined
+          }
         />
       ) : null}
 
@@ -3503,12 +4597,23 @@ function App() {
         <ConnectorDirectory
           connectors={mcpConnectors}
           connecting={mcpConnecting}
+          tools={mcpTools}
           onClose={() => setDirectoryOpen(false)}
           onConnect={(url, name) => {
             setMcpConnecting(name);
             daemonCmd({ type: "mcp_connect", url, name });
           }}
           onDisconnect={(name) => daemonCmd({ type: "mcp_disconnect", name })}
+          onToggle={(name, enabled) => daemonCmd({ type: "mcp_toggle", name, enabled })}
+          onListTools={(name) => {
+            setMcpTools((prev) => ({ ...prev, [name]: { loading: true, tools: prev[name]?.tools ?? [], error: null } }));
+            daemonCmd({ type: "mcp_tools", name });
+          }}
+          registry={mcpSearch}
+          onSearchRegistry={(text) => {
+            setMcpSearch({ text, searching: true, results: [] });
+            daemonCmd({ type: "mcp_search", text });
+          }}
         />
       ) : null}
 
@@ -3516,6 +4621,13 @@ function App() {
         <ModelPopover
           prefs={prefs}
           native={native}
+          usage={usageStats}
+          onRequestUsage={() => daemonCmd({ type: "usage_stats", days: 30 })}
+          pulls={ollamaPulls}
+          onPull={(model) => {
+            setOllamaPulls((prev) => ({ ...prev, [model]: { pct: null, status: "starting…" } }));
+            daemonCmd({ type: "ollama_pull", model });
+          }}
           onClose={() => setModelPopOpen(false)}
           onPickAuto={() => {
             setModelPopOpen(false);
@@ -3532,9 +4644,19 @@ function App() {
             apply((s) => ({ ...s, turnModel: enabled ? undefined : next.model, turnProvider: enabled ? undefined : next.provider }));
             daemonCmd({ type: "routing_mode", enabled });
           }}
+          onToggleFavorite={(key) => {
+            const favorites = (prefs.favoriteModels ?? []).includes(key)
+              ? (prefs.favoriteModels ?? []).filter((k) => k !== key)
+              : [...(prefs.favoriteModels ?? []), key].slice(-12);
+            const next = { ...prefs, favoriteModels: favorites };
+            setPrefs(next);
+            savePrefs(next);
+          }}
           onPick={(provider, model) => {
             setModelPopOpen(false);
-            const next = { ...prefs, provider, model, routingMode: "manual" as const };
+            const key = `${provider}/${model}`;
+            const recentModels = [key, ...(prefs.recentModels ?? []).filter((k) => k !== key)].slice(0, 6);
+            const next = { ...prefs, provider, model, routingMode: "manual" as const, recentModels };
             setPrefs(next);
             savePrefs(next);
             // Immediately show the picked model in the footer/composer. The next
@@ -3543,7 +4665,7 @@ function App() {
             apply((s) => ({ ...s, turnModel: model, turnProvider: provider, turnLane: undefined }));
             if (native) {
               if (daemon === "running") {
-                void invoke("ares_daemon_command", { command: { type: "model_switch", provider, model } }).catch((err) => {
+                void invoke("ares_daemon_command", { command: { type: "model_switch", provider, model, sessionId: activeRef.current } }).catch((err) => {
                   apply((s) => foldEvent(s, { type: "desktop_error", text: `model switch failed: ${String(err)}` }));
                 });
               } else {
@@ -3552,6 +4674,16 @@ function App() {
               }
             }
           }}
+        />
+      ) : null}
+
+      {reasoningOpen ? (
+        <EffortPopover
+          provider={active?.turnProvider ?? prefs.provider}
+          model={liveModel}
+          value={prefs.reasoning}
+          onPick={chooseReasoning}
+          onClose={() => setReasoningOpen(false)}
         />
       ) : null}
 
@@ -3590,15 +4722,6 @@ function App() {
                 ))}
               </div>
             )}
-          </div>
-        </div>
-      ) : null}
-
-      {reasoningOpen ? (
-        <div className="paletteScrim" onClick={() => setReasoningOpen(false)}>
-          <div className="palette reasoningPop" onClick={(e) => e.stopPropagation()}>
-            <div className="popTitle">Reasoning effort</div>
-            <ReasoningSlider value={currentEffort} onChange={setEffort} />
           </div>
         </div>
       ) : null}
@@ -3740,6 +4863,12 @@ const LANE_HINTS: Record<RouteLane, string> = {
   research: "planning, analysis, deep reads",
   "tool-use": "tool-output digestion, mechanical steps",
 };
+const LANE_ICONS: Record<RouteLane, string> = {
+  chat: "💬",
+  coding: "⌨️",
+  research: "🔎",
+  "tool-use": "🔧",
+};
 
 function RoutingPanel({
   prefs,
@@ -3776,15 +4905,21 @@ function RoutingPanel({
             return (
               <div key={lane} className="routeLane" data-on={open ? "1" : "0"}>
                 <button className="laneToggle" onClick={() => setLane(lane, entry ? undefined : { provider: prefs.provider, model: prefs.model })}>
-                  <i />
-                  <span className="laneName">{lane}</span>
-                  <em className="laneHint">{LANE_HINTS[lane]}</em>
-                  {entry ? <span className="laneModel">{entry.model}</span> : <span className="laneFallback">main model</span>}
+                  <span className="laneIcon" aria-hidden="true">{LANE_ICONS[lane]}</span>
+                  <span className="laneName">
+                    <strong>{lane}</strong>
+                    <em>{LANE_HINTS[lane]}</em>
+                  </span>
+                  <span className="laneAssign" title={entry ? `${entry.provider} · ${entry.model}` : "main model"}>{entry ? `${entry.provider} · ${entry.model}` : "main model"}</span>
+                  <span className="laneSwitch" data-on={entry ? "1" : "0"} aria-hidden="true"><i /></span>
                 </button>
                 {entry ? (
                   <div className="laneBody">
                     <div className="segment mini">
-                      {PROVIDERS.filter((p) => p !== "mock").map((p) => (
+                      {/* MoA ensembles are themselves routers — assigning one
+                          to a lane routes a route. Lanes take concrete
+                          providers only. */}
+                      {PROVIDERS.filter((p) => p !== "mock" && p !== "moa").map((p) => (
                         <button
                           key={p}
                           data-on={entry.provider === p ? "1" : "0"}
@@ -3848,29 +4983,56 @@ const CONNECTOR_PRESETS: ConnectorPreset[] = [
 function ConnectorDirectory({
   connectors,
   connecting,
+  tools,
   onConnect,
   onDisconnect,
+  onToggle,
+  onListTools,
+  registry,
+  onSearchRegistry,
   onClose,
 }: {
   connectors: McpConnectorVm[];
   connecting: string | null;
+  tools: Record<string, McpToolsVm>;
   onConnect: (url: string, name: string) => void;
   onDisconnect: (name: string) => void;
+  onToggle: (name: string, enabled: boolean) => void;
+  onListTools: (name: string) => void;
+  registry: { text: string; searching: boolean; results: McpRegistryResult[] };
+  onSearchRegistry: (text: string) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
+  // Registry search rides the same box, debounced — presets filter instantly,
+  // the whole public MCP registry answers a beat later.
+  useEffect(() => {
+    const text = query.trim();
+    if (text.length < 2) return;
+    const t = window.setTimeout(() => onSearchRegistry(text), 400);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query]);
   const [customUrl, setCustomUrl] = useState("");
+  const [expanded, setExpanded] = useState<string | null>(null);
   const connectedNames = new Set(connectors.map((c) => c.name));
   const q = query.trim().toLowerCase();
   const shown = q ? CONNECTOR_PRESETS.filter((p) => `${p.label} ${p.blurb}`.toLowerCase().includes(q)) : CONNECTOR_PRESETS;
+  const glyphFor = (c: McpConnectorVm) =>
+    CONNECTOR_PRESETS.find((p) => p.id === c.name || p.label.toLowerCase() === c.name)?.glyph ?? "🔌";
+  const expand = (name: string) => {
+    const next = expanded === name ? null : name;
+    setExpanded(next);
+    if (next && !tools[next]?.tools.length && !tools[next]?.loading) onListTools(next);
+  };
 
   return (
     <div className="paletteScrim" onClick={onClose}>
       <div className="palette directory" onClick={(e) => e.stopPropagation()}>
         <header className="dirHead">
           <div>
-            <strong>Directory</strong>
-            <em>Connect tools & apps — Ares does the OAuth, then their tools are live for the agent.</em>
+            <strong>Connectors</strong>
+            <em>/mcp — Ares does the OAuth, then their tools are live for the agent.</em>
           </div>
           <button className="ghost" onClick={onClose}>Close</button>
         </header>
@@ -3881,13 +5043,52 @@ function ConnectorDirectory({
           <>
             <div className="dirSectionLabel">Connected</div>
             <div className="dirConnected">
-              {connectors.map((c) => (
-                <div key={c.name} className="dirConnRow">
-                  <span className="dirConnName">🔌 {c.displayName ?? c.name}</span>
-                  <span className="dirConnUrl">{c.url}</span>
-                  <button className="dirDisconnect" onClick={() => onDisconnect(c.name)}>Disconnect</button>
-                </div>
-              ))}
+              {connectors.map((c, i) => {
+                const on = c.enabled !== false;
+                const open = expanded === c.name;
+                const t = tools[c.name];
+                return (
+                  <div key={c.name} className="dirConn" data-open={open ? "1" : "0"} data-on={on ? "1" : "0"} style={{ "--i": i } as React.CSSProperties}>
+                    <div className="dirConnRow">
+                      <button className="dirConnMain" onClick={() => expand(c.name)} title={open ? "collapse" : "show tools"}>
+                        <span className="dirConnGlyph" aria-hidden="true">{glyphFor(c)}</span>
+                        <span className="dirConnName">{c.displayName ?? c.name}</span>
+                        <span className="dirConnDot" data-on={on ? "1" : "0"} title={on ? "active" : "paused"} />
+                        <span className="dirConnUrl">{c.url}</span>
+                        <span className="dirConnChevron" data-open={open ? "1" : "0"} aria-hidden="true">▾</span>
+                      </button>
+                      <button
+                        className="dirSwitch"
+                        role="switch"
+                        aria-checked={on}
+                        data-on={on ? "1" : "0"}
+                        title={on ? "Pause — keep the connection, unload its tools" : "Resume — tools load again"}
+                        onClick={() => onToggle(c.name, !on)}
+                      >
+                        <span className="dirSwitchKnob" />
+                      </button>
+                      <button className="dirDisconnect" onClick={() => onDisconnect(c.name)}>Disconnect</button>
+                    </div>
+                    {open ? (
+                      <div className="dirTools">
+                        {t?.loading ? (
+                          <span className="dirToolsStatus"><span className="skillDockSpin" aria-hidden="true" /> asking {c.displayName ?? c.name} for its tools…</span>
+                        ) : t?.error ? (
+                          <span className="dirToolsStatus warn">{t.error}</span>
+                        ) : t && t.tools.length > 0 ? (
+                          t.tools.map((tool) => (
+                            <span key={tool.name} className="dirTool" title={tool.description ?? tool.name}>
+                              {tool.name}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="dirToolsStatus">no tools reported</span>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
           </>
         ) : null}
@@ -3915,8 +5116,44 @@ function ConnectorDirectory({
               </button>
             );
           })}
-          {shown.length === 0 ? <div className="dirEmpty">No preset matches — add it by URL below.</div> : null}
+          {shown.length === 0 ? <div className="dirEmpty">No preset matches — check the registry results below, or add by URL.</div> : null}
         </div>
+
+        {query.trim().length >= 2 ? (
+          <>
+            <div className="dirSectionLabel">MCP Registry</div>
+            <div className="dirRegistry">
+              {registry.searching ? (
+                <div className="dirToolsStatus"><span className="skillDockSpin" aria-hidden="true" /> searching the public registry…</div>
+              ) : registry.results.length === 0 ? (
+                <div className="dirToolsStatus">no remote servers found for “{registry.text}”</div>
+              ) : (
+                registry.results.map((r, i) => {
+                  const isConnected = connectedNames.has(r.name);
+                  const isConnecting = connecting === r.name;
+                  return (
+                    <button
+                      key={r.url}
+                      className="dirCard wide"
+                      data-connected={isConnected ? "1" : "0"}
+                      disabled={isConnected || connecting !== null}
+                      style={{ "--i": i } as React.CSSProperties}
+                      onClick={() => onConnect(r.url, r.name)}
+                      title={`${r.fullName}\n${r.url}`}
+                    >
+                      <span className="dirCardGlyph" aria-hidden="true">🛰️</span>
+                      <span className="dirCardBody">
+                        <strong>{r.name}{r.needsKey ? <i className="dirNeedsKey"> · needs API key</i> : null}</strong>
+                        <em>{r.description || r.url}</em>
+                      </span>
+                      <span className="dirCardAction">{isConnected ? "✓ connected" : isConnecting ? "connecting…" : "+ connect"}</span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </>
+        ) : null}
 
         <div className="dirSectionLabel">Add any MCP server by URL</div>
         <div className="dirCustom">
@@ -3969,7 +5206,9 @@ function BugReportModal({
       <div className="palette bugReport" onClick={(e) => e.stopPropagation()}>
         <header className="bugReportHead">
           <strong>🐛 Report a bug</strong>
-          <em>{sessionTitle}</em>
+          {/* Label the session name — a bare truncated first-message ("hey") floating
+             top-right reads as a random keyword (bug report dac60375). */}
+          <em title={`The session being reported: ${sessionTitle}`}>Session: “{sessionTitle}”</em>
         </header>
         <p className="bugReportBlurb">
           This uploads the <b>whole chat</b> — every message, all generated code, every tool call and its
@@ -4002,38 +5241,341 @@ function BugReportModal({
   );
 }
 
+function EffortPopover({
+  provider,
+  model,
+  value,
+  onPick,
+  onClose,
+}: {
+  provider: string;
+  model: string;
+  value: ReasoningLevel;
+  onPick: (level: ReasoningLevel) => void;
+  onClose: () => void;
+}) {
+  const levels = effortLevelsFor(provider, model);
+  const selected = levels.includes(value) ? value : null;
+  const activeIndex = selected ? levels.indexOf(selected) : -1;
+  const fill = activeIndex < 0 || levels.length < 2 ? 0 : (activeIndex / (levels.length - 1)) * 100;
+  return (
+    <div className="paletteScrim" onClick={onClose}>
+      <div className="palette reasoningPop" onClick={(e) => e.stopPropagation()}>
+        <div className="effortHead">
+          <ProviderLogo brand={provider} className="effortProviderMark" />
+          <span>
+            <strong>Reasoning effort</strong>
+            <em>{provider} / {model}</em>
+          </span>
+          <button className="close" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div className="effortSignal" aria-hidden="true">
+          <i style={{ width: `${fill}%` }} />
+          {levels.map((level, index) => <b key={level} data-on={level === selected ? "1" : "0"} style={{ left: `${levels.length === 1 ? 50 : (index / (levels.length - 1)) * 100}%` }} />)}
+        </div>
+        <div className="effortChoices" style={{ "--effort-stops": levels.length } as React.CSSProperties}>
+          {levels.map((level) => {
+            const meta = EFFORT_META[level];
+            return (
+              <button key={level} data-on={level === selected ? "1" : "0"} onClick={() => onPick(level)}>
+                <span>{meta.label}</span>
+                <small>{meta.hint}</small>
+              </button>
+            );
+          })}
+        </div>
+        <div className="effortWire" data-warning={selected ? "0" : "1"}>
+          <i />
+          <span>{selected ? effortWireLabel(provider, model, selected) : `Choose a supported level for ${model}; the saved “${EFFORT_META[value].label}” setting is not valid here.`}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Provider identity for the discovery panel — a branded gradient mark per
+ *  provider (no external logo fetches; the CSP forbids them anyway). */
+const PROVIDER_IDENTITY: Record<string, { title: string; tagline: string; mark: string; from: string; to: string }> = {
+  ares: { title: "Ares", tagline: "In-house models on your Ares account", mark: "Λ", from: "#5c1414", to: "#e08b2e" },
+  ollama: { title: "Ollama", tagline: "Local machine + Ollama Cloud", mark: "ᒍ", from: "#1d2b31", to: "#7fa6a3" },
+  openai: { title: "OpenAI", tagline: "The GPT frontier family", mark: "◎", from: "#0c2b22", to: "#10a37f" },
+  anthropic: { title: "Anthropic", tagline: "The Claude family", mark: "A\\", from: "#3b2417", to: "#d97757" },
+  deepseek: { title: "DeepSeek", tagline: "Frontier coding + reasoning, open weights", mark: "◗", from: "#101f3d", to: "#4d6bfe" },
+  openrouter: { title: "OpenRouter", tagline: "Hundreds of models behind one key", mark: "◈", from: "#241a33", to: "#9d7bea" },
+  custom: { title: "Custom", tagline: "Any OpenAI-compatible endpoint", mark: "✦", from: "#2a2a2e", to: "#9aa3ad" },
+  moa: { title: "Mixture of Agents", tagline: "Ensembles — several models, one answer", mark: "⁂", from: "#2d1a30", to: "#c86bd1" },
+  mock: { title: "Demo", tagline: "Offline demo models", mark: "◇", from: "#26262a", to: "#8a8f98" },
+};
+
 function ModelPopover({
   prefs,
   native,
+  usage,
+  onRequestUsage,
+  pulls,
+  onPull,
+  onToggleFavorite,
   onPickAuto,
   onPick,
   onClose,
 }: {
   prefs: Prefs;
   native: boolean;
+  usage: UsageStats | null;
+  onRequestUsage: () => void;
+  pulls: Record<string, { pct: number | null; status: string; done?: boolean; error?: string }>;
+  onPull: (model: string) => void;
+  onToggleFavorite: (key: string) => void;
   onPickAuto: () => void;
   onPick: (provider: string, model: string) => void;
   onClose: () => void;
 }) {
   const [provider, setProvider] = useState(prefs.provider);
+  const { models, loading, error } = useModelCatalog(provider, native);
+  // 30-day usage for the hero strip — ask once per open.
+  useEffect(() => { onRequestUsage(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  const providerUsage = usage?.providers?.find((p) => p.provider === provider);
+  // Pulled state: any Local Ollama entry with the same base name means the
+  // library model is already on this machine.
+  const localBases = useMemo(
+    () => new Set(models.filter((m) => m.group === "Local Ollama").map((m) => m.id.split(":")[0].toLowerCase())),
+    [models],
+  );
+  const groupRank = (g: string) => {
+    if (g === "Local Ollama") return 0;
+    if (g.startsWith("Ollama Cloud")) return 1;
+    if (g === "Ollama Library · cloud") return 2;
+    if (g === "Ollama Library") return 3;
+    return 4;
+  };
+  const parsePulls = (p?: string) => {
+    const m = p?.match(/([\d.]+)\s*([KMB]?)/i);
+    if (!m) return 0;
+    const mult = { k: 1e3, m: 1e6, b: 1e9 }[m[2]?.toLowerCase() as "k" | "m" | "b"] ?? 1;
+    return Number(m[1]) * mult;
+  };
+  const [query, setQuery] = useState("");
+  const [capability, setCapability] = useState<"all" | "tools" | "reasoning" | "vision" | "free">("all");
+  const [detail, setDetail] = useState<ModelOption | null>(null);
+  const value = prefs.provider === provider ? prefs.model : "";
+  const ident = PROVIDER_IDENTITY[provider] ?? { title: provider, tagline: "", mark: "◆", from: "#26262a", to: "#8a8f98" };
+  const q = query.trim().toLowerCase();
+  const byCapability = capability === "all" ? models : models.filter((m) => m.capabilities?.includes(capability));
+  const searched = q
+    ? byCapability.filter((m) => [m.id, m.label ?? "", m.hint ?? "", m.description ?? "", ...(m.capabilities ?? [])].join(" ").toLowerCase().includes(q))
+    : byCapability;
+  // Ordered: local models first, then cloud, then the library by popularity.
+  const filtered = [...searched].sort((a, b) =>
+    groupRank(a.group) - groupRank(b.group) || parsePulls(b.pulls) - parsePulls(a.pulls) || a.id.localeCompare(b.id));
+  const sections = [...new Set(filtered.map((m) => m.group))];
+  const capabilityCount = (name: Exclude<typeof capability, "all">) => models.filter((m) => m.capabilities?.includes(name)).length;
+  const ctxLabel = (n?: number) => {
+    if (!n) return null;
+    const k = Math.round(n / 1000);
+    return k >= 1000 ? `${(k / 1000).toFixed(k % 1000 ? 1 : 0)}M ctx` : `${k}k ctx`;
+  };
+  const markStyle = (pi: { from: string; to: string }) => ({ background: `linear-gradient(135deg, ${pi.from}, ${pi.to})` });
+  const pickProvider = (p: string) => {
+    setProvider(p);
+    setDetail(null);
+    setQuery("");
+    setCapability("all");
+  };
   return (
     <div className="paletteScrim" onClick={onClose}>
-      <div className="palette modelSwap" onClick={(e) => e.stopPropagation()}>
-        <button className="autoRoutePick" data-on={prefs.routingMode === "auto" ? "1" : "0"} onClick={onPickAuto} title={prefs.routingMode === "auto" ? "Routing is ON — click to switch back to a single manual model" : "Enable per-lane auto routing"}>
-          <span>
-            <strong>Routing (Auto){prefs.routingMode === "auto" ? " · ON" : ""}</strong>
-            <em>{prefs.routingMode === "auto" ? "click to disable — pick a model below for manual" : "classifies each turn and uses your lane assignments"}</em>
-          </span>
-          <i>{prefs.routingMode === "auto" ? "ON" : `${Object.keys(prefs.routing).length} lanes`}</i>
-        </button>
-        <div className="segment">
-          {PROVIDERS.map((p) => (
-            <button key={p} data-on={provider === p ? "1" : "0"} onClick={() => setProvider(p)}>
-              {p}
-            </button>
-          ))}
-        </div>
-        <ModelPicker provider={provider} value={prefs.provider === provider ? prefs.model : ""} onPick={(id) => onPick(provider, id)} native={native} searchOnly />
+      <div className="palette modelDiscovery" onClick={(e) => e.stopPropagation()}>
+        <aside className="mdlRail">
+          <div className="mdlRailTitle">Providers</div>
+          <div className="mdlRailList">
+            {PROVIDERS.map((p, i) => {
+              const pi = PROVIDER_IDENTITY[p] ?? { title: p, tagline: "", mark: "◆", from: "#26262a", to: "#8a8f98" };
+              return (
+                <button key={p} className="mdlProv" data-on={provider === p ? "1" : "0"} style={{ "--i": i } as React.CSSProperties} onClick={() => pickProvider(p)}>
+                  <ProviderLogo brand={p} className="mdlMark" />
+                  <span className="mdlProvBody">
+                    <strong>{pi.title}</strong>
+                    <em>{pi.tagline}</em>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <button className="autoRoutePick" data-on={prefs.routingMode === "auto" ? "1" : "0"} onClick={onPickAuto} title={prefs.routingMode === "auto" ? "Routing is ON — click to switch back to a single manual model" : "Enable per-lane auto routing"}>
+            <span>
+              <strong>Routing (Auto){prefs.routingMode === "auto" ? " · ON" : ""}</strong>
+              <em>{prefs.routingMode === "auto" ? "click to disable — pick a model for manual" : "classifies each turn per lane"}</em>
+            </span>
+            <i>{prefs.routingMode === "auto" ? "ON" : `${Object.keys(prefs.routing).length} lanes`}</i>
+          </button>
+        </aside>
+        <section className="mdlMain">
+          <header className="mdlHero">
+            <ProviderLogo brand={provider} className="mdlMark big" />
+            <div className="mdlHeroBody">
+              <strong>{ident.title}</strong>
+              <em>{ident.tagline}</em>
+            </div>
+            <span className="mdlCount">{loading ? "scanning…" : `${models.length} models`}</span>
+            <button className="ghost" onClick={onClose}>Close</button>
+          </header>
+          {(prefs.favoriteModels ?? []).length > 0 || (prefs.recentModels ?? []).length > 0 ? (
+            <div className="mdlQuick">
+              {(prefs.favoriteModels ?? []).map((key) => {
+                const [p, ...rest] = key.split("/");
+                const id = rest.join("/");
+                return (
+                  <button key={`f:${key}`} className="mdlQuickChip fav" data-on={p === prefs.provider && id === prefs.model ? "1" : "0"} title={key} onClick={() => onPick(p, id)}>
+                    ★ {id}
+                  </button>
+                );
+              })}
+              {(prefs.recentModels ?? []).filter((key) => !(prefs.favoriteModels ?? []).includes(key)).slice(0, 4).map((key) => {
+                const [p, ...rest] = key.split("/");
+                const id = rest.join("/");
+                return (
+                  <button key={`r:${key}`} className="mdlQuickChip" data-on={p === prefs.provider && id === prefs.model ? "1" : "0"} title={`recent · ${key}`} onClick={() => onPick(p, id)}>
+                    ↺ {id}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+          {providerUsage ? (
+            <div className="mdlUsage" title="Your last 30 days through this provider (spend estimated from live OpenRouter pricing)">
+              <span className="mdlUsageLabel">30d</span>
+              <span><b>{providerUsage.calls}</b> requests</span>
+              <span>↑ <b>{fmtTokens(providerUsage.tokensIn)}</b></span>
+              <span>↓ <b>{fmtTokens(providerUsage.tokensOut)}</b></span>
+              <span className="mdlUsageCost">{providerUsage.costUsd !== undefined ? <>≈ <b>${providerUsage.costUsd.toFixed(2)}</b></> : "cost n/a"}</span>
+            </div>
+          ) : null}
+          <div className="mdlControls">
+            <input
+              className="modelSearch"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={loading ? "loading models…" : `search ${models.length} models`}
+              spellCheck={false}
+              autoFocus
+            />
+            <div className="modelFilters" aria-label="model capability filters">
+              <button data-on={capability === "all" ? "1" : "0"} onClick={() => setCapability("all")}>all</button>
+              {(["tools", "reasoning", "vision", "free"] as const).map((name) => {
+                const count = capabilityCount(name);
+                return (
+                  <button key={name} data-on={capability === name ? "1" : "0"} disabled={count === 0} onClick={() => setCapability(name)}>
+                    {name} <em>{count}</em>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          {error ? <div className="modelError">{error}</div> : null}
+          {detail ? (
+            <div className="mdlDetailWrap">
+              <ModelDetail
+                model={detail}
+                selected={detail.id === value}
+                onUse={(id) => { onPick(provider, id); setDetail(null); }}
+                onBack={() => setDetail(null)}
+              />
+            </div>
+          ) : (
+            <div className="mdlGrid">
+              {sections.map((section) => (
+                <React.Fragment key={section}>
+                  {sections.length > 1 ? (
+                    <div className="mdlSection">
+                      <span>{section}</span>
+                      <em>{filtered.filter((m) => m.group === section).length}</em>
+                    </div>
+                  ) : null}
+                  {filtered.filter((m) => m.group === section).map((m, i) => {
+                    const ctx = ctxLabel(m.contextLength);
+                    const isFree = m.capabilities?.includes("free");
+                    const price = m.pricing?.input !== undefined ? `$${m.pricing.input.toFixed(2)}/M in` : null;
+                    const isLibrary = m.group.startsWith("Ollama Library");
+                    const cloudHosted = m.group.includes("cloud") || m.group.startsWith("Ollama Cloud") || m.id.includes("cloud");
+                    const pulled = isLibrary && localBases.has((m.label ?? m.id).split(":")[0].toLowerCase());
+                    return (
+                      <button key={m.id} className="mdlCard" data-on={m.id === value ? "1" : "0"} style={{ "--i": Math.min(i, 20) } as React.CSSProperties} onClick={() => onPick(provider, m.id)}>
+                        <span className="mdlCardTop">
+                          <ProviderLogo brand={brandKey(m)} className="modelGlyph" />
+                          <span className="mdlCardName">
+                            <strong>{m.label ?? m.id}</strong>
+                            {m.label && m.label !== m.id ? <em>{m.id}</em> : null}
+                          </span>
+                          <span
+                            className="mdlStar"
+                            role="button"
+                            tabIndex={0}
+                            data-on={(prefs.favoriteModels ?? []).includes(`${provider}/${m.id}`) ? "1" : "0"}
+                            title={(prefs.favoriteModels ?? []).includes(`${provider}/${m.id}`) ? "Unpin" : "Pin to the top"}
+                            aria-label={`Pin ${m.label ?? m.id}`}
+                            onClick={(e) => { e.stopPropagation(); onToggleFavorite(`${provider}/${m.id}`); }}
+                            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); onToggleFavorite(`${provider}/${m.id}`); } }}
+                          >{(prefs.favoriteModels ?? []).includes(`${provider}/${m.id}`) ? "★" : "☆"}</span>
+                          <span
+                            className="modelInfo"
+                            role="button"
+                            tabIndex={0}
+                            title="Details"
+                            aria-label={`Details for ${m.label ?? m.id}`}
+                            onClick={(e) => { e.stopPropagation(); setDetail(m); }}
+                            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); setDetail(m); } }}
+                          >ⓘ</span>
+                        </span>
+                        {m.description ? (
+                          <span className="mdlCardDesc" title={m.description}>{m.description}</span>
+                        ) : m.hint && !m.pulls ? (
+                          <span className="mdlCardDesc thin">{m.hint}</span>
+                        ) : null}
+                        {m.pulls || m.updated ? (
+                          <span className="mdlCardMeta">
+                            {m.pulls ? <span title="library pulls">⇩ {m.pulls}</span> : null}
+                            {m.updated ? <span title="last updated">↻ {m.updated}</span> : null}
+                          </span>
+                        ) : null}
+                        {(() => {
+                          const pullState = pulls[m.label ?? m.id];
+                          if (!pullState || pullState.done || pullState.error) return null;
+                          return (
+                            <span className="mdlPullBar" title={pullState.status}>
+                              <span className="mdlPullFill" style={{ width: pullState.pct !== null ? `${pullState.pct}%` : "100%" }} data-indeterminate={pullState.pct === null ? "1" : "0"} />
+                              <em>{pullState.pct !== null ? `${pullState.pct}%` : pullState.status || "pulling…"}</em>
+                            </span>
+                          );
+                        })()}
+                        <span className="mdlCardFoot">
+                          {isLibrary ? (
+                            pulled || pulls[m.label ?? m.id]?.done ? <i className="mdlChip pulled">✓ pulled</i>
+                            : cloudHosted ? null
+                            : pulls[m.label ?? m.id] && !pulls[m.label ?? m.id]?.error ? null
+                            : <span
+                                className="mdlChip pullBtn"
+                                role="button"
+                                tabIndex={0}
+                                title="Download this model through your local Ollama"
+                                onClick={(e) => { e.stopPropagation(); onPull(m.label ?? m.id); }}
+                                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); onPull(m.label ?? m.id); } }}
+                              >⇩ pull</span>
+                          ) : null}
+                          {cloudHosted && provider === "ollama" ? <i className="mdlChip cloud">☁ cloud</i> : null}
+                          {m.group === "Local Ollama" ? <i className="mdlChip pulled">💾 local</i> : null}
+                          {ctx ? <i className="mdlChip">{ctx}</i> : null}
+                          {isFree ? <i className="mdlChip free">FREE</i> : price ? <i className="mdlChip">{price}</i> : null}
+                          {m.capabilities?.filter((c) => c !== "free").slice(0, 3).map((c) => <i key={c} className="mdlChip cap">{c}</i>)}
+                          {m.id === value ? <i className="mdlChip current">✓ current</i> : null}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </React.Fragment>
+              ))}
+              {!loading && filtered.length === 0 ? <div className="modelHintEmpty">no models match</div> : null}
+            </div>
+          )}
+        </section>
       </div>
     </div>
   );
@@ -4238,6 +5780,67 @@ function kfmt(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
   if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "k";
   return String(Math.round(n));
+}
+
+// ─── Vanguard drive mode ────────────────────────────────────────────────────────
+//
+// The one-shot engine-switch burst: shield, shockwave rings, and the banner
+// "ARES : powered by VANGUARD". Purely visual — the actual engine switch is
+// the daemon's vanguard_mode ack that triggers this overlay.
+
+// The boot-sequence second beat: after the Ares forge splash exits, the
+// Vanguard shield draws itself in, holds one breath, and hands over to the
+// app. Click anywhere to skip; plays once per launch.
+function VanguardBootIntro({ onDone }: { onDone: () => void }) {
+  const [stage, setStage] = useState(0);
+  useEffect(() => {
+    const beats = [
+      window.setTimeout(() => setStage(1), 60),    // grid + shield draw
+      window.setTimeout(() => setStage(2), 850),   // wordmark reveal
+      window.setTimeout(() => setStage(3), 2050),  // fade out
+      window.setTimeout(onDone, 2450),
+    ];
+    return () => beats.forEach((beat) => window.clearTimeout(beat));
+  }, [onDone]);
+  return (
+    <div className="vgIntro" data-stage={stage} onClick={onDone} role="button" aria-label="Skip Vanguard intro">
+      <div className="vgIntroGrid" />
+      <div className="vgIntroStage">
+        <svg className="vgIntroShield" viewBox="0 0 64 72" aria-hidden="true">
+          <path className="hull" d="M32 4 58 14v20c0 17.6-11.6 28.4-26 32.8C17.6 62.4 6 51.6 6 34V14L32 4Z" fill="none" stroke="currentColor" strokeWidth="2.2" />
+          <path className="mark" d="m20 24 12 22 12-22" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <div className="vgIntroText">
+          <span className="pow">powered by</span>
+          <span className="word">VANGUARD</span>
+          <span className="tag">verification-first engine · armed</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VanguardBurst() {
+  return (
+    <div className="vgBurst" aria-hidden="true">
+      <div className="vgBurstWave" />
+      <div className="vgBurstWave two" />
+      <div className="vgBurstWire" />
+      <div className="vgBurstWire two" />
+      <div className="vgBurstCore">
+        <svg className="vgBurstShield" viewBox="0 0 64 72">
+          <path d="M32 4 58 14v20c0 17.6-11.6 28.4-26 32.8C17.6 62.4 6 51.6 6 34V14L32 4Z" fill="none" stroke="currentColor" strokeWidth="2.4" />
+          <path d="m20 24 12 22 12-22" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <div className="vgBurstText">
+          <span className="a">ARES</span>
+          <span className="sep">:</span>
+          <span className="p">powered by</span>
+          <span className="v">VANGUARD</span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function HelmView({
@@ -4670,45 +6273,6 @@ function FleetPanel({ fleet, onResume }: { fleet: FleetVm; onResume: (fleetId: s
 }
 
 // ─── The effort slider — low → max → ULTRA (with the fleet ignition) ─────────
-function ReasoningSlider({ value, onChange }: { value: EffortStep; onChange: (s: EffortStep) => void }) {
-  const idx = EFFORT_STEPS.indexOf(value);
-  const ignited = value === "ultra";
-  const pct = (idx / (EFFORT_STEPS.length - 1)) * 100;
-  return (
-    <div className={ignited ? "effortSlider ignited" : "effortSlider"} data-step={value}>
-      <div className="effortTrack">
-        <div className="effortFill" style={{ width: `${pct}%` }} />
-        <div className="effortFlame" aria-hidden="true" />
-        <div className="effortThumb" style={{ left: `${pct}%` }} />
-        <input
-          className="effortRange"
-          type="range"
-          min={0}
-          max={EFFORT_STEPS.length - 1}
-          step={1}
-          value={idx}
-          aria-label="reasoning effort"
-          onChange={(e) => onChange(EFFORT_STEPS[Number(e.target.value)])}
-        />
-      </div>
-      <div className="effortLabels">
-        {EFFORT_STEPS.map((s) => (
-          <button
-            key={s}
-            className="effortLabel"
-            data-on={s === value ? "1" : "0"}
-            data-ultra={s === "ultra" ? "1" : "0"}
-            onClick={() => onChange(s)}
-          >
-            {EFFORT_META[s].label}
-          </button>
-        ))}
-      </div>
-      <div className="effortHint">{EFFORT_META[value].hint}</div>
-    </div>
-  );
-}
-
 // ─── Dictation (speech → text) ───────────────────────────────────────────────
 // Mic → MediaRecorder (webm/opus) → Google Speech REST. Same public Chromium key
 // the rest of Ares uses for voice notes; the webview reaches the API directly
@@ -4731,6 +6295,19 @@ function blobToBase64(blob: Blob): Promise<string> {
 function dataUrlB64Len(dataUrl: string): number {
   const i = dataUrl.indexOf(",");
   return i >= 0 ? dataUrl.length - i - 1 : dataUrl.length;
+}
+
+/** Pull data:image URLs out of a message string so the transcript shows the
+ *  IMAGE, not a giant truncated base64 blob (which read as a "random directory").
+ *  Used for history replay; the live send path passes images out of band. */
+function splitDataImages(raw: string): { text: string; images: string[] } {
+  const images: string[] = [];
+  const text = raw
+    .replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, (m) => { images.push(m); return ""; })
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { text, images };
 }
 
 // Vision-safe downscale, done in the webview with a plain <canvas> — no deps.
@@ -4809,55 +6386,164 @@ async function transcribeSpeech(blob: Blob, language = "en-US"): Promise<string>
   return (data.results ?? []).map((r) => r.alternatives?.[0]?.transcript ?? "").join(" ").trim();
 }
 
+// A `provides:stt` skill's transcriber, installed by the App component when one
+// is enabled. Module-level so the mic hooks (which live in deeply-nested
+// components) reach it without threading a prop through every layer.
+const globalSttProvider: { current: ((audioB64: string, mime: string) => Promise<string | null>) | null } = { current: null };
+
 type DictState = "idle" | "recording" | "thinking" | "error";
-/** Click to record, click to stop → transcribe → onText. Auto-stops on unmount. */
+/**
+ * Tap once, speak, then pause → transcribe → onText. Prefers the LOCAL voice
+ * sidecar (faster-whisper, offline, no key, mic captured server-side so there's
+ * no WebView getUserMedia dance). Falls back to the old MediaRecorder → Google
+ * Speech path only when the sidecar isn't reachable, so the mic still works on a
+ * machine without the sidecar running. Both paths use silence detection; a
+ * second click merely finishes early and is never required.
+ */
 function useDictation(onText: (text: string) => void) {
   const [state, setState] = useState<DictState>("idle");
   const recRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const legacyVadFrame = useRef<number | null>(null);
+  const legacyAudioContext = useRef<AudioContext | null>(null);
+  const sttRef = useRef<Awaited<ReturnType<typeof sidecarListen>> | null>(null);
+  const usingSidecar = useRef(false);
   const onTextRef = useRef(onText);
   onTextRef.current = onText;
 
+  const stopLegacyVad = () => {
+    if (legacyVadFrame.current !== null) cancelAnimationFrame(legacyVadFrame.current);
+    legacyVadFrame.current = null;
+    if (legacyAudioContext.current) void legacyAudioContext.current.close().catch(() => null);
+    legacyAudioContext.current = null;
+  };
+
   const cleanupStream = () => {
+    stopLegacyVad();
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   };
 
-  const stop = useCallback(() => {
-    if (recRef.current && recRef.current.state !== "inactive") recRef.current.stop();
+  // ── legacy path (MediaRecorder → provider skill → Google) — the fallback ──
+  const startLegacy = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    streamRef.current = stream;
+    const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+    const rec = new MediaRecorder(stream, { mimeType: mime });
+    chunksRef.current = [];
+    rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
+    rec.onstop = async () => {
+      cleanupStream();
+      const blob = new Blob(chunksRef.current, { type: mime });
+      if (!blob.size) { setState("idle"); return; }
+      setState("thinking");
+      try {
+        // A provides:stt skill (whisper.cpp, Deepgram, …) transcribes the
+        // recording first; the cloud path is the last resort.
+        let txt = "";
+        const provider = globalSttProvider.current;
+        if (provider) {
+          const viaSkill = await provider(await blobToBase64(blob), mime).catch(() => null);
+          if (viaSkill?.trim()) txt = viaSkill.trim();
+        }
+        if (!txt) txt = await transcribeSpeech(blob);
+        setState("idle");
+        if (txt) onTextRef.current(txt);
+      } catch {
+        setState("error");
+        setTimeout(() => setState("idle"), 2400);
+      }
+    };
+    rec.start();
+    recRef.current = rec;
+    setState("recording");
+
+    // Even the emergency WebView recorder is one-tap now. A tiny local energy
+    // gate ends capture after the user pauses, then the existing provider/cloud
+    // transcription path receives the finished blob.
+    try {
+      const ctx = new AudioContext();
+      legacyAudioContext.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      const started = performance.now();
+      let heardSpeech = false;
+      let lastVoice = started;
+      const watchSilence = () => {
+        if (rec.state === "inactive") return;
+        analyser.getFloatTimeDomainData(samples);
+        let energy = 0;
+        for (const sample of samples) energy += sample * sample;
+        const rms = Math.sqrt(energy / samples.length);
+        const now = performance.now();
+        if (rms >= 0.014) { heardSpeech = true; lastVoice = now; }
+        if ((heardSpeech && now - lastVoice >= 650) || (!heardSpeech && now - started >= 8_000) || now - started >= 22_000) {
+          setState("thinking");
+          rec.stop();
+          return;
+        }
+        legacyVadFrame.current = requestAnimationFrame(watchSilence);
+      };
+      legacyVadFrame.current = requestAnimationFrame(watchSilence);
+    } catch {
+      // Manual early-finish remains available when Web Audio is unavailable.
+    }
   }, []);
 
   const start = useCallback(async () => {
+    setState("thinking");
+    // Try the local sidecar first — in AUTO mode, so the mic also ends itself
+    // when you stop talking (the transcript just lands in the composer).
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-      const rec = new MediaRecorder(stream, { mimeType: mime });
-      chunksRef.current = [];
-      rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
-      rec.onstop = async () => {
-        cleanupStream();
-        const blob = new Blob(chunksRef.current, { type: mime });
-        if (!blob.size) { setState("idle"); return; }
-        setState("thinking");
-        try {
-          const txt = await transcribeSpeech(blob);
-          setState("idle");
-          if (txt) onTextRef.current(txt);
-        } catch {
-          setState("error");
-          setTimeout(() => setState("idle"), 2400);
-        }
-      };
-      rec.start();
-      recRef.current = rec;
+      const handle = await sidecarListen((status) => {
+        setState(status === "listening" ? "recording" : "thinking");
+      }, { auto: true });
+      sttRef.current = handle;
+      usingSidecar.current = true;
       setState("recording");
+      // VAD auto-stop: the transcript can arrive without stop() being clicked.
+      void handle.transcript.then((txt) => {
+        if (sttRef.current !== handle) return; // manual stop already handled it
+        sttRef.current = null;
+        usingSidecar.current = false;
+        setState("idle");
+        if (txt) onTextRef.current(txt);
+      });
+      return;
+    } catch {
+      usingSidecar.current = false;
+      sttRef.current = null;
+    }
+    // Sidecar down → legacy.
+    try {
+      await startLegacy();
     } catch {
       cleanupStream();
       setState("error");
       setTimeout(() => setState("idle"), 2400);
     }
+  }, [startLegacy]);
+
+  const stop = useCallback(() => {
+    if (usingSidecar.current && sttRef.current) {
+      const handle = sttRef.current;
+      sttRef.current = null;
+      usingSidecar.current = false;
+      setState("thinking");
+      void handle.stop().then((txt) => {
+        setState("idle");
+        if (txt) onTextRef.current(txt);
+      }).catch(() => {
+        setState("error");
+        setTimeout(() => setState("idle"), 2400);
+      });
+      return;
+    }
+    if (recRef.current && recRef.current.state !== "inactive") recRef.current.stop();
   }, []);
 
   const toggle = useCallback(() => {
@@ -4868,47 +6554,65 @@ function useDictation(onText: (text: string) => void) {
     });
   }, [start, stop]);
 
-  useEffect(() => () => { stop(); cleanupStream(); }, [stop]);
+  useEffect(() => () => {
+    try { sttRef.current?.cancel(); } catch { /* ignore */ }
+    if (recRef.current && recRef.current.state !== "inactive") recRef.current.stop();
+    cleanupStream();
+  }, []);
 
   return { state, toggle };
 }
 
 const MicGlyph = () => (
-  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="5.5" y="1.5" width="5" height="8.5" rx="2.5" />
-    <path d="M3.5 7.5 A4.5 4.5 0 0 0 12.5 7.5 M8 12 L8 14.5 M5.5 14.5 L10.5 14.5" />
+  <svg className="voiceAperture" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeLinecap="round" aria-hidden="true">
+    <circle className="voiceOrbit" cx="10" cy="10" r="8" strokeWidth="1" />
+    <path className="voiceBar voiceBar1" d="M6 11V9" strokeWidth="1.8" />
+    <path className="voiceBar voiceBar2" d="M10 14V6" strokeWidth="1.8" />
+    <path className="voiceBar voiceBar3" d="M14 12V8" strokeWidth="1.8" />
   </svg>
 );
+
+function AresPillGlyph({ active = false }: { active?: boolean }) {
+  return (
+    <svg className="aresPillGlyph" data-active={active ? "1" : "0"} viewBox="0 0 28 16" fill="none" aria-hidden="true">
+      <rect x="1" y="1" width="26" height="14" rx="7" stroke="currentColor" strokeWidth="1.35" />
+      <path d="M8 8h2m2-2.5v5M15 4v8m3-4h2" stroke="currentColor" strokeWidth="1.45" strokeLinecap="round" />
+      <circle cx="23.2" cy="8" r="1.25" fill="currentColor" />
+    </svg>
+  );
+}
 
 // ─── The floating pill — Ares condensed to an always-on-top mic bar ──────────
 function PillBar({
   daemon,
   busy,
   activity,
-  pinTop,
-  onTogglePin,
+  conversation,
+  listening,
+  speaking,
+  wakeStatus,
   onExpand,
-  onSend,
+  onToggleConversation,
   onStop,
   native,
 }: {
   daemon: DaemonState;
   busy: boolean;
   activity: string;
-  pinTop: boolean;
-  onTogglePin: () => void;
+  conversation: boolean;
+  listening: boolean;
+  speaking: boolean;
+  wakeStatus: "off" | "arming" | "armed" | "offline";
   onExpand: () => void;
-  onSend: (text: string) => void;
+  onToggleConversation: () => void;
   onStop: () => void;
   native: boolean;
 }) {
-  const dictation = useDictation((t) => { if (t) onSend(t); });
   const label =
-    dictation.state === "recording" ? "listening…" :
-    dictation.state === "thinking" ? "transcribing…" :
-    dictation.state === "error" ? "mic blocked" :
+    listening ? "listening…" :
+    speaking ? "speaking" :
     busy ? (activity || "working…") :
-    daemon === "running" ? "ready" : daemon;
+    conversation ? "conversation open" : wakeStatus === "armed" ? "hey ares armed" : daemon === "running" ? "ready" : daemon;
 
   const onDrag = (e: React.MouseEvent) => {
     if (!native || e.button !== 0) return;
@@ -4917,31 +6621,26 @@ function PillBar({
   };
 
   return (
-    <div className="pillBar" data-busy={busy ? "1" : "0"} onMouseDown={onDrag}>
-      <div className="pillMark" aria-hidden="true" />
-      <span className="pillStatus">
-        <i className="dot" data-state={busy ? "running" : daemon} />
-        <em>{label}</em>
-      </span>
-      <span className="pillGrow" />
-      <button className="pillMic" data-state={dictation.state} onClick={dictation.toggle} title={dictation.state === "recording" ? "stop & send" : "speak to Ares"}>
-        {dictation.state === "thinking" ? <i className="pillSpin" /> : <MicGlyph />}
-      </button>
-      {busy ? (
-        <button className="pillBtn" onClick={onStop} title="stop the turn">
-          <svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5" /></svg>
+    <div className="pillBar" data-busy={busy ? "1" : "0"} data-conversation={conversation ? "1" : "0"} onMouseDown={onDrag}>
+      <div className="pillTopline">
+        <span className="pillMark"><AresPillGlyph active={listening || speaking || busy} /></span>
+        <span className="pillStatus">
+          <i className="dot" data-state={listening || speaking || busy ? "running" : daemon} />
+          <em>{label}</em>
+        </span>
+        <span className="pillGrow" />
+        <button className="pillMic" data-state={listening ? "recording" : wakeStatus === "offline" ? "error" : conversation || wakeStatus === "armed" ? "armed" : "idle"} onClick={onToggleConversation} title={conversation ? "close hands-free conversation" : "open hands-free conversation"}>
+          {listening ? <i className="pillSpin" /> : <MicGlyph />}
         </button>
-      ) : null}
-      <button className="pillBtn" data-on={pinTop ? "1" : "0"} onClick={onTogglePin} title={pinTop ? "always-on-top: ON" : "always-on-top: OFF"}>
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M5 2 L11 2 L10 7 L13 10 L3 10 L6 7 Z M8 10 L8 14" />
-        </svg>
-      </button>
-      <button className="pillBtn" onClick={onExpand} title="expand Ares">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M9 2 L14 2 L14 7 M14 2 L8.5 7.5 M7 14 L2 14 L2 9 M2 14 L7.5 8.5" />
-        </svg>
-      </button>
+        {busy ? (
+          <button className="pillBtn" onClick={onStop} title="stop the turn">
+            <svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5" /></svg>
+          </button>
+        ) : null}
+        <button className="pillBtn" onClick={onExpand} title="expand Ares">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 2 L14 2 L14 7 M14 2 L8.5 7.5 M7 14 L2 14 L2 9 M2 14 L7.5 8.5" /></svg>
+        </button>
+      </div>
     </div>
   );
 }
@@ -4954,7 +6653,6 @@ const Composer = React.memo(function Composer({
   busy,
   model,
   autoRouting,
-  reasoning,
   routedLanes,
   todos,
   steerQueued,
@@ -4962,24 +6660,36 @@ const Composer = React.memo(function Composer({
   onSteer,
   onStop,
   onModelChip,
-  onReasoningChip,
   onRoutingChip,
+  slashActions,
 }: {
   busy: boolean;
   model: string;
   autoRouting: boolean;
-  reasoning: ReasoningLevel;
   routedLanes: RouteLane[];
   todos: Array<{ id: string; content: string; activeForm: string; status: string }>;
   steerQueued: number;
-  onSend: (text: string) => void;
-  onSteer: (text: string) => void;
+  onSend: (text: string, images?: string[]) => void;
+  onSteer: (text: string, images?: string[]) => void;
   onStop: () => void;
   onModelChip: () => void;
-  onReasoningChip: () => void;
   onRoutingChip: () => void;
+  slashActions: SlashAction[];
 }) {
   const [text, setText] = useState("");
+  // "/" command menu: visible while the draft is a bare slash prefix.
+  const [slashSel, setSlashSel] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const slashQuery = text.startsWith("/") && !/\s/.test(text) && text.length <= 24 ? text.slice(1).toLowerCase() : null;
+  const slashMatches = slashQuery !== null && !slashDismissed
+    ? slashActions.filter((a) => a.id.startsWith(slashQuery) || a.label.toLowerCase().includes(slashQuery))
+    : [];
+  const runSlash = (a: SlashAction) => {
+    a.run();
+    setText("");
+    setSlashSel(0);
+    if (ref.current) ref.current.style.height = "auto";
+  };
   const [attachments, setAttachmentsState] = useState<Array<{ name: string; dataUrl: string }>>([]);
   // Mirrors `attachments` synchronously. Refs update immediately (unlike state,
   // which is batched/rendered-on-a-delay) — submit() reads THIS after awaiting
@@ -5032,16 +6742,52 @@ const Composer = React.memo(function Composer({
     }
   };
 
+  // Drop an image ANYWHERE in the window — not just on the input. Tauri's own
+  // drag-drop handler is disabled (dragDropEnabled:false) so these HTML5 events
+  // fire; without the preventDefault the webview would navigate to the file.
+  useEffect(() => {
+    const onDrop = (e: DragEvent) => {
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      if (dt.files && dt.files.length) {
+        e.preventDefault();
+        addFiles(Array.from(dt.files));
+        return;
+      }
+      // Dragged TEXT (from a page, editor, etc.) drops into the composer.
+      const dropped = dt.getData("text/plain") || dt.getData("text/uri-list") || dt.getData("text");
+      if (dropped && dropped.trim()) {
+        e.preventDefault();
+        setText((prev) => (prev.trim() ? prev.replace(/\s+$/, "") + " " : "") + dropped.trim());
+        ref.current?.focus();
+      }
+    };
+    const onOverAny = (e: DragEvent) => {
+      // Allow BOTH file and text drops (getData is empty during dragover, so
+      // check types) — without this the webview blocks the drop or navigates.
+      const types = Array.from(e.dataTransfer?.types ?? []);
+      if (types.includes("Files") || types.includes("text/plain") || types.includes("text/uri-list") || types.includes("text")) {
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      }
+    };
+    window.addEventListener("dragover", onOverAny);
+    window.addEventListener("drop", onDrop);
+    return () => { window.removeEventListener("dragover", onOverAny); window.removeEventListener("drop", onDrop); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const submit = async () => {
     if (pendingReads.current.size > 0) await Promise.all(pendingReads.current);
     const t = text.trim();
     const currentAttachments = attachmentsRef.current;
     if (!t && currentAttachments.length === 0) return;
-    // The daemon's contentFromUserInput parses data:image URLs out of the goal
-    // into image blocks — so we just append them to the message text.
-    const payload = [t, ...currentAttachments.map((a) => a.dataUrl)].filter(Boolean).join("\n");
-    if (busy) onSteer(payload);
-    else onSend(payload);
+    // Images travel OUT OF BAND now (not concatenated into the message text) so
+    // the transcript renders thumbnails, not a truncated base64 blob. The daemon
+    // still gets them as image content, and send() shows them on the bubble.
+    const imgs = currentAttachments.map((a) => a.dataUrl);
+    if (busy) onSteer(t, imgs);
+    else onSend(t, imgs);
     setText("");
     setAttachments(() => []);
     if (ref.current) ref.current.style.height = "auto";
@@ -5069,16 +6815,31 @@ const Composer = React.memo(function Composer({
           ))}
         </div>
       ) : null}
+      {slashMatches.length > 0 ? (
+        <div className="slashMenu" role="listbox" aria-label="Commands">
+          <div className="slashMenuTitle">Commands</div>
+          {slashMatches.map((a, i) => (
+            <button
+              key={a.id}
+              className="slashItem"
+              role="option"
+              aria-selected={i === slashSel}
+              data-sel={i === slashSel ? "1" : "0"}
+              onMouseEnter={() => setSlashSel(i)}
+              onClick={() => runSlash(a)}
+            >
+              <span className="slashIcon" aria-hidden="true">{a.icon}</span>
+              <span className="slashCmd">/{a.id}</span>
+              <span className="slashLabel">{a.label}</span>
+              <span className="slashHint">{a.hint}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div
         className="composerRow"
         data-busy={busy ? "1" : "0"}
-        onDragOver={(e) => e.preventDefault()}
-        onDrop={(e) => {
-          if (e.dataTransfer?.files?.length) {
-            e.preventDefault();
-            addFiles(Array.from(e.dataTransfer.files));
-          }
-        }}
+        data-draft={text.trim() || attachments.length ? "1" : "0"}
       >
         <textarea
           ref={ref}
@@ -5087,6 +6848,8 @@ const Composer = React.memo(function Composer({
           rows={1}
           onChange={(e) => {
             setText(e.target.value);
+            setSlashSel(0);
+            setSlashDismissed(false);
             e.target.style.height = "auto";
             e.target.style.height = `${Math.min(e.target.scrollHeight, 180)}px`;
           }}
@@ -5098,6 +6861,12 @@ const Composer = React.memo(function Composer({
             }
           }}
           onKeyDown={(e) => {
+            if (slashMatches.length > 0) {
+              if (e.key === "ArrowDown") { e.preventDefault(); setSlashSel((s) => (s + 1) % slashMatches.length); return; }
+              if (e.key === "ArrowUp") { e.preventDefault(); setSlashSel((s) => (s - 1 + slashMatches.length) % slashMatches.length); return; }
+              if (e.key === "Escape") { e.preventDefault(); setSlashDismissed(true); return; }
+              if (e.key === "Tab" || e.key === "Enter") { e.preventDefault(); runSlash(slashMatches[Math.min(slashSel, slashMatches.length - 1)]); return; }
+            }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               void submit();
@@ -5109,7 +6878,8 @@ const Composer = React.memo(function Composer({
           data-state={dictation.state}
           onClick={dictation.toggle}
           aria-label="dictate"
-          title={dictation.state === "recording" ? "stop & transcribe" : dictation.state === "error" ? "mic unavailable" : "speak to type"}
+          aria-pressed={dictation.state === "recording"}
+          title={dictation.state === "recording" ? "listening — pauses automatically; tap to finish early" : dictation.state === "thinking" ? "decoding speech…" : dictation.state === "error" ? "mic unavailable" : "tap once, speak, and pause"}
         >
           {dictation.state === "thinking" ? <i className="micSpin" /> : <MicGlyph />}
         </button>
@@ -5468,7 +7238,16 @@ const ItemView = React.memo(function ItemView({
   if (item.kind === "user") {
     return (
       <div className="turn user">
-        <div className="bubble">{item.text}</div>
+        <div className="bubble">
+          {item.images && item.images.length > 0 ? (
+            <div className="bubbleImages">
+              {item.images.map((src, i) => (
+                <img key={i} className="bubbleImage" src={src} alt="attachment" />
+              ))}
+            </div>
+          ) : null}
+          {item.text ? <div className="bubbleText">{item.text}</div> : null}
+        </div>
       </div>
     );
   }
@@ -5520,11 +7299,12 @@ const ItemView = React.memo(function ItemView({
   }
   if (item.kind === "tools") return <ToolGroup item={item} technical={toolDisplay === "technical"} />;
   if (item.kind === "usage") {
+    const freshInput = Math.max(0, item.input - item.cacheRead);
     return (
       <div className="usage" data-status={item.status}>
         {item.status !== "completed" ? `${item.status} · ` : ""}
-        {fmtMs(item.durationMs)} · {item.modelCalls} call{item.modelCalls === 1 ? "" : "s"} · ↑{fmtTokens(item.input)} ↓{fmtTokens(item.output)}
-        {item.cacheRead > 0 ? ` · ${Math.round((item.cacheRead / Math.max(1, item.input)) * 100)}% cached` : ""}
+        {fmtMs(item.durationMs)} · {item.modelCalls} call{item.modelCalls === 1 ? "" : "s"} · ↑{fmtTokens(freshInput)} fresh ↓{fmtTokens(item.output)}
+        {item.cacheRead > 0 ? ` · ${fmtTokens(item.cacheRead)} reused (${Math.round((item.cacheRead / Math.max(1, item.input)) * 100)}%)` : ""}
         {item.model ? <span className="usageModelTag">{item.model}{item.provider ? ` (${item.provider})` : ""}{item.lane ? ` · ${item.lane}` : ""}</span> : null}
       </div>
     );
@@ -5808,13 +7588,46 @@ function ChartBlock({ spec, complete }: { spec: string; complete: boolean }) {
   );
 }
 
+// The thought card. Streams visibly (shimmering label + growing preview while
+// deltas arrive), springs open/closed like the tool cards, and keeps the text
+// in a real div so it stays selectable (the old version was one big <button>).
 function ThinkingView({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
-  return (
-    <button className="thinking" data-open={open ? "1" : "0"} onClick={() => setOpen(!open)}>
-      <span className="thinkLabel">thinking</span>
-      <span className="thinkText">{open ? text : compact(text, 140)}</span>
-    </button>
+  const newStyle = useNewStyle();
+  // "Live" = the text grew within the last moment. No session state needed —
+  // the stream itself is the signal.
+  const [live, setLive] = useState(false);
+  const lastLen = useRef(text.length);
+  useEffect(() => {
+    if (text.length === lastLen.current) return;
+    lastLen.current = text.length;
+    setLive(true);
+    const t = window.setTimeout(() => setLive(false), 1500);
+    return () => window.clearTimeout(t);
+  }, [text]);
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const body = (
+    <>
+      <button className="thinkHead" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span className="thinkSigil" aria-hidden="true" />
+        <span className="thinkLabel">{live ? "thinking" : "thought"}</span>
+        {live ? <span className="thinkEllipsis" aria-hidden="true"><i /><i /><i /></span> : null}
+        <span className="thinkMeta">{words.toLocaleString()} word{words === 1 ? "" : "s"}</span>
+        <span className="thinkChevron" data-open={open ? "1" : "0"} aria-hidden="true">▾</span>
+      </button>
+      <div className="thinkText" data-open={open ? "1" : "0"}>
+        {open ? text : compact(live ? text.slice(-220) : text, 220)}
+      </div>
+    </>
+  );
+  return newStyle ? (
+    <SpringHeight className="thinking" attrs={{ "data-open": open ? "1" : "0", "data-live": live ? "1" : "0" }}>
+      {body}
+    </SpringHeight>
+  ) : (
+    <div className="thinking" data-open={open ? "1" : "0"} data-live={live ? "1" : "0"}>
+      {body}
+    </div>
   );
 }
 
@@ -5824,6 +7637,7 @@ function ThinkingView({ text }: { text: string }) {
 // per-step breakdown stays one click away. One reused card, not a stack.
 function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>; technical?: boolean }) {
   const [open, setOpen] = useState(false);
+  const [now, setNow] = useState(Date.now());
   const newStyle = useNewStyle();
   const running = item.steps.some((s) => s.status === "running" || s.status === "drafting");
   const failed = item.steps.some((s) => s.status === "error");
@@ -5834,13 +7648,18 @@ function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>
   const doneCount = item.steps.filter((s) => s.status === "ok").length;
   const failedCount = item.steps.filter((s) => s.status === "error").length;
   const total = item.steps.length;
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [running]);
   // The step the card is currently "wearing": the first live one, else the last.
   const current = runningSteps[0] ?? item.steps[item.steps.length - 1];
   const activeGlyph = toolGlyph(current?.name ?? "");
 
   const title = running ? current?.label ?? "working…" : `${total} tool${total === 1 ? "" : "s"} attempted`;
   const subline = running
-    ? `${doneCount}/${total} done${runningSteps.length > 1 ? ` · ${runningSteps.length} running` : ""}`
+    ? `${doneCount}/${total} done · ${fmtMs(Math.max(0, now - item.startedAt))}${runningSteps.length > 1 ? ` · ${runningSteps.length} running` : ""}`
     : `${summarizeSteps(item.steps)}${failed ? ` · ${failedCount} failed` : ""} · ${fmtMs(elapsed)}`;
 
   // New style: a finished card COLLAPSES to a compact ✓ line (height-spring via
@@ -5873,6 +7692,7 @@ function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>
         </span>
         <i className="caret" data-open={open ? "1" : "0"} />
       </button>
+      {running ? <div className="toolProgressRail" aria-hidden="true"><i style={{ width: `${Math.max(5, (doneCount / Math.max(total, 1)) * 100)}%` }} /></div> : null}
       {running && current?.liveTail && !open ? (
         <pre className="stepLiveTail cardTail">{current.liveTail.split("\n").slice(-10).join("\n")}</pre>
       ) : null}
@@ -6038,7 +7858,7 @@ function Boot() {
 }
 
 // Ares (the owner gateway) leads; mock is dev-only and hidden from users.
-const PROVIDERS = ["ares", "ollama", "openai", "anthropic", "deepseek", "openrouter", "custom", "moa"];
+const PROVIDERS = ["ares", "ollama", "openai", "anthropic", "deepseek", "kimi", "openrouter", "custom", "moa"];
 
 // ─── Custom (OpenAI-compatible) provider: bring-your-own URL + key + discovery ──
 // Point Ares at ANY OpenAI-compatible endpoint and pull its full model list from
@@ -6261,33 +8081,113 @@ function CustomProviderBlock({
   );
 }
 /** Providers that take a pasted API key (the rest use OAuth / local daemon / nothing). */
-const KEYED_PROVIDERS: Array<{ id: string; label: string; placeholder: string }> = [
-  { id: "anthropic", label: "Anthropic API key", placeholder: "sk-ant-… (stored by the daemon)" },
-  { id: "deepseek", label: "DeepSeek API key", placeholder: "sk-… official api.deepseek.com access" },
-  { id: "openrouter", label: "OpenRouter API key", placeholder: "sk-or-… (stored by the daemon)" },
-  { id: "ollama", label: "Ollama Cloud API key", placeholder: "cloud catalog; auth for OLLAMA_HOST=https://ollama.com" },
+const KEYED_PROVIDERS: Array<{ id: string; brand: string; label: string; sub: string; placeholder: string }> = [
+  { id: "anthropic", brand: "anthropic", label: "Anthropic", sub: "Claude models via API", placeholder: "sk-ant-…" },
+  { id: "deepseek", brand: "deepseek", label: "DeepSeek", sub: "official api.deepseek.com", placeholder: "sk-…" },
+  { id: "kimi", brand: "moonshot", label: "Kimi", sub: "api.kimi.com coding endpoint", placeholder: "sk-…" },
+  { id: "openrouter", brand: "openrouter", label: "OpenRouter", sub: "hundreds of models, one key", placeholder: "sk-or-…" },
+  { id: "ollama", brand: "ollama", label: "Ollama Cloud", sub: "cloud catalog + inference", placeholder: "ollama.com API key" },
 ];
 
 // A small brand glyph per model so the picker reads like a gallery, not a
 // wall of ids. Keyed off the catalog group first, then the id prefix that
 // OpenRouter-style ids carry ("openai/…", "anthropic/…").
-function modelGlyph(m: { id: string; group?: string }): string {
-  const g = (m.group ?? "").toLowerCase();
-  if (g.includes("ares")) return "⚔️";
-  if (g.includes("anthropic")) return "🔶";
-  if (g.includes("openai")) return "🟢";
-  if (g.includes("deepseek")) return "🐋";
-  if (g.includes("ollama")) return "🦙";
-  if (g.includes("openrouter")) return "🧭";
-  if (g.includes("custom")) return "🔧";
-  if (g.includes("mixture") || g.includes("moa")) return "🜲";
-  if (g.includes("mock")) return "🎭";
-  const prefix = m.id.split("/")[0]?.toLowerCase() ?? "";
+// Map a model (by group + id prefix) to a brand key for its logo. Covers both
+// the native providers and the model FAMILY (id prefix) for OpenRouter's mixed
+// catalog, so a "google/gemini-…" row shows Google's mark, not OpenRouter's.
+function brandKey(m: { id: string; group?: string }): string {
+  const id = m.id.toLowerCase();
+  const prefix = id.split("/")[0] ?? "";
   const byPrefix: Record<string, string> = {
-    openai: "🟢", anthropic: "🔶", google: "🔵", "meta-llama": "🦙", meta: "🦙",
-    mistralai: "🌫️", deepseek: "🐋", qwen: "🟣", "x-ai": "✖️", cohere: "🔗",
+    openai: "openai", "o1": "openai", "o3": "openai", "gpt": "openai",
+    anthropic: "anthropic", claude: "anthropic",
+    google: "google", "gemini": "google", "gemma": "google",
+    "meta-llama": "meta", meta: "meta", llama: "meta",
+    mistralai: "mistral", mistral: "mistral", ministral: "mistral",
+    deepseek: "deepseek", qwen: "qwen", qwq: "qwen", "x-ai": "xai", grok: "xai",
+    cohere: "cohere", "command": "cohere", nvidia: "nvidia", microsoft: "microsoft",
+    perplexity: "perplexity", "z-ai": "zai", moonshotai: "moonshot", moonshot: "moonshot",
   };
-  return byPrefix[prefix] ?? "🔥";
+  if (byPrefix[prefix]) return byPrefix[prefix];
+  const bare = id.split("/").pop() ?? id;
+  for (const [k, v] of Object.entries(byPrefix)) if (bare.startsWith(k)) return v;
+  const g = (m.group ?? "").toLowerCase();
+  if (g.includes("ares")) return "ares";
+  if (g.includes("anthropic")) return "anthropic";
+  if (g.includes("openai")) return "openai";
+  if (g.includes("deepseek")) return "deepseek";
+  if (g.includes("ollama") || g.includes("library")) return "ollama";
+  if (g.includes("openrouter")) return "openrouter";
+  if (g.includes("mixture") || g.includes("moa")) return "moa";
+  if (g.includes("custom")) return "custom";
+  if (g.includes("mock") || g.includes("demo")) return "mock";
+  return "generic";
+}
+
+// Original geometric brand marks — functional provider identifiers rendered as
+// self-contained rounded tiles (bg + mark), so they read as real app icons
+// instead of emoji. Not tracings of trademarked artwork; simple vector forms
+// in each brand's signature color.
+const BRAND_LOGOS: Record<string, { bg: string; fg: string; body: React.ReactNode }> = {
+  ares: { bg: "#3a0f0f", fg: "#f0b046", body: <path d="M12 4l6 14h-3l-1-3h-4l-1 3H5z m0 5l-1.2 3h2.4z" /> },
+  openai: { bg: "#0d1f1a", fg: "#10a37f", body: <path d="M12 5a4 4 0 0 1 3.9 3.1 4 4 0 0 1 .1 7.8A4 4 0 0 1 8.1 15 4 4 0 0 1 8 7.2 4 4 0 0 1 12 5m0 2.2a2.2 2.2 0 0 0-2.2 2.2v5.2a2.2 2.2 0 1 0 4.4 0V9.4A2.2 2.2 0 0 0 12 7.2" /> },
+  anthropic: { bg: "#2b1a12", fg: "#d97757", body: <path d="M9.2 5h2.2l4.4 14h-2.4l-.9-3H8.6l-.9 3H5.3zM9.3 14h3.1L10.9 8.8z" /> },
+  ollama: { bg: "#101a1c", fg: "#c9d6d3", body: <path d="M8 6c1 0 1.6.9 1.6 2.2 0 .5-.1 1-.3 1.4h5.4c-.2-.4-.3-.9-.3-1.4C14.4 6.9 15 6 16 6s1.7 1.1 1.7 2.7c0 1-.3 1.9-.8 2.5.6.7 1 1.7 1 2.8 0 2.5-2.2 4-5.9 4s-5.9-1.5-5.9-4c0-1.1.4-2.1 1-2.8-.5-.6-.8-1.5-.8-2.5C6.3 7.1 7 6 8 6m2.2 8.2a1 1 0 1 0 0 .1zm3.6 0a1 1 0 1 0 0 .1z" /> },
+  deepseek: { bg: "#101a33", fg: "#4d6bfe", body: <path d="M18 7c-1.5 2.3-3.4 2.2-5.3 2.5-2.6.4-4 1.6-4.4 3.9-.3-1-1-1.6-2-1.9 1 .9 1.1 2.4.3 3.6C7.9 16 10 17 12.4 17c3.4 0 5.8-2.4 5.8-6 0-1.5-.3-2.9-.2-4z" /> },
+  openrouter: { bg: "#1e1630", fg: "#9d7bea", body: <path d="M4 12h3.5M16.5 8.5 20 12l-3.5 3.5M7.5 12c1.8 0 2.2-4 4.5-4h4M7.5 12c1.8 0 2.2 4 4.5 4h4" fill="none" stroke="#9d7bea" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /> },
+  google: { bg: "#12151c", fg: "#4285f4", body: <path d="M12 4c1 3.8 3.2 6 7 7-3.8 1-6 3.2-7 7-1-3.8-3.2-6-7-7 3.8-1 6-3.2 7-7z" /> },
+  meta: { bg: "#0a1830", fg: "#3b82f6", body: <path d="M4 15c1.6 0 2.6-1.4 3.8-3.4C9 9.7 9.8 8.6 11 8.6c1.4 0 2 1.8 2.6 3.6M20 15c-1.6 0-2.6-1.4-3.8-3.4C15 9.7 14.2 8.6 13 8.6c-1.4 0-2 1.8-2.6 3.6" fill="none" stroke="#3b82f6" strokeWidth="1.7" strokeLinecap="round" /> },
+  mistral: { bg: "#201408", fg: "#f2a33c", body: <path d="M5 6h3v3H5zm5 0h3v3h-3zm5 0h3v3h-3zM5 11h3v3H5zm10 0h3v3h-3zM5 16h3v2H5zm5-5h3v3h-3zm0 5h3v2h-3zm5 0h3v2h-3z" /> },
+  qwen: { bg: "#1c1030", fg: "#a56bf0", body: <path d="M12 4l7 4v8l-7 4-7-4V8zm0 2.3L7 9v6l5 2.7L17 15V9z" /> },
+  xai: { bg: "#161616", fg: "#e8e8e8", body: <path d="M6 6l12 12M18 6L6 18" fill="none" stroke="#e8e8e8" strokeWidth="1.8" strokeLinecap="round" /> },
+  cohere: { bg: "#241416", fg: "#e06a5a", body: <path d="M9 9a3 3 0 1 0 3 3h6M9 9h4" fill="none" stroke="#e06a5a" strokeWidth="1.7" strokeLinecap="round" /> },
+  nvidia: { bg: "#0f1a0a", fg: "#76b900", body: <path d="M6 9c3-1 6-1 8 0s2 4 0 6c-3-1.5-3-4.5-8-6z" /> },
+  microsoft: { bg: "#101820", fg: "#3aa0ff", body: <path d="M5 5h5.5v5.5H5zm8.5 0H19v5.5h-5.5zM5 13.5h5.5V19H5zm8.5 0H19V19h-5.5z" /> },
+  perplexity: { bg: "#0d1c1e", fg: "#4fd0c8", body: <path d="M12 4v16M6 8l6 4 6-4M6 16l6-4 6 4" fill="none" stroke="#4fd0c8" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /> },
+  zai: { bg: "#151530", fg: "#7f8bf0", body: <path d="M7 7h10l-7 10h7" fill="none" stroke="#7f8bf0" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /> },
+  moonshot: { bg: "#12121c", fg: "#c9c9ff", body: <path d="M15 4a7 7 0 1 0 4 8 5.5 5.5 0 0 1-4-8z" /> },
+  ares_gateway: { bg: "#3a0f0f", fg: "#f0b046", body: <path d="M12 4l6 14h-3l-1-3h-4l-1 3H5z" /> },
+  moa: { bg: "#241430", fg: "#c86bd1", body: <path d="M12 5a2 2 0 1 1 0 .1zM6.5 15a2 2 0 1 1 0 .1zM17.5 15a2 2 0 1 1 0 .1zM12 5v3M12 8l-4.5 5M12 8l4.5 5" fill="none" stroke="#c86bd1" strokeWidth="1.5" strokeLinecap="round" /> },
+  custom: { bg: "#1a1a1e", fg: "#9aa3ad", body: <path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0-4v2m0 12v2M4 12h2m12 0h2M6 6l1.5 1.5M16.5 16.5 18 18" fill="none" stroke="#9aa3ad" strokeWidth="1.4" strokeLinecap="round" /> },
+  mock: { bg: "#1a1a1e", fg: "#8a8f98", body: <path d="M8 9a1.5 1.5 0 1 1 0 .1zm8 0a1.5 1.5 0 1 1 0 .1zM8 15c1 1.2 2.4 1.8 4 1.8s3-.6 4-1.8" fill="none" stroke="#8a8f98" strokeWidth="1.4" strokeLinecap="round" /> },
+  generic: { bg: "#1a1a1e", fg: "#c98a3a", body: <path d="M12 4l2.2 5.6L20 10l-4.5 3.4L17 19l-5-3-5 3 1.5-5.6L4 10l5.8-.4z" /> },
+};
+
+// The provider's OWN domain — we load its real favicon (the genuine logo it
+// serves) at runtime and only fall back to the vector mark when offline / the
+// image fails. Ares/MoA/custom have no external brand, so they use the mark.
+const BRAND_DOMAINS: Record<string, string> = {
+  openai: "openai.com", anthropic: "anthropic.com", google: "google.com",
+  meta: "meta.com", mistral: "mistral.ai", deepseek: "deepseek.com",
+  qwen: "qwen.ai", xai: "x.ai", cohere: "cohere.com", ollama: "ollama.com",
+  openrouter: "openrouter.ai", nvidia: "nvidia.com", microsoft: "microsoft.com",
+  perplexity: "perplexity.ai", zai: "z.ai", moonshot: "moonshot.ai",
+};
+
+function ProviderLogo({ brand, className }: { brand: string; className?: string }) {
+  const domain = BRAND_DOMAINS[brand];
+  const [failed, setFailed] = useState(false);
+  const b = BRAND_LOGOS[brand] ?? BRAND_LOGOS.generic;
+  if (domain && !failed) {
+    // DuckDuckGo's favicon service returns the provider's real, normalized
+    // logo; a clean light tile keeps dark marks visible in any theme.
+    return (
+      <span className={`brandLogo ${className ?? ""}`} aria-hidden="true">
+        <img
+          src={`https://icons.duckduckgo.com/ip3/${domain}.ico`}
+          alt=""
+          loading="lazy"
+          onError={() => setFailed(true)}
+        />
+      </span>
+    );
+  }
+  return (
+    <svg className={className} viewBox="0 0 24 24" role="img" aria-hidden="true">
+      <rect x="0" y="0" width="24" height="24" rx="6" fill={b.bg} />
+      <g fill={b.fg}>{b.body}</g>
+    </svg>
+  );
 }
 
 function ModelPicker({
@@ -6378,7 +8278,7 @@ function ModelPicker({
               .filter((m) => m.group === g)
               .map((m, i) => (
                 <button key={m.id} className="modelRow" data-on={m.id === value ? "1" : "0"} style={{ ["--i" as string]: i }} onClick={() => choose(m.id)}>
-                  <span className="modelGlyph" aria-hidden="true">{modelGlyph(m)}</span>
+                  <ProviderLogo brand={brandKey(m)} className="modelGlyph" />
                   <span className="modelIdentity">
                     {/* Friendly name leads (white-labeled for gateway models); raw id demotes to a tag. */}
                     <span className="modelId">{m.label ?? m.id}</span>
@@ -6433,7 +8333,7 @@ function ModelDetail({ model, selected, onUse, onBack }: { model: ModelOption; s
     <div className="modelDetail" role="dialog" aria-label={`${model.label ?? model.id} details`}>
       <button className="mdBack" onClick={onBack}>← Back to models</button>
       <div className="mdHead">
-        <span className="mdGlyph" aria-hidden="true">{modelGlyph(model)}</span>
+        <ProviderLogo brand={brandKey(model)} className="mdGlyph" />
         <div className="mdTitle">
           <strong>{model.label ?? model.id}</strong>
           <span className="mdSub">{model.group}{model.label && model.label !== model.id ? ` · ${model.id}` : ""}</span>
@@ -6460,14 +8360,26 @@ function ModelDetail({ model, selected, onUse, onBack }: { model: ModelOption; s
   );
 }
 
-type SettingsTab = "account" | "model" | "appearance" | "skills" | "usage" | "routing" | "keys" | "services" | "consciousness" | "permissions" | "advanced" | "updates" | "about";
+type SettingsTab = "account" | "model" | "appearance" | "voice" | "skills" | "usage" | "routing" | "keys" | "consciousness" | "permissions" | "advanced" | "updates" | "about";
 
+interface SkillSurface {
+  id: string;
+  label: string;
+  icon?: string;
+  kind?: "button" | "toggle";
+  input?: unknown;
+  hint?: string;
+}
 interface SkillInfo {
   name: string;
   description: string;
   status: string;
   category: string;
   enabled: boolean;
+  provides?: string[];
+  surfaces?: SkillSurface[];
+  runnable?: boolean;
+  modifiedAt?: number;
 }
 interface UsageStats {
   sessions: number;
@@ -6478,7 +8390,9 @@ interface UsageStats {
   auxiliaryTokensIn: number;
   auxiliaryTokensOut: number;
   daily: Array<{ date: string; in: number; out: number }>;
-  models: Array<{ model: string; tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number }>;
+  models: Array<{ model: string; provider?: string; tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number; costUsd?: number }>;
+  /** Per-provider rollup with estimated spend (live OpenRouter pricing). */
+  providers?: Array<{ provider: string; tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number; costUsd?: number }>;
 }
 
 const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; glyph: string }> = [
@@ -6486,10 +8400,10 @@ const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; glyph: string }> = 
   { id: "account", label: "Ares Account", glyph: "dot" },
   { id: "routing", label: "Routing", glyph: "search" },
   { id: "appearance", label: "Appearance", glyph: "edit" },
+  { id: "voice", label: "Voice", glyph: "dot" },
   { id: "skills", label: "Skills & Tools", glyph: "file" },
   { id: "usage", label: "Usage", glyph: "web" },
   { id: "keys", label: "API Keys", glyph: "shell" },
-  { id: "services", label: "Services", glyph: "web" },
   { id: "consciousness", label: "Consciousness", glyph: "dot" },
   { id: "permissions", label: "Permissions", glyph: "shell" },
   { id: "advanced", label: "Advanced", glyph: "dot" },
@@ -6657,6 +8571,16 @@ function Settings({
   onLivePref,
   onAnthropicSignIn,
   initialTab,
+  onPreviewVoice,
+  listProviderVoices,
+  voiceEngine,
+  onRepairVoice,
+  onOpenModelBrowser,
+  openaiAuth,
+  onOpenaiSignIn,
+  kimiAuth,
+  onKimiSignIn,
+  onLaunchLivingSurface,
 }: {
   prefs: Prefs;
   onApply: (p: Prefs, keys: Record<string, string>) => void;
@@ -6674,10 +8598,21 @@ function Settings({
   onLivePref: (patch: Partial<Prefs>) => void;
   onAnthropicSignIn: () => void;
   initialTab?: SettingsTab;
+  onPreviewVoice?: (voiceId: string) => void;
+  listProviderVoices?: () => Promise<VoiceInfo[]>;
+  voiceEngine: { phase: string; detail: string };
+  onRepairVoice: () => void;
+  onOpenModelBrowser: () => void;
+  openaiAuth: { signingIn: boolean; connected: boolean; email: string | null; plan: string | null };
+  onOpenaiSignIn: () => void;
+  kimiAuth: { signingIn: boolean; connected: boolean; detail: string | null };
+  onKimiSignIn: () => void;
+  onLaunchLivingSurface: () => void;
 }) {
   const [tab, setTab] = useState<SettingsTab>(initialTab ?? "model");
   const [draft, setDraftPrefs] = useState<Prefs>(prefs);
   const [keys, setKeys] = useState<Record<string, string>>({});
+  const [skillQuery, setSkillQuery] = useState("");
   const providerModels = useRef<Record<string, string>>({ [prefs.provider]: prefs.model });
 
   // pull live data when entering data-backed tabs
@@ -6731,24 +8666,19 @@ function Settings({
             <div className="settingsPane">
               <h3 className="paneTitle">Model</h3>
               <p className="paneHint">The main model for new sessions. Hot-swap the active chat from the composer.</p>
-              <label className="fieldLabel">Provider</label>
-              <div className="provGrid">
-                {PROVIDERS.map((p) => (
-                  <button key={p} className="provChip" data-on={draft.provider === p ? "1" : "0"} onClick={() => setProvider(p)}>
-                    <i className="provDot" data-provider={p} />
-                    <span>{p}</span>
-                  </button>
-                ))}
-              </div>
-              <label className="fieldLabel">Model</label>
-              <ModelPicker provider={draft.provider} value={draft.model} onPick={setModel} native={native} />
-              <label className="fieldLabel">Reasoning effort</label>
-              <div className="segment">
-                {REASONING_LEVELS.map((r) => (
-                  <button key={r} data-on={draft.reasoning === r ? "1" : "0"} onClick={() => setDraftPrefs({ ...draft, reasoning: r })}>
-                    {r}
-                  </button>
-                ))}
+              <label className="fieldLabel">Current model</label>
+              <button className="settingsModelCard" onClick={onOpenModelBrowser} title="Open the full model browser">
+                <ProviderLogo brand={brandKey({ id: prefs.model, group: prefs.provider })} className="settingsModelLogo" />
+                <span className="settingsModelBody">
+                  <strong>{prefs.model}</strong>
+                  <em>{PROVIDER_IDENTITY[prefs.provider]?.title ?? prefs.provider}{prefs.routingMode === "auto" ? " · auto-routing on" : ""}</em>
+                </span>
+                <span className="settingsModelBrowse">Browse models →</span>
+              </button>
+              <label className="fieldLabel">Reasoning</label>
+              <div className="modelNativeReasoning">
+                <strong>Model-native</strong>
+                <span>Ares negotiates the real reasoning capability supported by this model. There is no simulated global thinking mode.</span>
               </div>
             </div>
           ) : null}
@@ -6768,14 +8698,19 @@ function Settings({
                 return (
                   <div key={lane} className="routeLane" data-on={entry ? "1" : "0"}>
                     <button className="laneToggle" onClick={() => setLane(entry ? undefined : { provider: draft.provider, model: draft.model })}>
-                      <i />
-                      <span>{lane}</span>
-                      <em>{LANE_HINTS[lane]}</em>
+                      <span className="laneIcon" aria-hidden="true">{LANE_ICONS[lane]}</span>
+                      <span className="laneName">
+                        <strong>{lane}</strong>
+                        <em>{LANE_HINTS[lane]}</em>
+                      </span>
+                      <span className="laneAssign" title={entry ? `${entry.provider} · ${entry.model}` : "main model"}>{entry ? `${entry.provider} · ${entry.model}` : "main model"}</span>
+                      <span className="laneSwitch" data-on={entry ? "1" : "0"} aria-hidden="true"><i /></span>
                     </button>
                     {entry ? (
                       <div className="laneBody">
                         <div className="segment mini">
-                          {PROVIDERS.filter((p) => p !== "mock").map((p) => (
+                          {/* Lanes take concrete providers only — no MoA (an ensemble is itself a router). */}
+                          {PROVIDERS.filter((p) => p !== "mock" && p !== "moa").map((p) => (
                             <button
                               key={p}
                               data-on={entry.provider === p ? "1" : "0"}
@@ -6797,6 +8732,15 @@ function Settings({
           {tab === "appearance" ? (
             <div className="settingsPane">
               <h3 className="paneTitle">Appearance</h3>
+              <div className="livingLaunchCard">
+                <div className="livingLaunchSignal"><i /><i /><i /></div>
+                <div className="livingLaunchCopy">
+                  <span>EXPERIMENTAL INTERFACE</span>
+                  <strong>Self-Generating UI <b>BETA</b></strong>
+                  <p>Name your wildest dream — a chat room, a game, a control room — and Ares builds it live: working software it reshapes around you as you speak.</p>
+                </div>
+                <button onClick={onLaunchLivingSurface} disabled={!native}>LAUNCH ARES ↗</button>
+              </div>
               <label className="fieldLabel">Interface style</label>
               <div className="displayModes">
                 <button
@@ -6852,34 +8796,61 @@ function Settings({
             </div>
           ) : null}
 
+          {tab === "voice" ? (
+            <div className="settingsPane">
+              <h3 className="paneTitle">Voice</h3>
+              <p className="paneHint">Speak with Ares hands-free. The local voice engine runs on your machine — private, no cloud.</p>
+              <VoiceEngineStatus voiceEngine={voiceEngine} onRepair={onRepairVoice} />
+              <VoiceSettings draft={draft} setDraftPrefs={setDraftPrefs} onLivePref={onLivePref} providerSkill={skills.find((s) => s.enabled && (s.provides ?? []).includes("tts"))} onPreviewVoice={onPreviewVoice} listProviderVoices={listProviderVoices} />
+            </div>
+          ) : null}
+
           {tab === "skills" ? (
             <div className="settingsPane">
               <h3 className="paneTitle">Skills & Tools</h3>
-              <p className="paneHint">Skills Ares has learned or you've installed, under ~/.ares/skills. Toggle to enable per session.</p>
+              <p className="paneHint">Installed capabilities under ~/.ares/skills. Search, inspect readiness, test executable skills, and disable anything you do not want routed into a turn.</p>
+              <div className="skillOverview">
+                <span><strong>{skills.filter((s) => s.enabled).length}</strong> enabled</span>
+                <span><strong>{skills.filter((s) => s.runnable).length}</strong> executable</span>
+                <span><strong>{new Set(skills.flatMap((s) => s.provides ?? [])).size}</strong> capabilities</span>
+              </div>
+              <input className="txt skillFilter" type="search" placeholder="Filter skills, categories, capabilities…" value={skillQuery} onChange={(e) => setSkillQuery(e.target.value)} />
               {skills.length === 0 ? (
                 <div className="paneEmpty">No skills yet. Ares proposes skills from repeated workflows; approved ones land here.</div>
               ) : (
                 <div className="skillList">
-                  {skills.map((s) => (
+                  {skills.filter((s) => {
+                    const q = skillQuery.trim().toLowerCase();
+                    return !q || [s.name, s.description, s.category, ...(s.provides ?? [])].join(" ").toLowerCase().includes(q);
+                  }).map((s) => (
                     <div key={s.name} className="skillRow">
                       <div className="skillInfo">
                         <strong>
                           {s.name}
                           <span className="skillCat">{s.category}</span>
+                          {(s.provides ?? []).map((p) => <span key={p} className="skillCat provides">{p}</span>)}
+                          <span className="skillReady" data-ready={s.runnable ? "1" : "0"}>{s.runnable ? "executable" : "prompt"}</span>
                         </strong>
                         <span>{s.description}</span>
                       </div>
-                      <button
-                        className="toggle"
-                        data-on={s.enabled ? "1" : "0"}
-                        onClick={() => onDaemonCommand({ type: "skill_toggle", name: s.name, enabled: !s.enabled })}
-                      >
-                        <i />
-                      </button>
+                      <div className="skillRowActions">
+                        {s.runnable ? <button className="btn tiny ghost" disabled={!s.enabled} title="Run this skill's health check" onClick={() => onDaemonCommand({ type: "skill_invoke", name: s.name, input: { op: "healthcheck", source: "settings" } })}>▶ Test</button> : null}
+                        <button className="btn tiny ghost" title="Publish this skill to the SkillHub" onClick={() => onDaemonCommand({ type: "skillhub_publish", name: s.name })}>
+                          ⬆ Upload
+                        </button>
+                        <button
+                          className="toggle"
+                          data-on={s.enabled ? "1" : "0"}
+                          onClick={() => onDaemonCommand({ type: "skill_toggle", name: s.name, enabled: !s.enabled })}
+                        >
+                          <i />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
               )}
+              <div className="skillHubSection"><SkillHubBrowser onDaemonCommand={onDaemonCommand} /></div>
             </div>
           ) : null}
 
@@ -6891,56 +8862,85 @@ function Settings({
           {tab === "keys" ? (
             <div className="settingsPane">
               <h3 className="paneTitle">API Keys</h3>
-              <p className="paneHint">Keys are encrypted by the daemon under ~/.ares and never enter this window's storage.</p>
-              <div className="keyRegistry">
-                <div className="keyGroupLabel">Sign in</div>
-                <div className="keyRegRow signInRow">
-                  <div className="keyRegName">
-                    <i className="provDot" data-provider="anthropic" />
-                    <strong>Claude (Pro / Max)</strong>
-                  </div>
-                  <button className="ghost signInBtn" onClick={onAnthropicSignIn}>
-                    ◆ Sign in with browser
-                  </button>
+              <p className="paneHint">Keys are encrypted by the daemon under ~/.ares and never touch this window's storage.</p>
+
+              <div className="keyGroupLabel">Sign in — no key needed</div>
+              <div className="keyCard signIn">
+                <ProviderLogo brand="anthropic" className="keyLogo" />
+                <div className="keyCardBody">
+                  <strong>Claude (Pro / Max)</strong>
+                  <em>Use your Claude subscription — nothing to paste.</em>
                 </div>
-                <p className="keyHint" style={{ margin: "0 0 6px" }}>Use your Claude subscription — no API key needed.</p>
-                <div className="keyGroupLabel">API keys</div>
-                {KEYED_PROVIDERS.map((kp) => (
-                  <div key={kp.id} className="keyRegRow">
-                    <div className="keyRegName">
-                      <i className="provDot" data-provider={kp.id} />
-                      <strong>{kp.label}</strong>
-                      <span className="keyState" data-on={keyStatus[kp.id] ? "1" : "0"}>
-                        {keyStatus[kp.id] ? "saved" : "not set"}
-                      </span>
+                <button className="keySignInBtn" onClick={onAnthropicSignIn}>Sign in with browser</button>
+              </div>
+              <div className="keyCard signIn" data-on={openaiAuth.connected ? "1" : "0"}>
+                <ProviderLogo brand="openai" className="keyLogo" />
+                <div className="keyCardBody">
+                  <div className="keyCardHead">
+                    <strong>ChatGPT (Plus / Pro / Max)</strong>
+                    {openaiAuth.connected ? <span className="keyPill" data-on="1">connected{openaiAuth.plan ? ` · ${openaiAuth.plan}` : ""}</span> : null}
+                  </div>
+                  <em>{openaiAuth.connected ? (openaiAuth.email ? `Signed in as ${openaiAuth.email} — GPT models use your subscription.` : "GPT models run on your ChatGPT subscription.") : "Run GPT models on your ChatGPT subscription — no API key."}</em>
+                </div>
+                <button className="keySignInBtn" disabled={openaiAuth.signingIn} onClick={onOpenaiSignIn}>
+                  {openaiAuth.signingIn ? "Waiting…" : openaiAuth.connected ? "Re-sign in" : "Sign in with browser"}
+                </button>
+              </div>
+              <div className="keyCard signIn" data-on={kimiAuth.connected ? "1" : "0"}>
+                <ProviderLogo brand="moonshot" className="keyLogo" />
+                <div className="keyCardBody">
+                  <div className="keyCardHead">
+                    <strong>Kimi (subscription)</strong>
+                    {kimiAuth.connected ? <span className="keyPill" data-on="1">connected{kimiAuth.detail ? ` · ${kimiAuth.detail}` : ""}</span> : null}
+                  </div>
+                  <em>{kimiAuth.connected ? "Kimi models run on your Kimi subscription." : "Run Kimi models on your Kimi subscription — no API key."}</em>
+                </div>
+                <button className="keySignInBtn" disabled={kimiAuth.signingIn} onClick={onKimiSignIn}>
+                  {kimiAuth.signingIn ? "Waiting…" : kimiAuth.connected ? "Re-sign in" : "Sign in with browser"}
+                </button>
+              </div>
+
+              <div className="keyGroupLabel">Provider keys</div>
+              {KEYED_PROVIDERS.map((kp) => {
+                const on = !!keyStatus[kp.id];
+                return (
+                  <div key={kp.id} className="keyCard" data-on={on ? "1" : "0"}>
+                    <ProviderLogo brand={kp.brand} className="keyLogo" />
+                    <div className="keyCardBody">
+                      <div className="keyCardHead">
+                        <strong>{kp.label}</strong>
+                        <span className="keyPill" data-on={on ? "1" : "0"}>{on ? "connected" : "not set"}</span>
+                      </div>
+                      <input className="keyInput" value={keys[kp.id] ?? ""} type="password" placeholder={on ? "•••••••• saved — paste to replace" : kp.placeholder} onChange={(e) => setKeys({ ...keys, [kp.id]: e.target.value })} />
+                      <em className="keySub">{kp.sub}</em>
                     </div>
-                    <input value={keys[kp.id] ?? ""} type="password" placeholder={kp.placeholder} onChange={(e) => setKeys({ ...keys, [kp.id]: e.target.value })} />
-                    {keyStatus[kp.id] ? (
-                      <button className="ghost keyClear" onClick={() => onDaemonCommand({ type: "provider_key", provider: kp.id, key: "" })}>
-                        Clear
-                      </button>
+                    {on ? (
+                      <button className="keyClearBtn" title="Remove this key" onClick={() => onDaemonCommand({ type: "provider_key", provider: kp.id, key: "" })}>✕</button>
                     ) : null}
                   </div>
-                ))}
-                <CustomProviderBlock onDaemonCommand={onDaemonCommand} native={native} />
-                <div className="keyGroupLabel">Tools</div>
-                <div className="keyRegRow">
-                  <div className="keyRegName">
-                    <i className="provDot" data-provider="brave" />
+                );
+              })}
+
+              <div className="keyGroupLabel">Search & tools</div>
+              <div className="keyCard" data-on={keyStatus.brave ? "1" : "0"}>
+                <ProviderLogo brand="generic" className="keyLogo" />
+                <div className="keyCardBody">
+                  <div className="keyCardHead">
                     <strong>Brave Search</strong>
-                    <span className="keyState" data-on={keyStatus.brave ? "1" : "0"}>
-                      {keyStatus.brave ? "saved" : "not set"}
-                    </span>
+                    <span className="keyPill" data-on={keyStatus.brave ? "1" : "0"}>{keyStatus.brave ? "connected" : "not set"}</span>
                   </div>
-                  <input value={keys.brave ?? ""} type="password" placeholder="BSA… — upgrades web + image search" onChange={(e) => setKeys({ ...keys, brave: e.target.value })} />
-                  {keyStatus.brave ? (
-                    <button className="ghost keyClear" onClick={() => onDaemonCommand({ type: "provider_key", provider: "brave", key: "" })}>
-                      Clear
-                    </button>
-                  ) : null}
+                  <input className="keyInput" value={keys.brave ?? ""} type="password" placeholder={keyStatus.brave ? "•••••••• saved — paste to replace" : "BSA…"} onChange={(e) => setKeys({ ...keys, brave: e.target.value })} />
+                  <em className="keySub">upgrades web + image search</em>
                 </div>
+                {keyStatus.brave ? (
+                  <button className="keyClearBtn" title="Remove this key" onClick={() => onDaemonCommand({ type: "provider_key", provider: "brave", key: "" })}>✕</button>
+                ) : null}
               </div>
-              <p className="keyHint">OpenAI uses ChatGPT OAuth. Local Ollama needs no key; the Ollama key enables direct ollama.com cloud discovery and inference.</p>
+
+              <div className="keyGroupLabel">Custom / OpenAI-compatible</div>
+              <CustomProviderBlock onDaemonCommand={onDaemonCommand} native={native} />
+
+              <p className="keyHint">OpenAI signs in with ChatGPT OAuth. Local Ollama needs no key — the Ollama Cloud key adds ollama.com discovery + inference.</p>
             </div>
           ) : null}
 
@@ -7010,11 +9010,16 @@ function Settings({
                 </button>
               </div>
               <EngineRow label="Auto-tick interval (min)" hint="Minutes between idle mission ticks." value={draft.engine.operatorTickMinutes ?? 30} onChange={(v) => setEngine({ operatorTickMinutes: v })} />
+              <div className="engineRow">
+                <div className="engineInfo">
+                  <strong>Desktop control of browser windows</strong>
+                  <span>Let Ares drive your real Chrome/Edge with the physical mouse. Off keeps web pages from ever steering your cursor; the sandboxed Browser tool still works either way.</span>
+                </div>
+                <button className="toggle" data-on={draft.engine.computerUseBrowser === true ? "1" : "0"} onClick={() => setEngine({ computerUseBrowser: !(draft.engine.computerUseBrowser === true) })}>
+                  <i />
+                </button>
+              </div>
             </div>
-          ) : null}
-
-          {tab === "services" ? (
-            <ServicesPane native={native} providers={oauthProviders} onDaemonCommand={onDaemonCommand} />
           ) : null}
 
           {tab === "consciousness" ? (
@@ -7097,6 +9102,360 @@ const SERVICE_PROVIDERS = [
   { id: "linkedin", label: "LinkedIn", desc: "Profile & connections" },
   { id: "dropbox", label: "Dropbox", desc: "Files & sharing" },
 ];
+
+interface HubSkillMeta { id: string; name: string; description: string; author?: string; provides?: string[]; downloads?: number }
+
+// SkillHub browser — search the doingteam registry and install skills. Gated on
+// `reachable` (from the daemon's probe) so it stays a quiet "coming soon" line
+// until the backend is live rather than dead-ending. Talks to the daemon via
+// commands + window-event responses (bridged in the app-level handler).
+function SkillHubBrowser({ onDaemonCommand }: { onDaemonCommand: (cmd: Record<string, unknown>) => void }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<HubSkillMeta[]>([]);
+  const [reachable, setReachable] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [note, setNote] = useState<string>("");
+
+  useEffect(() => {
+    const onList = (e: Event) => {
+      const d = (e as CustomEvent).detail as { reachable?: boolean; skills?: HubSkillMeta[] };
+      setReachable(d.reachable ?? false);
+      setResults(Array.isArray(d.skills) ? d.skills : []);
+      setBusy(false);
+    };
+    const onInstalled = (e: Event) => {
+      const d = (e as CustomEvent).detail as { ok?: boolean; name?: string; error?: string };
+      setInstalling(null);
+      setNote(d.ok ? `Installed ${d.name} — enable it above.` : `Install failed: ${d.error ?? "unknown"}`);
+      window.setTimeout(() => setNote(""), 4000);
+    };
+    window.addEventListener("ares:skillhub_list", onList);
+    window.addEventListener("ares:skillhub_installed", onInstalled);
+    return () => { window.removeEventListener("ares:skillhub_list", onList); window.removeEventListener("ares:skillhub_installed", onInstalled); };
+  }, []);
+
+  // Probe once on mount.
+  useEffect(() => { setBusy(true); onDaemonCommand({ type: "skillhub_list", text: "" }); }, [onDaemonCommand]);
+
+  const search = () => { setBusy(true); onDaemonCommand({ type: "skillhub_list", text: query }); };
+  const install = (id: string) => { setInstalling(id); onDaemonCommand({ type: "skillhub_install", id }); };
+
+  if (reachable === false) {
+    return <p className="paneHint">🌐 SkillHub — the shared skill registry on doingteam. Not live yet; when it is, you'll browse and one-click install community skills right here.</p>;
+  }
+  return (
+    <div className="skillHub">
+      <div className="skillHubHead">
+        <strong>🌐 SkillHub</strong>
+        <span className="paneHint">Browse & install skills the community published.</span>
+      </div>
+      <div className="skillHubSearch">
+        <input className="txt" placeholder="Search skills — e.g. spotify, weather, video…" value={query}
+          onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") search(); }} />
+        <button className="btn" onClick={search} disabled={busy}>{busy ? "…" : "Search"}</button>
+      </div>
+      {note ? <div className="skillHubNote">{note}</div> : null}
+      {results.length === 0 ? (
+        <div className="paneEmpty">{busy ? "Searching the hub…" : "No skills found. Try another search."}</div>
+      ) : (
+        <div className="skillHubGrid">
+          {results.map((s) => (
+            <div key={s.id} className="skillHubCard">
+              <div className="skillHubCardHead">
+                <strong>{s.name}</strong>
+                {(s.provides ?? []).map((p) => <span key={p} className="skillHubTag">{p}</span>)}
+              </div>
+              <p>{s.description}</p>
+              <div className="skillHubCardFoot">
+                <span>{s.author ? `by ${s.author}` : ""}{typeof s.downloads === "number" ? ` · ${s.downloads}↓` : ""}</span>
+                <button className="btn tiny" onClick={() => install(s.id)} disabled={installing === s.id}>
+                  {installing === s.id ? "Installing…" : "Install"}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The active-skills dock — a floating, animated tray. Core voice controls (a
+// living orb reflecting idle/listening/speaking, quick on/off, conversation
+// mode) sit alongside buttons that enabled skills contribute via their
+// `surfaces` manifest. A surface can only invoke its own skill.
+function SkillDock({
+  voiceEnabled,
+  onToggleVoice,
+  speaking,
+  listening,
+  convoMode,
+  onToggleConvo,
+  wakeWord,
+  wakeStatus,
+  onToggleWake,
+  onStopVoice,
+  providerLabel,
+  skills,
+  onSurface,
+  toast,
+  voiceEngine,
+  onRepairVoice,
+}: {
+  voiceEnabled: boolean;
+  onToggleVoice: (on: boolean) => void;
+  speaking: boolean;
+  listening: boolean;
+  convoMode: boolean;
+  onToggleConvo: (on: boolean) => void;
+  wakeWord: boolean;
+  wakeStatus: "off" | "arming" | "armed" | "offline";
+  onToggleWake: (on: boolean) => void;
+  onStopVoice: () => void;
+  providerLabel: string;
+  skills: SkillInfo[];
+  onSurface: (skill: SkillInfo, surface: SkillSurface) => void;
+  toast: { name: string; text: string; ok: boolean } | null;
+  voiceEngine: { phase: string; detail: string };
+  onRepairVoice: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const withSurfaces = skills.filter((s) => s.enabled && (s.surfaces?.length ?? 0) > 0);
+  const orbState = speaking ? "speaking" : listening ? "listening" : voiceEnabled ? "ready" : "off";
+  const surfaceCount = withSurfaces.reduce((n, s) => n + (s.surfaces?.length ?? 0), 0);
+  const wakeSuffix = !wakeWord
+    ? ""
+    : voiceEngine.phase === "error" || voiceEngine.phase === "missing"
+      ? " · offline"
+      : voiceEngine.phase !== "running"
+        ? " · warming up…"
+        : wakeStatus === "armed"
+          ? " · listening"
+          : wakeStatus === "arming"
+            ? " · connecting…"
+            : "";
+
+  return (
+    <div className="skillDock" data-open={open ? "1" : "0"}>
+      {toast ? <div className="skillDockToast" data-ok={toast.ok ? "1" : "0"}>{toast.text}</div> : null}
+      {open ? (
+        <div className="skillDockPanel">
+          <div className="skillDockHead">
+            <strong>Voice</strong>
+            <span className="skillDockProvider">{providerLabel}</span>
+          </div>
+          <div className="skillDockRow">
+            <button className="skillDockBtn" data-on={voiceEnabled ? "1" : "0"} onClick={() => onToggleVoice(!voiceEnabled)}>
+              {voiceEnabled ? "🔊 Speaking on" : "🔇 Speak replies"}
+            </button>
+            <button className="skillDockBtn" data-on={convoMode ? "1" : "0"} disabled={!voiceEnabled} onClick={() => onToggleConvo(!convoMode)}>
+              💬 Conversation
+            </button>
+            <button className="skillDockBtn" data-on={wakeWord ? "1" : "0"} onClick={() => onToggleWake(!wakeWord)} title="Say “Hey Ares”, then just talk — it sends when you stop.">
+              👂 Hey Ares{wakeSuffix}
+            </button>
+            {speaking ? <button className="skillDockBtn stop" onClick={onStopVoice}>⏹ Stop</button> : null}
+          </div>
+          {(wakeWord && wakeStatus === "offline") || voiceEngine.phase === "setup" || voiceEngine.phase === "starting" || voiceEngine.phase === "error" || voiceEngine.phase === "missing" ? (
+            voiceEngine.phase === "setup" || voiceEngine.phase === "starting" ? (
+              <p className="skillDockHint">
+                <span className="skillDockSpin" aria-hidden="true" /> {voiceEngine.detail || "Setting up the local voice engine…"}
+              </p>
+            ) : voiceEngine.phase === "error" ? (
+              <p className="skillDockHint warn">
+                {voiceEngine.detail || "The local voice engine hit a problem."}{" "}
+                <button className="skillDockRepair" onClick={onRepairVoice}>Repair</button>
+              </p>
+            ) : voiceEngine.phase === "missing" ? (
+              <p className="skillDockHint warn">{voiceEngine.detail || "The voice service files aren't in this install."}</p>
+            ) : (
+              <p className="skillDockHint warn">
+                Connecting to the local voice engine — “Hey Ares” will arm itself the moment it's up.{" "}
+                <button className="skillDockRepair" onClick={onRepairVoice}>Repair</button>
+              </p>
+            )
+          ) : null}
+          {withSurfaces.length > 0 ? (
+            <>
+              <div className="skillDockHead"><strong>Skills</strong><span className="skillDockProvider">{surfaceCount} action{surfaceCount === 1 ? "" : "s"}</span></div>
+              <div className="skillDockSurfaces">
+                {withSurfaces.map((s) => (s.surfaces ?? []).map((surf) => (
+                  <button key={`${s.name}:${surf.id}`} className="skillDockSurface" title={surf.hint ?? s.description} onClick={() => onSurface(s, surf)}>
+                    <span className="skillDockIcon" aria-hidden="true">{surf.icon ?? "✦"}</span>
+                    <span>{surf.label}</span>
+                  </button>
+                )))}
+              </div>
+            </>
+          ) : (
+            <p className="skillDockHint">Enabled skills that declare buttons appear here.</p>
+          )}
+        </div>
+      ) : null}
+      <button className="skillDockOrb" data-state={orbState} onClick={() => setOpen((v) => !v)} title="Voice & skills" aria-label="Voice and skills">
+        <span className="skillDockOrbCore" />
+        {(speaking || listening) ? <span className="skillDockOrbPulse" /> : null}
+      </button>
+    </div>
+  );
+}
+
+// Live health of the local voice engine + one honest Repair button. Repair
+// wipes and rebuilds the Python venv (the fix for a setup that half-installed
+// on an incompatible Python and crash-looped).
+function VoiceEngineStatus({ voiceEngine, onRepair }: { voiceEngine: { phase: string; detail: string }; onRepair: () => void }) {
+  const phase = voiceEngine.phase;
+  const tone = phase === "running" ? "ok" : phase === "setup" || phase === "starting" ? "busy" : phase === "error" || phase === "missing" ? "warn" : "idle";
+  const label =
+    phase === "running" ? "Voice engine running"
+    : phase === "starting" ? "Starting the voice engine…"
+    : phase === "setup" ? (voiceEngine.detail || "Setting up the voice engine…")
+    : phase === "error" ? (voiceEngine.detail || "The voice engine hit a problem.")
+    : phase === "missing" ? (voiceEngine.detail || "The voice service isn't installed.")
+    : "Voice engine idle";
+  const busy = phase === "setup" || phase === "starting";
+  return (
+    <div className="voiceEngineStatus" data-tone={tone}>
+      <span className="voiceEngineDot" data-tone={tone}>{busy ? <i className="skillDockSpin" /> : null}</span>
+      <span className="voiceEngineLabel">{label}</span>
+      {phase !== "running" && phase !== "missing" ? (
+        <button className="voiceEngineRepair" disabled={busy} onClick={onRepair}>{busy ? "Working…" : "Repair"}</button>
+      ) : null}
+    </div>
+  );
+}
+
+// The Voice Hub — enable spoken replies, pick a voice from the local sidecar's
+// catalog (or a TTS-provider skill once registered), and set the rate. Applies
+// live via onLivePref so the toggle takes effect without a session restart.
+function VoiceSettings({
+  draft,
+  setDraftPrefs,
+  onLivePref,
+  providerSkill,
+  onPreviewVoice,
+  listProviderVoices,
+}: {
+  draft: Prefs;
+  setDraftPrefs: (p: Prefs) => void;
+  onLivePref: (patch: Partial<Prefs>) => void;
+  providerSkill?: SkillInfo;
+  onPreviewVoice?: (voiceId: string) => void;
+  listProviderVoices?: () => Promise<VoiceInfo[]>;
+}) {
+  const [voices, setVoices] = useState<VoiceInfo[]>([]);
+  const [defaultVoice, setDefaultVoice] = useState("");
+  const [status, setStatus] = useState<"loading" | "ready" | "offline">("loading");
+
+  useEffect(() => {
+    const ac = new AbortController();
+    // When a provider skill is the active voice engine, its catalog IS the
+    // picker — you choose among the voices that will actually speak. The
+    // sidecar catalog is the fallback.
+    if (listProviderVoices) {
+      let cancelled = false;
+      void listProviderVoices().then((provided) => {
+        if (cancelled) return;
+        if (provided.length > 0) {
+          setVoices(provided);
+          setDefaultVoice(provided[0]?.id ?? "");
+          setStatus("ready");
+        } else {
+          fetchVoices(ac.signal).then(({ voices, default: def }) => {
+            setVoices(voices);
+            setDefaultVoice(def);
+            setStatus(voices.length ? "ready" : "offline");
+          });
+        }
+      });
+      return () => { cancelled = true; ac.abort(); };
+    }
+    fetchVoices(ac.signal).then(({ voices, default: def }) => {
+      setVoices(voices);
+      setDefaultVoice(def);
+      setStatus(voices.length ? "ready" : "offline");
+    });
+    return () => ac.abort();
+  }, [listProviderVoices]);
+
+  const setEnabled = (on: boolean) => {
+    // On first enable with no chosen voice, adopt the sidecar default so it
+    // speaks immediately instead of silently doing nothing.
+    const voiceId = draft.voiceId || defaultVoice || voices[0]?.id || "";
+    const patch: Partial<Prefs> = { voiceEnabled: on, voiceId };
+    setDraftPrefs({ ...draft, ...patch });
+    onLivePref(patch);
+  };
+  const pickVoice = (id: string) => { setDraftPrefs({ ...draft, voiceId: id }); onLivePref({ voiceId: id }); };
+  const setSpeed = (n: number) => { setDraftPrefs({ ...draft, voiceSpeed: n }); onLivePref({ voiceSpeed: n }); };
+
+  return (
+    <div className="voiceHub">
+      <label className="fieldLabel">Voice — speak replies aloud</label>
+      <div className="displayModes">
+        <button data-on={draft.voiceEnabled ? "1" : "0"} onClick={() => setEnabled(true)}>
+          <strong>On</strong>
+          <span>Ares reads its replies aloud (emoji, markdown &amp; code stripped).</span>
+        </button>
+        <button data-on={!draft.voiceEnabled ? "1" : "0"} onClick={() => setEnabled(false)}>
+          <strong>Off</strong>
+          <span>Text only.</span>
+        </button>
+      </div>
+      <p className="paneHint">
+        {status === "loading" ? "Checking the local voice engine…"
+          : status === "offline" && providerSkill ? `Using ${providerSkill.name} for speech. Built-in local voice is offline, but replies still speak through the skill.`
+          : status === "offline" ? "Local voice engine offline. A TTS-provider skill can also supply voices."
+          : `${voices.length} voice${voices.length === 1 ? "" : "s"} · local (Kokoro), private & offline`}
+      </p>
+      {status === "ready" ? (
+        <>
+          <label className="fieldLabel">Voice{providerSkill ? ` — via ${providerSkill.name}` : ""}</label>
+          <div className="voiceGrid">
+            {voices.map((v) => (
+              <div key={v.id} className="voiceCard" data-on={(draft.voiceId || defaultVoice) === v.id ? "1" : "0"} title={v.character}>
+                <button className="voiceCardPick" onClick={() => pickVoice(v.id)}>
+                  <strong>{v.label}</strong>
+                  <em>{[v.accent, v.gender].filter(Boolean).join(" · ")}{v.id === defaultVoice ? " · recommended" : ""}</em>
+                </button>
+                {onPreviewVoice ? (
+                  <button className="voicePreview" title={`Hear ${v.label}`} aria-label={`Preview ${v.label}`} onClick={() => onPreviewVoice(v.id)}>
+                    ▶
+                  </button>
+                ) : null}
+              </div>
+            ))}
+          </div>
+          <label className="fieldLabel">Speed — {(draft.voiceSpeed ?? 1).toFixed(2)}×</label>
+          <input
+            className="voiceSpeed"
+            type="range" min={0.5} max={2} step={0.05}
+            value={draft.voiceSpeed ?? 1}
+            onChange={(e) => setSpeed(Number(e.target.value))}
+          />
+        </>
+      ) : null}
+      <label className="fieldLabel">Hands-free</label>
+      <div className="displayModes">
+        <button
+          data-on={draft.wakeWord ? "1" : "0"}
+          onClick={() => { const on = !draft.wakeWord; setDraftPrefs({ ...draft, wakeWord: on }); onLivePref({ wakeWord: on }); }}
+        >
+          <strong>“Hey Ares” wake word</strong>
+          <span>Say it, then speak — Ares listens, and sends the moment you stop talking. Local &amp; private.</span>
+        </button>
+        <button
+          data-on={draft.voiceNotify !== false ? "1" : "0"}
+          onClick={() => { const on = draft.voiceNotify === false; setDraftPrefs({ ...draft, voiceNotify: on }); onLivePref({ voiceNotify: on }); }}
+        >
+          <strong>Spoken heads-up</strong>
+          <span>When a background task finishes while you're away, Ares says so out loud.</span>
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function ServicesPane({
   native,
@@ -7451,8 +9810,23 @@ function UsagePane({ usage, onDaemonCommand, native }: { usage: UsageStats | nul
             <div className="usageCard"><span>Tokens in</span><strong>{fmtTokens(usage.tokensIn)}</strong></div>
             <div className="usageCard"><span>Tokens out</span><strong>{fmtTokens(usage.tokensOut)}</strong></div>
             <div className="usageCard"><span>Cache reads</span><strong>{fmtTokens(usage.cacheReadTokens)}</strong></div>
-            <div className="usageCard"><span>Agent overhead</span><strong>{fmtTokens(usage.auxiliaryTokensIn + usage.auxiliaryTokensOut)}</strong></div>
+            <div className="usageCard"><span>Est. spend</span><strong>{fmtSpend(usage)}</strong></div>
           </div>
+          {(usage.providers ?? []).length > 0 ? (
+            <>
+              <label className="fieldLabel">By provider</label>
+              <div className="usageTable">
+                {(usage.providers ?? []).map((p) => (
+                  <div key={p.provider} className="usageRow">
+                    <span className="usageModel">{p.provider}</span>
+                    <span className="usageCalls">{p.calls} calls</span>
+                    <span className="usageTok">↑{fmtTokens(p.tokensIn)} ↓{fmtTokens(p.tokensOut)}</span>
+                    <span className="usageCost">{p.costUsd !== undefined ? `≈$${p.costUsd.toFixed(2)}` : "—"}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : null}
           {usage.daily.length > 0 ? (
             <>
               <label className="fieldLabel">Daily tokens</label>
@@ -7470,10 +9844,11 @@ function UsagePane({ usage, onDaemonCommand, native }: { usage: UsageStats | nul
               <label className="fieldLabel">Top models</label>
               <div className="usageTable">
                 {usage.models.slice(0, 8).map((m) => (
-                  <div key={m.model} className="usageRow">
-                    <span className="usageModel">{m.model}</span>
+                  <div key={`${m.provider ?? ""}/${m.model}`} className="usageRow">
+                    <span className="usageModel">{m.model}{m.provider ? <em className="usageProv"> {m.provider}</em> : null}</span>
                     <span className="usageCalls">{m.calls} calls</span>
                     <span className="usageTok">↑{fmtTokens(m.tokensIn)} ↓{fmtTokens(m.tokensOut)}</span>
+                    <span className="usageCost">{m.costUsd !== undefined ? `≈$${m.costUsd.toFixed(2)}` : "—"}</span>
                   </div>
                 ))}
               </div>
@@ -7520,6 +9895,47 @@ class AresErrorBoundary extends React.Component<{ children: React.ReactNode }, {
   }
 }
 
+function PresenceOverlay() {
+  const [presence, setPresence] = useState<PresenceSnapshot>({ visible: false, mode: "idle", caption: "", detail: "" });
+
+  useEffect(() => {
+    document.body.dataset.presence = "1";
+    let disposed = false;
+    void invoke<PresenceSnapshot>("ares_presence_status")
+      .then((snapshot) => { if (!disposed && snapshot) setPresence(snapshot); })
+      .catch(() => null);
+    let unlisten: (() => void) | null = null;
+    void listen<PresenceSnapshot>("ares:presence-state", (event) => {
+      if (!disposed && event.payload) setPresence(event.payload);
+    }).then((un) => { if (disposed) un(); else unlisten = un; });
+    return () => {
+      disposed = true;
+      unlisten?.();
+      delete document.body.dataset.presence;
+    };
+  }, []);
+
+  const stateLabel = presence.mode === "listening"
+    ? "HEARING"
+    : presence.mode === "speaking"
+      ? "ARES"
+      : presence.mode === "working"
+        ? "WORKING"
+        : "HEARD";
+  return (
+    <div className="presenceSurface" data-mode={presence.mode} data-visible={presence.visible ? "1" : "0"}>
+      <div className="presenceEdge" aria-hidden="true" />
+      {presence.caption ? (
+        <div className="desktopCaption" aria-live="off">
+          <span className="desktopCaptionState"><i aria-hidden="true" />{stateLabel}</span>
+          <span className="desktopCaptionText">{presence.caption}</span>
+          {presence.detail ? <span className="desktopCaptionDetail">{presence.detail}</span> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 // Catch top-level runtime errors and promise rejections so a single bad event
 // or effect doesn't hard-crash the WebView renderer.
 window.addEventListener("error", (e) => {
@@ -7533,12 +9949,20 @@ window.addEventListener("unhandledrejection", (e) => {
 
 const rootEl = document.getElementById("root");
 if (rootEl) {
+  const query = new URLSearchParams(window.location.search);
+  const isPresenceSurface = query.get("presence") === "1";
+  const livingHash = window.location.hash.match(/^#living\/([a-z0-9_-]+)$/i);
+  const isLivingSurface = query.get("living") === "1" || Boolean(livingHash);
+  const livingSessionId = livingHash?.[1] || query.get("session") || `sess_living_${Date.now()}`;
+  if (isPresenceSurface) document.body.dataset.presence = "1";
   // Vite HMR re-evaluates this module — reuse the root across hot reloads.
   const holder = window as unknown as { __aresRoot?: ReturnType<typeof createRoot> };
   holder.__aresRoot ??= createRoot(rootEl);
   holder.__aresRoot.render(
-    <AresErrorBoundary>
-      <App />
-    </AresErrorBoundary>,
+    isPresenceSurface
+      ? <PresenceOverlay />
+      : isLivingSurface
+        ? <AresErrorBoundary><LivingSurface sessionId={livingSessionId} /></AresErrorBoundary>
+        : <AresErrorBoundary><App /></AresErrorBoundary>,
   );
 }

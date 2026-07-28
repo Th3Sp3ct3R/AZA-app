@@ -50,6 +50,24 @@ test("runtime: input is passed through to the handler", async () => {
   assert.deepEqual(r.result, { hello: "world", n: 42 });
 });
 
+test("runtime: every skill receives an OS-leased loopback port contract", async () => {
+  const home = await makeHome();
+  await writeSkill(home, "port-aware", `import { createServer } from "node:net";
+export default async (_input, ctx) => {
+  const server = createServer();
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(ctx.port, ctx.host, resolve); });
+  await new Promise((resolve) => server.close(resolve));
+  return { host: ctx.host, port: ctx.port, envPort: Number(process.env.ARES_SKILL_PORT), genericPort: Number(process.env.PORT), bound: true };
+};`);
+  const r = await runSkill({ home, name: "port-aware" });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.result.host, "127.0.0.1");
+  assert.ok(Number.isInteger(r.result.port) && r.result.port > 0);
+  assert.equal(r.result.envPort, r.result.port);
+  assert.equal(r.result.genericPort, r.result.port);
+  assert.equal(r.result.bound, true);
+});
+
 test("runtime: a throwing handler is captured as ok:false, not a crash", async () => {
   const home = await makeHome();
   await writeSkill(home, "boom", "export default async () => { throw new Error('kaboom'); };");

@@ -2,17 +2,20 @@
 
 import { createWorkspaceCheckpoint, restoreWorkspaceCheckpoint, loadStartupReminders, buildPromptCacheKey, routeModel, DEFAULT_PROVIDER_PROFILES, type ModelTask, type ModelTaskKind, type ModelRouteDecision, type RiskLevel, type PrivacyPosture, type QualityNeed, type CostPreference, type LatencyPreference, type ModelTouch } from "@ares/core";
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { ReadTool, GlobTool, GrepTool, EditTool, WriteTool, ApplyIntentTool, MemoryTool, TodoStore, ShellRegistry, type RichToolContext, type FileReadStamp } from "@ares/tools";
 import { notice } from "../terminalUi.js";
 import { completeBootstrap, createMemoryStore, recordCardMemoryOnce, ensureAgentScaffold, exportHome, importHome, listSnapshots, loadAgentConfig, restoreSnapshot, runDeepDream, runRemDream, snapshotBrain } from "@ares/agent";
-import { distillMissionCard, learningCardId, learningCardMemoryText, listLearningCards, loadLearningCard, saveLearningCard, type LearningCard, loadGoal, loadMissionContract, runEvalSuite, runGauntlet, type EvalReport, type EvalTask } from "@ares/operator";
+import { distillMissionCard, learningCardId, learningCardMemoryText, listLearningCards, loadLearningCard, saveLearningCard, type LearningCard, loadGoal, loadMissionContract, runEvalSuite, runGauntlet, CODING_GAUNTLET, CODING_GAUNTLET_V2, type EvalReport, type EvalTask } from "@ares/operator";
 import { MemoryStore, withConsolidationLock } from "@ares/mind";
-import { buildEngineTools } from "./engineTools.js";
+import { buildCodingTools } from "./engineTools.js";
 import { AresCommandPermissionStore, AresPathPermissionStore } from "./permissions.js";
 import { selectProvider } from "./providers.js";
-import { AresRuntimeState, ParsedArgs, cliRuntimeContext, compactLine } from "./runtime.js";
+import { AresRuntimeState, ParsedArgs, cliRuntimeContext, cliVersion, compactLine } from "./runtime.js";
+import { buildSystemPrompt } from "./turnPipeline.js";
 
 export async function agentCommand(args: ParsedArgs): Promise<number> {
   const subcommand = args.positionals[0] ?? "doctor";
@@ -139,24 +142,117 @@ export async function agentCommand(args: ParsedArgs): Promise<number> {
  * ~/.ares/gauntlet/, and print the scoreboard. The number every C-phase
  * change must move.
  */
+function gitOutput(cwd: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd, windowsHide: true, maxBuffer: 20 * 1024 * 1024 }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout.trimEnd());
+    });
+  });
+}
+
+async function codingHarnessSourceIdentity(cwd: string): Promise<Record<string, unknown>> {
+  try {
+    const [revision, status, diff] = await Promise.all([
+      gitOutput(cwd, ["rev-parse", "HEAD"]),
+      gitOutput(cwd, ["status", "--porcelain=v1"]),
+      gitOutput(cwd, ["diff", "--binary", "HEAD", "--"]),
+    ]);
+    const untracked = status.split(/\r?\n/).filter((line) => line.startsWith("?? ")).map((line) => line.slice(3));
+    const untrackedDigest = createHash("sha256");
+    for (const relative of untracked.sort()) {
+      const content = await readFile(path.resolve(cwd, relative)).catch(() => null);
+      untrackedDigest.update(relative).update("\0");
+      if (content) untrackedDigest.update(content);
+      untrackedDigest.update("\0");
+    }
+    return {
+      sourceRevision: revision,
+      sourceDirty: status.length > 0,
+      sourceFingerprint: createHash("sha256")
+        .update(diff)
+        .update("\0")
+        .update(status)
+        .update("\0")
+        .update(untrackedDigest.digest("hex"))
+        .digest("hex"),
+    };
+  } catch {
+    return { sourceRevision: "unavailable", sourceDirty: null, sourceFingerprint: "unavailable" };
+  }
+}
+
 async function gauntletCommand(args: ParsedArgs): Promise<number> {
   const selection = await selectProvider(args.flags);
   const context = cliRuntimeContext({ home: args.flags.get("home") ?? process.env.ARES_HOME });
-  const pathPermissions = await AresPathPermissionStore.load(context);
-  const commandPermissions = await AresCommandPermissionStore.load(context);
-  const runtime: AresRuntimeState = { permissionMode: "bypass" };
+  const runtime: AresRuntimeState = { permissionMode: "workspace-write" };
+  const isolatedHomes: string[] = [];
+  const evalShellRegistries: ShellRegistry[] = [];
+  const suite = args.flags.get("suite") ?? "coding-v2";
+  if (suite !== "coding-v1" && suite !== "coding-v2") {
+    process.stderr.write("error: --suite must be coding-v1 or coding-v2\n");
+    return 2;
+  }
+  const isMockProvider = selection.provider.name === "mock" || selection.provider.name.startsWith("mock-");
+  // Host-process execution is the DEFAULT on this box (owner's call — it's a
+  // personal machine). --require-isolated-eval (or ARES_REQUIRE_ISOLATED_EVAL=1)
+  // restores the hard VM/container gate for cautious runs.
+  const requireIsolation = args.flags.has("require-isolated-eval") || process.env.ARES_REQUIRE_ISOLATED_EVAL === "1";
+  const allowUnsafeProcessEval = !requireIsolation ||
+    args.flags.has("allow-unsafe-process-eval") || process.env.ARES_ALLOW_UNSAFE_PROCESS_EVAL === "1";
+  if (!isMockProvider && !allowUnsafeProcessEval) {
+    process.stderr.write(
+      "error: isolation required: real-model coding eval executes candidate code in host processes. " +
+      "Run inside a disposable VM/container, then pass --allow-unsafe-process-eval (or ARES_ALLOW_UNSAFE_PROCESS_EVAL=1).\n",
+    );
+    return 2;
+  }
+  if (!isMockProvider && !requireIsolation) {
+    process.stderr.write("note: eval executes candidate code in host processes (no OS sandbox). --require-isolated-eval restores the gate.\n");
+  }
+  const sourceIdentity = await codingHarnessSourceIdentity(process.cwd());
 
   const report = await runGauntlet({
     provider: selection.provider,
     model: selection.model,
     keepWorkspaces: args.flags.has("keep"),
-    tools: async () => {
+    suite,
+    tasks: suite === "coding-v2" ? CODING_GAUNTLET_V2 : CODING_GAUNTLET,
+    harness: args.flags.get("harness") !== "false" && !args.flags.has("no-harness"),
+    harnessManifest: {
+      ...sourceIdentity,
+      aresVersion: await cliVersion(),
+      providerSource: selection.source,
+      subModel: selection.subModel ?? null,
+      reasoning: "provider/default",
+      permissionMode: runtime.permissionMode,
+    },
+    systemPrompt: (workspace) => buildSystemPrompt("workspace-write", cliRuntimeContext({ workspace, home: context.home })),
+    tools: async (workspace) => {
       // Fresh harness per workspace — gauntlet runs must not share shell or
       // todo state across tasks.
+      const isolatedHome = await mkdtemp(path.join(os.tmpdir(), "ares-coding-eval-home-"));
+      isolatedHomes.push(isolatedHome);
+      const isolatedContext = cliRuntimeContext({ workspace, home: isolatedHome });
+      const [pathPermissions, commandPermissions] = await Promise.all([
+        AresPathPermissionStore.load(isolatedContext),
+        AresCommandPermissionStore.load(isolatedContext),
+      ]);
       const shellRegistry = new ShellRegistry();
+      evalShellRegistries.push(shellRegistry);
       const todoStore = new TodoStore();
-      return buildEngineTools(pathPermissions, commandPermissions, selection, runtime, context, shellRegistry, todoStore);
+      const tools = await buildCodingTools(pathPermissions, commandPermissions, selection, runtime, isolatedContext, shellRegistry, todoStore, new Map(), { shell: !isMockProvider && allowUnsafeProcessEval });
+      return {
+        tools,
+        dispose: async () => {
+          await shellRegistry.killAll().catch(() => 0);
+          await rm(isolatedHome, { recursive: true, force: true }).catch(() => undefined);
+        },
+      };
     },
+  }).finally(async () => {
+    await Promise.all(evalShellRegistries.map((registry) => registry.killAll().catch(() => 0)));
+    await Promise.all(isolatedHomes.map((home) => rm(home, { recursive: true, force: true }).catch(() => undefined)));
   });
 
   // Persist: one report per run, plus an append-only scoreboard for trends.
@@ -165,15 +261,17 @@ async function gauntletCommand(args: ParsedArgs): Promise<number> {
   const stamp = report.startedAt.replace(/[:.]/g, "-");
   const reportFile = path.join(dir, `${stamp}-${report.model.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`);
   await writeFile(reportFile, JSON.stringify(report, null, 2) + "\n", "utf8");
-  await appendFile(
-    path.join(dir, "scoreboard.jsonl"),
-    JSON.stringify({ at: report.startedAt, provider: report.provider, model: report.model, total: report.total, tasks: report.tasks.map((t) => ({ id: t.id, score: t.score })) }) + "\n",
-    "utf8",
-  );
+  if (report.complete) {
+    await appendFile(
+      path.join(dir, "scoreboard.jsonl"),
+      JSON.stringify({ at: report.startedAt, schemaVersion: report.schemaVersion, suite: report.suite, harness: report.harness, official: report.official, isolation: report.isolation, complete: report.complete, taskManifestHash: report.taskManifestHash, systemPromptHash: report.systemPromptHash, startupReminderHash: report.startupReminderHash, toolSchemaHash: report.toolSchemaHash, toolNames: report.toolNames, environment: report.environment, harnessManifest: report.harnessManifest, provider: report.provider, model: report.model, total: report.total, usage: report.usage, metrics: report.metrics, tasks: report.tasks.map((t) => ({ id: t.id, score: t.score, workStatus: t.workStatus, usage: t.usage })) }) + "\n",
+      "utf8",
+    );
+  }
 
   if (args.flags.has("json")) {
     process.stdout.write(JSON.stringify(report, null, 2) + "\n");
-    return report.total >= 1 ? 0 : 1;
+    return report.complete && report.total >= 1 ? 0 : 1;
   }
   const pct = (x: number) => `${Math.round(x * 100)}%`;
   const lines = report.tasks.map((t) => {
@@ -181,9 +279,11 @@ async function gauntletCommand(args: ParsedArgs): Promise<number> {
     return `${t.score === 1 ? "ok  " : t.score > 0 ? "part" : "FAIL"} ${pct(t.score).padStart(4)} [${bar}] ${t.title}${t.error ? ` — ${compactLine(t.error, 80)}` : ""}`;
   });
   lines.push("", `TOTAL ${pct(report.total)} — ${report.model} via ${report.provider} (${Math.round(report.durationMs / 1000)}s)`);
+  lines.push(`integrity ${pct(report.metrics.integrityRate)} · verified ${pct(report.metrics.verifiedTaskRate)} · false-green ${pct(report.metrics.falseGreenRate)} · verified-mismatch ${pct(report.metrics.verifiedMismatchRate)}`);
+  if (!report.complete) lines.push("INCOMPLETE — excluded from trend history");
   lines.push(`report: ${reportFile}`);
-  process.stdout.write(notice("Gauntlet · coding-v1", lines, report.total >= 0.75 ? "success" : "warn"));
-  return report.total >= 0.5 ? 0 : 1;
+  process.stdout.write(notice(`Gauntlet · ${report.suite}`, lines, report.total >= 0.75 ? "success" : "warn"));
+  return report.complete && report.total >= 1 ? 0 : 1;
 }
 
 export async function evalCommand(args: ParsedArgs): Promise<number> {

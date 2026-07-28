@@ -61,12 +61,18 @@ export class FrictionRecorder {
   private readonly nameById = new Map<string, string>();
   private writeChain: Promise<void> = Promise.resolve();
   private readonly enabled: boolean;
+  private readonly dir: string;
 
   constructor(
     private readonly sessionId: string,
-    private readonly dir = telemetryDir(),
+    dir?: string,
   ) {
-    this.enabled = process.env.ARES_TELEMETRY !== "0";
+    this.dir = dir ?? telemetryDir();
+    // `node --test` constructs many real Sessions. Those used to append their
+    // fake tool failures into the owner's ~/.ares telemetry (190/190 Browser
+    // failures in the live dashboard). Explicit test directories still record,
+    // so FrictionRecorder itself remains fully testable.
+    this.enabled = process.env.ARES_TELEMETRY !== "0" && (dir !== undefined || !process.env.NODE_TEST_CONTEXT);
     this.turn = emptyTurn(sessionId);
   }
 

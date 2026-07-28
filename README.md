@@ -88,16 +88,27 @@ set ARES_BROWSER_CDP_URL=http://127.0.0.1:9222   # Windows (PowerShell: $env:ARE
 export ARES_BROWSER_CDP_URL=http://127.0.0.1:9222 # macOS/Linux
 ```
 
-Launch-strategy order: configured CDP endpoint → opt-in localhost discovery →
+Launch-strategy order: configured CDP endpoint → localhost discovery →
 detected Edge/Chrome exe (persistent `~/.ares` profile) → msedge channel →
 chrome channel → bundled Chromium.
 
 - `ARES_BROWSER_CDP_URL` — explicit endpoint, tried first. If it's unreachable,
   Ares falls back to launching its own browser.
-- `ARES_BROWSER_CDP_DISCOVERY=1` — **opt-in** auto-discovery of a local debugging
-  browser (`127.0.0.1:9222` by default; override with `ARES_BROWSER_CDP_PORTS=9222,9223`).
-  Off by default on purpose: Ares never attaches to a random open browser unless
-  you ask it to.
+- Local CDP discovery is on by default for `127.0.0.1:9222`; set
+  `ARES_BROWSER_CDP_DISCOVERY=0` to disable it, or override probe ports with
+  `ARES_BROWSER_CDP_PORTS=9222,9223`.
+
+Use Browser `handshake` when attachment—not fallback—is required. It probes the
+explicit/discovered CDP endpoint and fails if it cannot attach; it never quietly
+launches a different profile. Chrome 136+ intentionally ignores remote-debugging
+flags against the default Chrome profile, so use Ares's separate persistent
+browser profile. Controlling arbitrary tabs in a normally launched default
+profile requires an explicitly installed extension bridge; Ares does not bypass
+that browser security boundary.
+
+For an opt-in real-browser acceptance pass against Expand Testing's public
+automation practice site, run `ARES_LIVE_BROWSER_HARNESS=1 pnpm test` (PowerShell:
+`$env:ARES_LIVE_BROWSER_HARNESS="1"; pnpm test`).
 
 > ⚠️ **CDP attach gives Ares control of that browser session** — every tab,
 > cookie, and logged-in account in the profile you exposed. Use a dedicated

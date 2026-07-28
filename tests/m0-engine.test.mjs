@@ -35,6 +35,12 @@ test("M0: ares help exits 0 with usage on stdout", () => {
   assert.match(r.stdout, /autonomous AI agent/);
 });
 
+test("M0: ares --help is non-interactive and exits 0", () => {
+  const r = runAres(["--help"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /ares eval coding/);
+});
+
 test("M0: ares run --goal emits ordered event stream", () => {
   const r = runAres(["run", "--provider", "mock", "--goal", "ping"]);
   assert.equal(r.status, 0, `ares run failed: ${r.stderr}`);

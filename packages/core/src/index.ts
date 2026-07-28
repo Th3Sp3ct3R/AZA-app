@@ -46,6 +46,7 @@ export {
   ANTHROPIC_MESSAGES_URL,
   DEFAULT_ANTHROPIC_MODEL,
   fetchAnthropicModels,
+  stripUnpairedWireToolBlocks,
   type AnthropicProviderOptions,
 } from "./providers/anthropic.js";
 
@@ -122,6 +123,7 @@ export {
 export {
   ContinuousVerifier,
   deriveNarrowVerify,
+  deriveScopedVerify,
   findRelatedTestFiles,
   triageVerifyOutput,
   type VerifierOptions,
@@ -131,7 +133,26 @@ export {
   type WorkspaceSetup,
   type CommandRunner,
   type VerifyCacheStats,
+  type VerificationEvidenceSnapshot,
 } from "./verifier.js";
+
+export {
+  buildRepositoryMap,
+  renderRepositoryMap,
+  repositoryMapReminder,
+  type RepositoryMap,
+  type RepositoryPackageMap,
+  type RepositoryMapOptions,
+} from "./repoCartography.js";
+
+export {
+  CodingJournal,
+  type CodingJournalOptions,
+  type CodingJournalState,
+  type CodingPhase,
+  type CodingCheckRecord,
+  type CodingFailureRecord,
+} from "./codingJournal.js";
 
 export {
   HookManager,
@@ -156,6 +177,7 @@ export {
 export {
   connectMcpServer,
   disconnectMcpServer,
+  setMcpServerEnabled,
   getMcpAccessToken,
   loadRemoteMcpServers,
   connectorNameFromUrl,
@@ -200,12 +222,17 @@ export {
   authFilePath,
   aresHome,
   deviceCodeLogin,
+  runOpenAILoginFlow,
+  refreshOpenAIToken,
+  fetchCodexModels,
+  type CodexModel,
   type AuthToken,
   type AuthStatus,
   type AuthMode,
   type AuthSource,
   type DeviceCodeChallenge,
   type DeviceCodeLoginOptions,
+  type OpenAILoginOptions,
 } from "./providers/openaiAuth.js";
 
 export {
@@ -213,10 +240,12 @@ export {
   DEFAULT_OLLAMA_SLOTS,
   OLLAMA_CLOUD_MODELS,
   ollamaCloudModelsFor,
+  fetchOllamaLibraryModels,
   type SlotName,
   type SlotConfig,
   type OllamaCloudPoolOptions,
   type OllamaCloudModel,
+  type OllamaLibraryModel,
 } from "./providers/ollamaCloud.js";
 
 export {

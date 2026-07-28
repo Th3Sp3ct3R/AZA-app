@@ -1,0 +1,29 @@
+Vanguard Proprietary License
+
+Copyright (c) 2026 clout2buy. All rights reserved.
+
+Vanguard is closed-source, proprietary software. It is distributed in
+compiled form only, together with type declarations and integration
+documentation that define its supported embedding surface.
+
+Subject to a separate written agreement with the copyright holder, you may:
+
+1. Install and run this package, including embedding the Vanguard engine in
+   your own agent or application through its documented public interfaces
+   (see docs/EMBEDDING.md and docs/ENGINE_PROTOCOL.md).
+
+You may not, without prior written permission from the copyright holder:
+
+1. Copy, publish, sublicense, sell, or redistribute this package or any part
+   of it.
+2. Modify, translate, decompile, deobfuscate, or otherwise attempt to derive
+   or reconstruct the source code of the compiled artifacts.
+3. Remove or alter this license, the copyright notice, or any embedded
+   attribution.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.

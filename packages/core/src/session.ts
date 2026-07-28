@@ -19,8 +19,10 @@ import {
   type ProviderInfo,
   type Message,
   type ToolResultBlock,
+  type Todo,
+  type WorkStatus,
 } from "@ares/protocol";
-import { QueryEngine, stringifyModelToolOutput, type EngineTool, type Provider } from "./queryEngine.js";
+import { QueryEngine, stringifyModelToolOutput, type EngineTool, type Provider, type QueryEngineConfig } from "./queryEngine.js";
 import type { ToolPermissionRequest } from "./queryEngine.js";
 import type { PermissionPromptDecision, ReasoningLevel, Usage } from "@ares/protocol";
 import type { HookManager } from "./hooks.js";
@@ -40,6 +42,10 @@ type ReminderSource =
   | "recall"
   | "self-revise";
 
+function isOpaqueMutationTool(name: string | undefined): boolean {
+  return name === "Bash" || name === "PowerShell" || name === "CodeMode" || name === "Task" || name === "Conductor";
+}
+
 export interface SessionOptions {
   workspace: string;
   provider: Provider;
@@ -51,11 +57,19 @@ export interface SessionOptions {
   sessionId?: string;
   sessionMeta?: SessionMeta;
   initialMessages?: readonly Message[];
+  /** Last TodoWrite snapshot restored independently of lossy message replay. */
+  initialTodos?: readonly Todo[];
   initialSeq?: number;
   /** Pending system-reminders to inject at next turn_start. */
   drainSystemReminders?: () => Array<{ text: string; source: ReminderSource }>;
   /** C1 end-of-turn gate — see QueryEngineConfig.confirmTurnEnd. */
   confirmTurnEnd?: () => Promise<Array<{ text: string; source: "verifier" | "hook" }>>;
+  requireVerificationEvidence?: boolean;
+  verificationEvidence?: QueryEngineConfig["verificationEvidence"];
+  outstandingVerificationRequired?: QueryEngineConfig["outstandingVerificationRequired"];
+  persistedVerificationDebt?: QueryEngineConfig["persistedVerificationDebt"];
+  persistedVerificationScopeComplete?: QueryEngineConfig["persistedVerificationScopeComplete"];
+  observedMutationAt?: QueryEngineConfig["observedMutationAt"];
   /** Failure-signature recall — see QueryEngineConfig.recallFailureFix. */
   recallFailureFix?: (input: { tool: string; signature: string; error: string }) => Promise<string | null>;
   hookManager?: HookManager;
@@ -94,6 +108,10 @@ export class Session {
   private readonly metaPath: string;
   private metaWritten = false;
   private lastCheckpointId: string | undefined;
+  private ioError: Error | null = null;
+  private readonly eventObservers = new Set<(event: TurnEvent) => void>();
+  /** Work truth from the most recent turn, used by post-turn learning. */
+  lastWorkStatus: WorkStatus = "not_applicable";
 
   constructor(private readonly opts: SessionOptions) {
     const sessionId = opts.sessionMeta?.id ?? opts.sessionId ?? `sess_${randomUUID()}`;
@@ -118,6 +136,12 @@ export class Session {
         signal: opts.signal,
         drainSystemReminders: opts.drainSystemReminders,
         confirmTurnEnd: opts.confirmTurnEnd,
+        requireVerificationEvidence: opts.requireVerificationEvidence,
+        verificationEvidence: opts.verificationEvidence,
+        outstandingVerificationRequired: opts.outstandingVerificationRequired,
+        persistedVerificationDebt: opts.persistedVerificationDebt,
+        persistedVerificationScopeComplete: opts.persistedVerificationScopeComplete,
+        observedMutationAt: opts.observedMutationAt,
         recallFailureFix: opts.recallFailureFix,
         hookManager: opts.hookManager,
         requestPermission: opts.requestPermission,
@@ -151,6 +175,7 @@ export class Session {
       sessionId,
     );
     if (opts.initialMessages) this.engine.hydrate(opts.initialMessages);
+    if (opts.initialTodos) this.engine.hydrateTodos(opts.initialTodos);
     if (opts.initialSeq) this.seq = opts.initialSeq;
     if (opts.sessionMeta) this.metaWritten = true;
   }
@@ -162,6 +187,13 @@ export class Session {
 
   setMaxTurns(maxTurns: number | undefined): void {
     this.engine.setMaxTurns(maxTurns);
+  }
+
+  /** Subscribe below every UI surface so durable state and verification taps
+   * cannot be forgotten by one chat/daemon consumer. Returns an unsubscribe. */
+  observeEvents(observer: (event: TurnEvent) => void): () => void {
+    this.eventObservers.add(observer);
+    return () => this.eventObservers.delete(observer);
   }
 
   /** Swap provider/model in place and persist the new session metadata. */
@@ -223,11 +255,85 @@ export class Session {
 
   private async *streamAndPersist(): AsyncGenerator<TurnEvent> {
     const preToolCheckpoints = new Map<string, string>();
+    const toolNames = new Map<string, string>();
+    let observedMutationAt = 0;
+    let verificationGenerationAtObservedMutation = this.opts.verificationEvidence?.().mutationGeneration ?? 0;
     try {
-      for await (const event of this.engine.streamTurn()) {
+      for await (const rawEvent of this.engine.streamTurn()) {
+        let event = rawEvent;
+        if (event.type === "tool_start") toolNames.set(event.id, event.name);
+        if (event.type === "checkpoint_created" && event.toolUseId && event.reason === "pre_tool") {
+          preToolCheckpoints.set(event.toolUseId, event.checkpointId);
+        }
+
+        // Shell/CodeMode tools cannot declare touched files up front. Their
+        // pre-tool checkpoint is a full workspace snapshot, so diff it now and
+        // promote discovered changes onto tool_end. Every UI consumer already
+        // schedules verification from tool_end.touchedFiles; this closes the
+        // bypass without duplicating scheduling logic in each surface.
+        let preparedDiff: Awaited<ReturnType<typeof diffWorkspaceCheckpointUnified>> | null = null;
+        if (event.type === "tool_end" && (!event.touchedFiles || event.touchedFiles.length === 0)) {
+          const checkpointId = preToolCheckpoints.get(event.id);
+          if (checkpointId) {
+            try {
+              preparedDiff = await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId);
+            } catch (error) {
+              // Opaque execution tools can mutate through arbitrary programs
+              // (`node generator.mjs`, build scripts, formatters). If their
+              // checkpoint diff fails, failing open would label the turn
+              // not_applicable. Arm proof debt with an explicit sentinel and
+              // surface the unavailable diff as a truncated workspace event.
+              if (isOpaqueMutationTool(toolNames.get(event.id))) {
+                const sentinel = path.resolve(this.opts.workspace, ".ares-unknown-mutation");
+                const detail = error instanceof Error ? error.message : String(error);
+                preparedDiff = {
+                  files: [path.basename(sentinel)],
+                  diff: `Checkpoint diff unavailable after ${toolNames.get(event.id)}: ${detail}`,
+                  truncated: true,
+                };
+                event = { ...event, touchedFiles: [sentinel] };
+              }
+            }
+            if (preparedDiff?.files.length) {
+              event = {
+                ...event,
+                touchedFiles: preparedDiff.files.map((file) => path.resolve(this.opts.workspace, file)),
+              };
+            }
+          } else if (isOpaqueMutationTool(toolNames.get(event.id))) {
+            // Broad/home workspaces deliberately disable snapshots. Delegated
+            // writers and arbitrary code execution must still fail closed:
+            // exact files are unavailable, so arm an unknown mutation debt.
+            const sentinel = path.resolve(this.opts.workspace, ".ares-unknown-mutation");
+            preparedDiff = {
+              files: [path.basename(sentinel)],
+              diff: `Checkpoint unavailable after ${toolNames.get(event.id)}; workspace mutation scope is unknown.`,
+              truncated: true,
+            };
+            event = { ...event, touchedFiles: [sentinel] };
+          }
+        }
+        if (event.type === "tool_end" && event.touchedFiles?.length) {
+          verificationGenerationAtObservedMutation = this.opts.verificationEvidence?.().mutationGeneration ?? verificationGenerationAtObservedMutation;
+          observedMutationAt = Date.now();
+        }
+        if (event.type === "turn_end" && observedMutationAt > 0 && (!event.workStatus || event.workStatus === "not_applicable")) {
+          const evidence = this.opts.verificationEvidence?.();
+          const currentRun = evidence?.latestRunGeneration === evidence?.mutationGeneration;
+          const newerRun = (evidence?.latestRunGeneration ?? -1) > verificationGenerationAtObservedMutation;
+          const passedAfterMutation = currentRun && newerRun && evidence?.latestRunStatus === "passed" && evidence.latestRunStrength === "behavioral";
+          const failedAfterMutation = currentRun && newerRun && evidence?.latestRunStatus === "failed";
+          event = {
+            ...event,
+            workStatus: passedAfterMutation ? "verified" : failedAfterMutation ? "blocked" : "unverified",
+          };
+        }
+
         // Persistence is enqueued (not awaited) so a fast token stream never
         // waits on an NTFS append + Defender scan before reaching the consumer.
         this.persistEvent(event);
+        this.notifyEvent(event);
+        if (event.type === "turn_end") this.lastWorkStatus = event.workStatus ?? "not_applicable";
         // Friction telemetry rides the same tap — every surface (chat, TUI,
         // daemon) logs identically because they all stream through here.
         this.friction.record(event);
@@ -237,13 +343,12 @@ export class Session {
         // user's immediate next message).
         if (event.type === "turn_end") await this.flush();
         yield event;
-      if (event.type === "checkpoint_created" && event.toolUseId && event.reason === "pre_tool") {
-        preToolCheckpoints.set(event.toolUseId, event.checkpointId);
-      }
-        if (event.type === "tool_end" && event.touchedFiles && event.touchedFiles.length > 0) {
+
+        if (event.type === "tool_end") {
+          toolNames.delete(event.id);
           const checkpointId = preToolCheckpoints.get(event.id);
           if (!checkpointId) continue;
-          const diff = await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId, event.touchedFiles).catch(() => null);
+          const diff = preparedDiff ?? await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId, event.touchedFiles).catch(() => null);
           if (!diff || !diff.diff) continue;
           const diffEvent: TurnEvent = {
             type: "workspace_diff",
@@ -254,6 +359,7 @@ export class Session {
             truncated: diff.truncated,
           };
           this.persistEvent(diffEvent);
+          this.notifyEvent(diffEvent);
           yield diffEvent;
         }
       }
@@ -268,6 +374,17 @@ export class Session {
   /** Read-only history snapshot. */
   history() {
     return this.engine.history();
+  }
+
+  /**
+   * Persist an externally-driven engine event (the Vanguard drive) into this
+   * session's rollout, so session history, restore after restart, and bug
+   * reports include the turn — a drive conversation must be exactly as
+   * durable as a native one.
+   */
+  async recordExternalEvent(event: TurnEvent): Promise<void> {
+    await this.ensureSessionDir();
+    this.persistEvent(event);
   }
 
   private async ensureSessionDir(): Promise<void> {
@@ -300,12 +417,40 @@ export class Session {
       event: persistedEvent,
     };
     const line = JSON.stringify(entry) + "\n";
-    this.ioChain = this.ioChain.then(() => appendFile(this.eventsPath, line, "utf8")).catch(() => {});
+    this.ioChain = this.ioChain
+      .catch(() => undefined)
+      .then(() => appendFile(this.eventsPath, line, "utf8"))
+      .catch((error: unknown) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        // Surface the FIRST failure immediately (disk full, perms, path gone) —
+        // the rollout is the durable session history; silently losing it until
+        // someone happens to await flush() was how sessions vanished with no
+        // trace. Log once (not per-event) so a persistent fault isn't spammy.
+        if (!this.ioError) {
+          try {
+            process.stderr.write(`[session] rollout persistence failing (${this.eventsPath}): ${err.message}\n`);
+          } catch { /* stderr unavailable */ }
+        }
+        this.ioError = err;
+      });
   }
 
   /** Await all pending rollout appends. */
-  private flush(): Promise<void> {
-    return this.ioChain;
+  private async flush(): Promise<void> {
+    await this.ioChain;
+    if (this.ioError) {
+      throw new Error(`session rollout persistence failed: ${this.ioError.message}`, { cause: this.ioError });
+    }
+  }
+
+  private notifyEvent(event: TurnEvent): void {
+    for (const observer of this.eventObservers) {
+      try {
+        observer(event);
+      } catch {
+        // Observability cannot invalidate a completed tool call or model turn.
+      }
+    }
   }
 }
 
@@ -324,6 +469,8 @@ export interface SessionSummary {
 export interface SessionSnapshot {
   meta: SessionMeta;
   messages: Message[];
+  /** Latest durable TodoWrite state, folded from rollout events. */
+  todos: Todo[];
   nextSeq: number;
   eventCount: number;
   preview: string;
@@ -381,11 +528,13 @@ export async function loadSessionSnapshot(
   const eventsText = await readFile(eventsPath, "utf8").catch(() => "");
   const entries = parseRolloutEntries(eventsText);
   const rawMessages = messagesFromRollout(entries);
+  const todos = latestTodosFromRollout(entries);
   const replay = compactReplayMessages(rawMessages, sessionId, opts.maxMessages);
   const nextSeq = entries.length > 0 ? Math.max(...entries.map((entry) => entry.seq)) + 1 : 0;
   return {
     meta,
     messages: replay.messages,
+    todos,
     nextSeq,
     eventCount: entries.length,
     preview: previewFromMessages(rawMessages),
@@ -393,6 +542,14 @@ export async function loadSessionSnapshot(
     omittedMessageCount: replay.omittedMessageCount,
     replayedMessageCount: replay.messages.length,
   };
+}
+
+function latestTodosFromRollout(entries: readonly RolloutEntry[]): Todo[] {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const event = entries[index].event;
+    if (event.type === "todo_updated") return event.todos.map((todo) => ({ ...todo }));
+  }
+  return [];
 }
 
 /** The FULL raw rollout for a session — every persisted event, untouched by

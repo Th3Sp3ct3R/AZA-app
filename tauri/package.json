@@ -1,6 +1,6 @@
 {
   "name": "ares-tauri",
-  "version": "0.20.1",
+  "version": "0.28.22",
   "private": true,
   "type": "module",
   "scripts": {

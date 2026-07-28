@@ -256,8 +256,10 @@ export class OllamaCloudPool {
       // (mirrors openAIReasoningEffort) to avoid a 400 on models that validate it,
       // while still letting the owner's dial bite here. Gate on reasoningEnabled so
       // "off"/undefined omit think entirely (a present field re-enables thinking).
-      ...(reasoningEnabled(req.reasoningLevel)
-        ? { think: req.reasoningLevel === "max" ? "high" : req.reasoningLevel }
+      ...(req.reasoningLevel === "off"
+        ? { think: false }
+        : reasoningEnabled(req.reasoningLevel)
+        ? { think: req.reasoningLevel === "xhigh" || req.reasoningLevel === "max" ? "high" : req.reasoningLevel === "minimal" ? "low" : req.reasoningLevel }
         : {}),
       // Inject the system prompt as a leading system message — Ollama
       // doesn't have a separate `system` field at the chat-level API.
@@ -1128,6 +1130,67 @@ export interface OllamaCloudModel {
   role: "reasoner" | "apply" | "summarize" | "general";
   /** Short capability hint shown in the picker. */
   hint: string;
+}
+
+// ─── Ollama LIBRARY catalog (ollama.com/library) ───────────────────────
+//
+// The full public library — every model whether the user pulled it or not,
+// so the discovery panel can show the same browse experience as ollama.com
+// (blurb, capabilities, pull count, updated). Parsed from the library HTML:
+// there is no public JSON API, but the page is server-rendered with stable
+// `x-test-*` markers on every card, which makes it safely regex-parseable.
+
+export interface OllamaLibraryModel {
+  name: string;
+  description?: string;
+  /** Raw ollama capability tags: tools, thinking, vision, embedding. */
+  capabilities: string[];
+  /** Model has a hosted :cloud variant on ollama.com. */
+  cloud: boolean;
+  /** Human pull count, e.g. "225.9K". */
+  pulls?: string;
+  tagCount?: number;
+  /** Relative age, e.g. "3 weeks ago". */
+  updated?: string;
+}
+
+let ollamaLibraryCache: { at: number; models: OllamaLibraryModel[] } | null = null;
+
+/** Fetch + parse the ollama.com library (cached 1h). Returns [] on any failure —
+ *  the catalog must degrade, never break the picker. */
+export async function fetchOllamaLibraryModels(opts: { fetchImpl?: typeof fetch; force?: boolean } = {}): Promise<OllamaLibraryModel[]> {
+  if (!opts.force && ollamaLibraryCache && Date.now() - ollamaLibraryCache.at < 60 * 60 * 1000) {
+    return ollamaLibraryCache.models;
+  }
+  const f = opts.fetchImpl ?? fetch;
+  let html = "";
+  try {
+    const res = await f("https://ollama.com/library?sort=popular", {
+      headers: { Accept: "text/html" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return ollamaLibraryCache?.models ?? [];
+    html = await res.text();
+  } catch {
+    return ollamaLibraryCache?.models ?? [];
+  }
+  const models: OllamaLibraryModel[] = [];
+  // One <li> card per model; anchor href carries the name. Split on the card
+  // anchors so each chunk holds exactly one model's markup.
+  const chunks = html.split(/<a href="\/library\//).slice(1);
+  for (const chunk of chunks) {
+    const name = chunk.match(/^([a-z0-9._-]+)"/i)?.[1];
+    if (!name) continue;
+    const description = chunk.match(/<p class="max-w-lg[^"]*">([\s\S]*?)<\/p>/)?.[1]?.replace(/<[^>]+>/g, "").trim();
+    const capabilities = [...chunk.matchAll(/x-test-capability[^>]*>([a-z]+)</g)].map((m) => m[1]);
+    const cloud = />cloud</.test(chunk);
+    const pulls = chunk.match(/x-test-pull-count>([^<]+)</)?.[1]?.trim();
+    const tagCount = Number(chunk.match(/x-test-tag-count>([^<]+)</)?.[1]) || undefined;
+    const updated = chunk.match(/x-test-updated>([^<]+)</)?.[1]?.trim();
+    models.push({ name, description, capabilities, cloud, pulls, tagCount, updated });
+  }
+  if (models.length > 0) ollamaLibraryCache = { at: Date.now(), models };
+  return models;
 }
 
 export const OLLAMA_CLOUD_MODELS: readonly OllamaCloudModel[] = [

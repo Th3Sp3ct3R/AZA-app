@@ -78,6 +78,24 @@ test("ARES_TELEMETRY=0 writes nothing", async () => {
   }
 });
 
+test("node test sessions do not contaminate the default user telemetry directory", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "ares-friction-home-"));
+  const prevHome = process.env.ARES_HOME;
+  process.env.ARES_HOME = home;
+  try {
+    const rec = new FrictionRecorder("sess_default_test");
+    rec.record({ type: "tool_use_start", id: "browser", name: "Browser" });
+    rec.record({ type: "tool_error", id: "browser", error: "synthetic test failure" });
+    rec.record(turnEnd());
+    await rec.settle();
+    assert.deepEqual(await readdir(home), [], "default telemetry stays untouched under node --test");
+  } finally {
+    if (prevHome === undefined) delete process.env.ARES_HOME;
+    else process.env.ARES_HOME = prevHome;
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("summarizeFriction aggregates across turns with error-rate ordering data", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "ares-friction-"));
   try {

@@ -1,6 +1,6 @@
 // Extracted from entry.ts — turnPipeline.
 
-import { sideQuery, sideQueryJson } from "@ares/core";
+import { repositoryMapReminder, sideQuery, sideQueryJson } from "@ares/core";
 import { rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -170,6 +170,40 @@ export async function recallFailureFixFromMemory(
 export async function prepareUserTurn(live: LiveSession, userMessage: string): Promise<void> {
   await live.agentRuntime?.beforeTurn(userMessage);
   await mindBeforeTurn(live, userMessage);
+  const codingState = live.codingJournal.beginTurn(userMessage);
+  if (codingState) {
+    live.queueSystemReminder(codingState, "instructions");
+    if (process.env.ARES_REPO_MAP !== "0") {
+      live.repositoryMapCodingTurns = (live.repositoryMapCodingTurns ?? 0) + 1;
+      const snapshot = live.codingJournal.snapshot();
+      const priorTouchedCount = live.repositoryMapTouchedCount ?? 0;
+      const newlyTouched = snapshot.touchedFiles.slice(priorTouchedCount);
+      const boundaryChanged = newlyTouched.some((file) =>
+        /(^|\/)(?:package\.json|pnpm-workspace\.yaml|tsconfig(?:\.[^.]+)?\.json|pyproject\.toml|cargo\.toml|go\.mod|agents\.md)$/i.test(file.replace(/\\/g, "/")),
+      );
+      const due = !live.repositoryMapText || boundaryChanged ||
+        live.repositoryMapCodingTurns - (live.repositoryMapLastTurn ?? 0) >= 6;
+      if (due) {
+        const map = await repositoryMapReminder(live.context.workspace).catch(() => "");
+        if (map) {
+          live.repositoryMapText = map;
+          live.repositoryMapLastTurn = live.repositoryMapCodingTurns;
+          live.repositoryMapTouchedCount = snapshot.touchedFiles.length;
+          live.queueSystemReminder(map, "instructions");
+        }
+      }
+    }
+    if (live.codingJournal.persistedVerificationDebtForCurrentTurn()) {
+      const persistedFiles = live.codingJournal.snapshot().touchedFiles.map((file) =>
+        path.isAbsolute(file) ? file : path.resolve(live.context.workspace, file),
+      );
+      if (persistedFiles.length) live.verifier.scheduleFor(persistedFiles);
+    }
+    // Unlike the session-creation prompt, this captures the CURRENT dirty tree
+    // after prior edits or external changes in a long-running task.
+    const git = await loadGitContext(live.context);
+    if (git) live.queueSystemReminder(`CURRENT REPOSITORY DELTA${git}`, "instructions");
+  }
   // Peripheral awareness: a bounded note of what the local watcher has recently
   // seen, injected only when something fresh is buffered (usually nothing). The
   // reminder is hard-capped in items + chars so it can't dominate the window.
@@ -256,7 +290,22 @@ export async function finishTurn(
   live: LiveSession,
   finalStatus: "completed" | "interrupted" | "failed",
 ): Promise<void> {
+  if (
+    finalStatus !== "completed" ||
+    live.session.lastWorkStatus === "unverified" ||
+    live.session.lastWorkStatus === "blocked"
+  ) {
+    await live.verifier.cancel().catch(() => undefined);
+  }
   await live.agentRuntime?.afterTurn(finalStatus);
+  try {
+    await live.codingJournal.finishTurn(finalStatus);
+  } catch (error) {
+    live.queueSystemReminder(
+      `Coding journal persistence failed: ${error instanceof Error ? error.message : String(error)}. Re-establish task state from the rollout and repository before continuing; do not assume the prior turn's working state was saved.`,
+      "instructions",
+    );
+  }
 
   // V6 — settle the artifacts that were in play.
   const ids = live.lastRecallIds ?? [];
@@ -264,9 +313,10 @@ export async function finishTurn(
   if (ids.length > 0) {
     try {
       const store = await MemoryStore.open(live.context.mind.memoryFile);
+      const workStatus = live.session.lastWorkStatus;
       await store.recordOutcome(ids, {
-        won: finalStatus === "completed",
-        note: `in play for a turn that ${finalStatus}`,
+        won: finalStatus === "completed" && (workStatus === "verified" || workStatus === "not_applicable"),
+        note: `in play for a turn that ${finalStatus} with work status ${workStatus}`,
       });
     } catch {
       // consequence settling never breaks the loop
@@ -278,6 +328,7 @@ export async function finishTurn(
   const userMessage = live.lastUserMessage;
   live.lastUserMessage = undefined;
   if (!userMessage || finalStatus === "interrupted") return;
+  if (finalStatus === "completed" && (live.session.lastWorkStatus === "unverified" || live.session.lastWorkStatus === "blocked")) return;
   if (process.env.ARES_WITNESS === "0" || !live.agentRuntime?.prepared.enabled) return;
   try {
     const intent = classifyUserIntent(userMessage);
@@ -319,6 +370,16 @@ export async function finishTurn(
   } catch {
     // the Witness is opportunistic — a failed review costs nothing
   }
+}
+
+/** Stop process-backed coding helpers when a live session is discarded. */
+export async function disposeLiveSession(live: LiveSession): Promise<void> {
+  await Promise.all([
+    live.verifier.cancel().catch(() => undefined),
+    live.shellRegistry.killAll().catch(() => 0),
+  ]);
+  await live.agentRuntime?.sessionEnded().catch(() => undefined);
+  live.agentRuntime?.stop();
 }
 
 export async function mindSessionEnded(): Promise<void> {
@@ -380,6 +441,8 @@ assistant: [Glob src/**/*.ts]
 
 For substantial work, lead with the action you're taking in one short sentence, then act.
 
+When a user turn contains \`<voice-mode/>\`, it is hands-free speech: respond immediately in 1–3 short conversational sentences that read naturally aloud, with no Markdown unless requested. Perform requested actions before confirming them; for web tasks use the live visible Browser/CDP surface rather than a headless fetch.
+
 ## Presence
 
 Not every message is a build request. If the user greets you, checks in, jokes, vents, asks who you are, or asks a non-coding question, respond naturally in your own voice. Do not force the conversation toward code, tickets, or "what are we building" unless the user actually put work on the table.
@@ -418,7 +481,7 @@ assistant: Planning this with TodoWrite — 3 steps: add the command parser, wir
 
 ## Coding doctrine (non-negotiable)
 
-- **Act first, plan light.** Take ONE concrete action — a tool call — then observe, then continue. Don't plan the whole task in your head before acting, and keep any reasoning before your first tool call short. On a real task, your first move should be a tool call, not an essay. Momentum beats a perfect upfront plan.
+- **Orient fast, plan light.** Make the first move a concrete read/search/status tool call, then observe and form the smallest evidence-backed plan. Don't write an essay before acting, and don't edit before you know the owning boundary and local pattern.
 - **Minimum complexity.** Do exactly what's asked — no extra features, speculative abstractions, defensive validation, or backwards-compat shims nobody requested. Validate at system boundaries, not everywhere. Three similar lines beat a premature abstraction. The best diff is the smallest one that is correct and clear.
 - **Faithful reporting.** NEVER claim tests pass, the build is green, or something works unless you ran it and saw it. If a step was skipped or a check failed, say so plainly. "I didn't run it" is a respectable answer; a false "it works" is not — and on long autonomous missions it is the most expensive lie you can tell.
 - **Diagnose before retry.** When something fails, READ the actual error and fix the cause. Don't blind-retry the same call and don't thrash. One focused fix after understanding beats five guesses.
@@ -429,10 +492,14 @@ assistant: Planning this with TodoWrite — 3 steps: add the command parser, wir
 
 ## Expert in large codebases (monorepos, mature projects)
 
+- **Establish the baseline.** Before changing behavior, run the narrow failing test/reproduction when affordable and record whether the tree was already red. A post-edit failure is actionable only when you know whether it is new.
 - **Learn the pattern before writing.** Before adding anything, find how this codebase already does it (grep a sibling feature) and match its naming, error-handling, and test idiom. Code that fights the house style is a defect even when it runs.
+- **Trace the blast radius.** For public types, protocols, persistence, config, and shared utilities, inspect definitions, callers, serializers, migrations, and tests before editing. Preserve compatibility intentionally; never discover consumers one compiler error at a time.
 - **Respect module boundaries.** Change the package that owns the behavior; don't reach across layers because it's closer. If a fix seems to need edits in 4 packages, you probably found the wrong seam — look for the single choke point.
 - **Verify narrow, then wide.** In a monorepo, typecheck/test the package you touched first (fast signal), full suite before declaring the task done. Never run the world after every one-line edit.
 - **Refactors are staged, not heroic.** Big moves happen as small verified steps: extract, compile, test, repeat. If the tree is broken for more than one step at a time, back up and stage it smaller.
+- **Review the delivered diff.** Before the final claim, inspect changed files for accidental rewrites, test tampering, generated junk, debug code, stale TODOs, and unhandled callers. Tests prove behavior; the diff proves scope and maintainability.
+- **Use durable state as your flight plan.** Treat repository cartography, the coding journal, current git delta, and TodoWrite as facts. After compaction or resume, re-anchor from them instead of reconstructing a long task from vague prose.
 - **When failures pile up, triage.** The verifier's TRIAGE header groups a wall of red into root causes — fix cause #1 (usually one bad import/symbol) and re-run before touching anything else. Fifty failures is almost never fifty problems.
 
 ## Building UIs & visual output (beautiful is the default, not a bonus)

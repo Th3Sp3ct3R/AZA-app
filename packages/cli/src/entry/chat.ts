@@ -13,12 +13,12 @@ import { onLifecycle } from "@ares/agent";
 import { briefingLines, buildBriefing, buildContinuitySummary, buildWorldGraph, checkpointDiffCommand, checkpointsCommand, continuityLines, doctorCommand, loginCommand, rollbackCommand, worldGraphLines } from "./introspect.js";
 import { ProviderSelection, TERMINAL_PROVIDERS, daemonModelCatalog, defaultTerminalModel, providerFamilyForSelection } from "./providers.js";
 import { ParsedArgs, cliRuntimeContext, printHelp } from "./runtime.js";
-import { LiveSession, createSession, createSessionWithSelection, handleReasoningCommand } from "./sessionFactory.js";
+import { LiveSession, createSession, createSessionWithSelection, guardVisionForTurn, handleReasoningCommand } from "./sessionFactory.js";
 import { promptPermission } from "./permissions.js";
 import type { ToolPermissionRequest } from "@ares/core";
 import type { PermissionPromptDecision } from "@ares/protocol";
 import { applyTerminalAutoRouting, applyTerminalRoutingCommand, checkpointDiffLines, checkpointLines, colorUnifiedDiff, contentFromUserInput, doctorSummaryLines, inkHelpLines, legacyProgressText, persistTerminalModelPreference, printResumed, printSessions, requireResumeSessionId, resolveResumeSessionId, resumedLines, rollbackLines, saveTheme, sessionsLines, setTerminalProviderKey, switchTerminalModel, terminalKeyLines, terminalModelCatalogLines, terminalSettingsLines, themeLines, undoLines, usageMeter } from "./terminalLines.js";
-import { finishTurn, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
+import { disposeLiveSession, finishTurn, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
 
 export async function runCommand(args: ParsedArgs): Promise<number> {
   const goal = args.flags.get("goal");
@@ -48,7 +48,9 @@ export async function runCommand(args: ParsedArgs): Promise<number> {
   });
   await prepareUserTurn(live, goal);
   let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-  for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
+  const turnContent = await contentFromUserInput(goal, live.context.workspace);
+  guardVisionForTurn(live, turnContent);
+  for await (const event of live.session.sendContent(turnContent)) {
     if (event.type === "tool_end" && event.touchedFiles?.length) {
       live.verifier.scheduleFor(event.touchedFiles);
     }
@@ -59,8 +61,7 @@ export async function runCommand(args: ParsedArgs): Promise<number> {
   // before the post-turn / session-end hooks fire any additional lifecycle events.
   unsubLifecycle();
   await finishTurn(live, finalStatus);
-  await live.agentRuntime?.sessionEnded();
-  live.agentRuntime?.stop();
+  await disposeLiveSession(live);
   return 0;
 }
 
@@ -156,7 +157,9 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
         await applyTerminalAutoRouting(live, goal);
         await prepareUserTurn(live, goal);
         let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-        for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
+        const turnContent = await contentFromUserInput(goal, live.context.workspace);
+        guardVisionForTurn(live, turnContent);
+        for await (const event of live.session.sendContent(turnContent)) {
           if (event.type === "tool_end" && event.touchedFiles?.length) {
             live.verifier.scheduleFor(event.touchedFiles);
           }
@@ -168,9 +171,8 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
       handleCommand: async (line): Promise<InkCommandResult> => {
         if (line === "/exit" || line === "/quit") {
           await pendingFinish; // don't lose detached post-turn bookkeeping on exit
-          await live.agentRuntime?.sessionEnded();
+          await disposeLiveSession(live);
           await mindSessionEnded();
-          live.agentRuntime?.stop();
           return { kind: "exit" };
         }
         if (line === "/help") return { kind: "handled", lines: inkHelpLines(), snapshot: snapshot() };
@@ -256,7 +258,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
         if (line === "/resume" || line.startsWith("/resume ")) {
           const target = line.split(/\s+/, 2)[1] ?? "last";
           const sessionId = await requireResumeSessionId(target, live.context);
-          live.agentRuntime?.stop();
+          await disposeLiveSession(live);
           live = await createSessionWithSelection(args, live.selection, sessionId, requestPermission);
           return { kind: "handled", lines: live.resumed ? resumedLines(live.resumed) : [`Resumed ${sessionId}`], snapshot: snapshot() };
         }
@@ -265,7 +267,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
           const next = path.resolve(live.context.workspace, target);
           const info = await stat(next).catch(() => null);
           if (!info?.isDirectory()) return { kind: "handled", lines: [`Not a directory: ${next}`], snapshot: snapshot() };
-          live.agentRuntime?.stop();
+          await disposeLiveSession(live);
           process.chdir(next);
           live = await createSessionWithSelection(args, live.selection, undefined, requestPermission);
           return { kind: "handled", lines: [`Active workspace is now ${live.context.workspace}`], snapshot: snapshot() };
@@ -306,8 +308,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
     const line = (await askLine(promptLabel(live.selection.model, live.context.workspace, live.runtime.permissionMode))).trim();
     if (!line) continue;
     if (line === "/exit" || line === "exit" || line === "/quit" || line === "quit") {
-      await live.agentRuntime?.sessionEnded();
-      live.agentRuntime?.stop();
+      await disposeLiveSession(live);
       process.stdout.write("bye\n");
       return 0;
     }
@@ -456,7 +457,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
       const target = line.split(/\s+/, 2)[1] ?? "last";
       try {
         const sessionId = await requireResumeSessionId(target, live.context);
-        live.agentRuntime?.stop();
+        await disposeLiveSession(live);
         live = await createSessionWithSelection(args, live.selection, sessionId);
         if (live.resumed) printResumed(live.resumed);
       } catch (err) {
@@ -481,7 +482,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
     }
     if (line.startsWith("/workspace ")) {
       const target = line.slice("/workspace ".length).trim();
-      live.agentRuntime?.stop();
+      await disposeLiveSession(live);
       live = await switchWorkspace(args, live.selection, target);
       continue;
     }
@@ -523,7 +524,9 @@ async function renderTurn(live: LiveSession, goal: string): Promise<void> {
   let wroteText = false;
   let wroteThinking = false;
   let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-  for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
+  const turnContent = await contentFromUserInput(goal, live.context.workspace);
+  guardVisionForTurn(live, turnContent);
+  for await (const event of live.session.sendContent(turnContent)) {
     if (event.type === "text_delta") {
       if (wroteThinking) {
         process.stderr.write("\n");

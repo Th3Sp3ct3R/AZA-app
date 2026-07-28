@@ -43,6 +43,16 @@ importers:
         specifier: ^0.1.7
         version: 0.1.9
 
+  packages/browser-extension: {}
+
+  packages/browser-extension-connector:
+    dependencies:
+      '@ares/connectors':
+        specifier: workspace:*
+        version: link:../connectors
+
+  packages/browser-host: {}
+
   packages/channels:
     dependencies:
       '@ares/protocol':
@@ -61,6 +71,9 @@ importers:
       '@ares/agent':
         specifier: workspace:*
         version: link:../agent
+      '@ares/browser-extension-connector':
+        specifier: workspace:*
+        version: link:../browser-extension-connector
       '@ares/channels':
         specifier: workspace:*
         version: link:../channels
@@ -94,6 +107,9 @@ importers:
       react:
         specifier: ^19.2.6
         version: 19.2.6
+      vanguard:
+        specifier: file:../../vendor/vanguard
+        version: file:vendor/vanguard
       ws:
         specifier: ^8.18.0
         version: 8.21.0
@@ -1637,6 +1653,9 @@ packages:
     resolution: {integrity: sha512-Qo+uWgilfSmAhXCMav1uYFynlQO7fMFiMVZsQqZRMIXp0O7rR7qjkj+cPvBHLgBqi960QCoo/PH2/6ZtVqKvrg==}
     hasBin: true
 
+  vanguard@file:vendor/vanguard:
+    resolution: {directory: vendor/vanguard, type: directory}
+
   vite@7.3.3:
     resolution: {integrity: sha512-/4XH147Ui7OGTjg3HbdWe5arnZQSbfuRzdr9Ec7TQi5I7R+ir0Rlc9GIvD4v0XZurELqA035KVXJXpR61xhiTA==}
     engines: {node: ^20.19.0 || >=22.12.0}
@@ -3065,6 +3084,10 @@ snapshots:
     optional: true
 
   uuid@14.0.0: {}
+
+  vanguard@file:vendor/vanguard:
+    dependencies:
+      '@types/node': 22.19.19
 
   vite@7.3.3(@types/node@22.19.19):
     dependencies:

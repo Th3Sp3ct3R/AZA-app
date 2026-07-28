@@ -1,19 +1,19 @@
 {
   "name": "ares",
-  "version": "0.20.1",
+  "version": "0.28.22",
   "private": true,
   "type": "module",
   "bin": {
     "ares": "packages/cli/dist/entry.js"
   },
   "packageManager": "pnpm@10.33.0",
-  "description": "Ares: a streaming, multi-provider coding + autonomous agent (Anthropic, OpenAI, Ollama Cloud, OpenRouter, DeepSeek) with a Tauri desktop and terminal — continuous verifier, multi-session daemon, persistent agent mind, and real desktop control.",
+  "description": "Ares: a streaming, multi-provider coding + autonomous agent (Anthropic, OpenAI, Ollama Cloud, OpenRouter, DeepSeek) with a Tauri desktop and terminal â€” continuous verifier, multi-session daemon, persistent agent mind, and real desktop control.",
   "license": "AGPL-3.0-only",
   "scripts": {
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
     "lint": "pnpm check",
-    "test": "pnpm build && node --test tests/*.test.mjs",
+    "test": "pnpm build && node --test --test-concurrency=4 tests/*.test.mjs",
     "ares": "node packages/cli/dist/entry.js",
     "install:cli": "powershell -ExecutionPolicy Bypass -File scripts/install.ps1",
     "uninstall:cli": "powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1",
