@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Main Ares desktop permissions.",
-  "windows": ["main"],
+  "windows": ["main", "presence-overlay", "living-surface"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

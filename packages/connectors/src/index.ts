@@ -16,7 +16,7 @@ export { MockBrowser, type MockPage } from "./mockBrowser.js";
 
 export { Filmstrip, type FilmstripEntry } from "./filmstrip.js";
 
-export { navigateEffect, fillEffect, clickEffect, type BrowserEffectOptions } from "./effects.js";
+export { browserActionEffect, navigateEffect, fillEffect, clickEffect, type BrowserEffectOptions } from "./effects.js";
 
 export {
   createPlaywrightBrowser,

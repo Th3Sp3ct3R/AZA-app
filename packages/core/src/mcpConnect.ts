@@ -42,6 +42,9 @@ export interface RemoteMcpEntry {
   authToken?: string;
   displayName?: string;
   connectedAt?: string;
+  /** false = connected but paused: tokens stay in the vault, tools don't load.
+   *  Absent means enabled (back-compat with pre-toggle entries). */
+  enabled?: boolean;
 }
 
 /** The encrypted-at-rest OAuth bundle (JSON) kept in the vault per connector. */
@@ -69,6 +72,17 @@ async function saveRemoteMcpServers(servers: Record<string, RemoteMcpEntry>, hom
   const dir = aresHome(home);
   await fs.mkdir(dir, { recursive: true }).catch(() => undefined);
   await fs.writeFile(remoteConfigPath(home), JSON.stringify({ servers }, null, 2) + "\n", "utf8");
+}
+
+/** Pause/resume a connector without touching its vault tokens — the `/mcp`
+ *  panel's toggle. Unknown names are a no-op (returns false). */
+export async function setMcpServerEnabled(name: string, enabled: boolean, home?: string): Promise<boolean> {
+  const servers = await loadRemoteMcpServers(home);
+  const entry = servers[name];
+  if (!entry) return false;
+  entry.enabled = enabled;
+  await saveRemoteMcpServers(servers, home);
+  return true;
 }
 
 /** Derive a stable, human-ish connector name from a URL host when the caller

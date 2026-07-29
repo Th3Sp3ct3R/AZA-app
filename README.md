@@ -49,6 +49,8 @@ pnpm ares help                          # list commands
 pnpm ares chat --provider mock          # interactive terminal chat (no API key)
 pnpm ares run --goal "fix failing tests"
 pnpm ares doctor                        # provider/runtime health
+pnpm ares triage scan --deep            # backfill + cluster local reliability failures
+pnpm ares triage list                    # review active reliability candidates
 pnpm ares garrison serve                # start the always-on daemon + gateway
 pnpm ares attach                        # attach a thin client to the gateway
 pnpm ares mind consolidate              # prune, dedupe, crystallize memory
@@ -71,6 +73,26 @@ pnpm desktop:installer                  # build the .exe (bundles a self-contain
 
 See `docs/DEVELOPMENT.md` for the full permission-mode and verification policy.
 
+### Self-triage reliability loop
+
+Ares keeps a local, redacted failure envelope for each completed Core and
+Garrison turn when telemetry is enabled, registers workspace rollouts under the
+active Ares home, and periodically reconciles those records with crash logs.
+The scanner joins both default durable homes (`~/.ares` and the Windows desktop
+home), registered session pointers, the current workspace, and the default
+desktop workspace. For pre-registry sessions in any other workspace, pass
+`--workspaces PATH1;PATH2` on Windows (`:` on POSIX), or persist the same list in
+`ARES_TRIAGE_WORKSPACES`. Stable signatures become durable findings under
+`<ARES_HOME>/triage`; recurrence thresholds keep auth problems, page-state
+misses, and old test pollution out of the product-repair queue.
+
+`ares triage show <id>` resolves the local evidence pointer for review.
+`acknowledge`, `dismiss`, and `resolve` are bookkeeping only: log text is never
+executed and no fixer, shell, model, worktree, commit, or push is launched. The
+repair gate intentionally stays closed until an authenticated, isolated Git
+worktree runner exists. Set `ARES_SELF_TRIAGE=0` to disable automatic scans or
+`ARES_SELF_TRIAGE_INTERVAL_MS` to change the six-hour cadence.
+
 ## Browser & CDP attach
 
 Ares can drive a real browser. By default it launches a persistent-profile
@@ -88,16 +110,27 @@ set ARES_BROWSER_CDP_URL=http://127.0.0.1:9222   # Windows (PowerShell: $env:ARE
 export ARES_BROWSER_CDP_URL=http://127.0.0.1:9222 # macOS/Linux
 ```
 
-Launch-strategy order: configured CDP endpoint → opt-in localhost discovery →
+Launch-strategy order: configured CDP endpoint → localhost discovery →
 detected Edge/Chrome exe (persistent `~/.ares` profile) → msedge channel →
 chrome channel → bundled Chromium.
 
 - `ARES_BROWSER_CDP_URL` — explicit endpoint, tried first. If it's unreachable,
   Ares falls back to launching its own browser.
-- `ARES_BROWSER_CDP_DISCOVERY=1` — **opt-in** auto-discovery of a local debugging
-  browser (`127.0.0.1:9222` by default; override with `ARES_BROWSER_CDP_PORTS=9222,9223`).
-  Off by default on purpose: Ares never attaches to a random open browser unless
-  you ask it to.
+- Local CDP discovery is on by default for `127.0.0.1:9222`; set
+  `ARES_BROWSER_CDP_DISCOVERY=0` to disable it, or override probe ports with
+  `ARES_BROWSER_CDP_PORTS=9222,9223`.
+
+Use Browser `handshake` when attachment—not fallback—is required. It probes the
+explicit/discovered CDP endpoint and fails if it cannot attach; it never quietly
+launches a different profile. Chrome 136+ intentionally ignores remote-debugging
+flags against the default Chrome profile, so use Ares's separate persistent
+browser profile. Controlling arbitrary tabs in a normally launched default
+profile requires an explicitly installed extension bridge; Ares does not bypass
+that browser security boundary.
+
+For an opt-in real-browser acceptance pass against Expand Testing's public
+automation practice site, run `ARES_LIVE_BROWSER_HARNESS=1 pnpm test` (PowerShell:
+`$env:ARES_LIVE_BROWSER_HARNESS="1"; pnpm test`).
 
 > ⚠️ **CDP attach gives Ares control of that browser session** — every tab,
 > cookie, and logged-in account in the profile you exposed. Use a dedicated

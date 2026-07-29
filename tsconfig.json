@@ -2,6 +2,7 @@
   "extends": "./tsconfig.base.json",
   "files": [],
   "references": [
+    { "path": "./packages/browser-extension-connector" },
     { "path": "./packages/protocol" },
     { "path": "./packages/core" },
     { "path": "./packages/tools" },

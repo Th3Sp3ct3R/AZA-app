@@ -46,6 +46,7 @@ export {
   ANTHROPIC_MESSAGES_URL,
   DEFAULT_ANTHROPIC_MODEL,
   fetchAnthropicModels,
+  stripUnpairedWireToolBlocks,
   type AnthropicProviderOptions,
 } from "./providers/anthropic.js";
 
@@ -59,6 +60,27 @@ export {
   type AnthropicOAuthTokens,
   type AnthropicAuthChallenge,
 } from "./providers/anthropicAuth.js";
+
+export {
+  runKimiLoginFlow,
+  requestKimiDeviceAuthorization,
+  pollKimiDeviceToken,
+  refreshKimiTokens,
+  resolveKimiTokens,
+  resolveKimiAccessToken,
+  loadKimiTokens,
+  saveKimiTokens,
+  kimiAuthStatus,
+  kimiAuthFilePath,
+  kimiLogout,
+  fetchKimiModels,
+  KIMI_CODING_BASE_URL,
+  type KimiModel,
+  type KimiTokens,
+  type KimiAuthStatus,
+  type KimiDeviceAuthorization,
+  type KimiLoginOptions,
+} from "./providers/kimiAuth.js";
 
 export {
   sideQuery,
@@ -117,11 +139,16 @@ export {
   telemetryDir,
   type FrictionTurn,
   type FrictionSummary,
+  type FrictionSource,
+  type FrictionDiagnostic,
+  type FrictionSessionLocation,
+  type FrictionRecorderOptions,
 } from "./frictionLog.js";
 
 export {
   ContinuousVerifier,
   deriveNarrowVerify,
+  deriveScopedVerify,
   findRelatedTestFiles,
   triageVerifyOutput,
   type VerifierOptions,
@@ -131,7 +158,64 @@ export {
   type WorkspaceSetup,
   type CommandRunner,
   type VerifyCacheStats,
+  type VerificationEvidenceSnapshot,
 } from "./verifier.js";
+
+export {
+  buildRepositoryMap,
+  renderRepositoryMap,
+  repositoryMapReminder,
+  type RepositoryMap,
+  type RepositoryPackageMap,
+  type RepositoryMapOptions,
+} from "./repoCartography.js";
+
+export {
+  CodingJournal,
+  normalizeFailure,
+  failureDigest,
+  type CodingJournalOptions,
+  type CodingJournalState,
+  type CodingPhase,
+  type CodingCheckRecord,
+  type CodingFailureRecord,
+} from "./codingJournal.js";
+
+export {
+  registerSessionLocation,
+  listRegisteredSessionLocations,
+  readSessionLocation,
+  writeSessionLocationAtomic,
+  sessionLocationRegistryDir,
+  sessionLocationFile,
+  hashWorkspaceIdentity,
+  type SessionLocation,
+  type SessionLocationRecord,
+  type SessionLocationSource,
+  type SessionRolloutFormat,
+  type RegisterSessionLocationInput,
+  type SessionRegistryOptions,
+} from "./sessionRegistry.js";
+
+export {
+  runReliabilityTriage,
+  listReliabilityFindings,
+  loadReliabilityFinding,
+  resolveReliabilitySource,
+  updateReliabilityFindingStatus,
+  reliabilityTriagePaths,
+  type ReliabilityFindingStatus,
+  type ReliabilitySeverity,
+  type ReliabilityCategory,
+  type ReliabilitySignalKind,
+  type ReliabilityEvidence,
+  type ReliabilityFinding,
+  type ReliabilityTriageHealth,
+  type ReliabilityTriageCoverage,
+  type ReliabilityTriageRun,
+  type ReliabilityTriageOptions,
+  type ReliabilityTriagePaths,
+} from "./reliabilityTriage.js";
 
 export {
   HookManager,
@@ -156,6 +240,7 @@ export {
 export {
   connectMcpServer,
   disconnectMcpServer,
+  setMcpServerEnabled,
   getMcpAccessToken,
   loadRemoteMcpServers,
   connectorNameFromUrl,
@@ -200,12 +285,17 @@ export {
   authFilePath,
   aresHome,
   deviceCodeLogin,
+  runOpenAILoginFlow,
+  refreshOpenAIToken,
+  fetchCodexModels,
+  type CodexModel,
   type AuthToken,
   type AuthStatus,
   type AuthMode,
   type AuthSource,
   type DeviceCodeChallenge,
   type DeviceCodeLoginOptions,
+  type OpenAILoginOptions,
 } from "./providers/openaiAuth.js";
 
 export {
@@ -213,10 +303,12 @@ export {
   DEFAULT_OLLAMA_SLOTS,
   OLLAMA_CLOUD_MODELS,
   ollamaCloudModelsFor,
+  fetchOllamaLibraryModels,
   type SlotName,
   type SlotConfig,
   type OllamaCloudPoolOptions,
   type OllamaCloudModel,
+  type OllamaLibraryModel,
 } from "./providers/ollamaCloud.js";
 
 export {

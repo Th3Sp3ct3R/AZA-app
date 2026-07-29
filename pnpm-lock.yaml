@@ -43,6 +43,16 @@ importers:
         specifier: ^0.1.7
         version: 0.1.9
 
+  packages/browser-extension: {}
+
+  packages/browser-extension-connector:
+    dependencies:
+      '@ares/connectors':
+        specifier: workspace:*
+        version: link:../connectors
+
+  packages/browser-host: {}
+
   packages/channels:
     dependencies:
       '@ares/protocol':
@@ -61,6 +71,9 @@ importers:
       '@ares/agent':
         specifier: workspace:*
         version: link:../agent
+      '@ares/browser-extension-connector':
+        specifier: workspace:*
+        version: link:../browser-extension-connector
       '@ares/channels':
         specifier: workspace:*
         version: link:../channels

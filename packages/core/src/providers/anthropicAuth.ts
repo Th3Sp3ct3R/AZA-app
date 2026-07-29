@@ -99,17 +99,26 @@ export async function runAnthropicLoginFlow(
   openUrl: (url: string) => void,
   fetchImpl: typeof fetch = fetch,
   timeoutMs = 300_000,
+  force = false,
 ): Promise<AnthropicOAuthTokens> {
-  const existing = await loadAnthropicTokens();
-  if (existing?.accessToken && Date.now() < existing.expiresAt - 60_000) {
-    await saveAnthropicTokens(existing);
-    return existing;
-  }
-  if (existing?.refreshToken) {
-    try {
-      return await refreshAnthropicTokens(existing, fetchImpl);
-    } catch {
-      // A rejected refresh token should fall through to an interactive login.
+  // `force` is what an explicit "Sign in" click means: always run the real
+  // browser flow. Without it, a stored token that still LOOKS alive (or a
+  // refresh that succeeds against a limit-broken account) short-circuits and
+  // the owner can never re-authenticate or switch accounts.
+  if (force) {
+    await clearAnthropicTokens().catch(() => undefined);
+  } else {
+    const existing = await loadAnthropicTokens();
+    if (existing?.accessToken && Date.now() < existing.expiresAt - 60_000) {
+      await saveAnthropicTokens(existing);
+      return existing;
+    }
+    if (existing?.refreshToken) {
+      try {
+        return await refreshAnthropicTokens(existing, fetchImpl);
+      } catch {
+        // A rejected refresh token should fall through to an interactive login.
+      }
     }
   }
 

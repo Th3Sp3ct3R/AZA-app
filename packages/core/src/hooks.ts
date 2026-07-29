@@ -108,6 +108,23 @@ async function runHookCommand(
   input: HookRunInput,
 ): Promise<{ exitCode: number | null; output: string }> {
   return new Promise((resolve) => {
+    // Full payload goes on STDIN as one JSON line — env vars have a hard size
+    // limit (~32KB/var on Windows) and a big tool input/output used to blow the
+    // whole env block, failing the spawn, which the caller then treated as a
+    // DENY. The env copies remain for simple hooks but are size-capped so they
+    // can never crash the spawn again; a hook that needs the full data reads
+    // stdin.
+    const fullInput = safeJson(input.input);
+    const fullOutput = safeJson(input.output);
+    const stdinPayload = safeJson({
+      event: input.event,
+      tool: input.toolName ?? "",
+      input: input.input ?? {},
+      output: input.output ?? {},
+      workspace: input.workspace,
+    });
+    const ENV_CAP = 8192; // well under the per-var limit, with headroom
+    const capEnv = (s: string) => (s.length > ENV_CAP ? "" : s); // empty = "read stdin"
     const child = spawn(hook.command, {
       cwd: input.workspace,
       shell: true,
@@ -116,10 +133,17 @@ async function runHookCommand(
         ...process.env,
         ARES_HOOK_EVENT: input.event,
         ARES_HOOK_TOOL: input.toolName ?? "",
-        ARES_HOOK_INPUT: safeJson(input.input),
-        ARES_HOOK_OUTPUT: safeJson(input.output),
+        ARES_HOOK_INPUT: capEnv(fullInput),
+        ARES_HOOK_OUTPUT: capEnv(fullOutput),
+        // Signals to the hook that the full JSON is on stdin (always true).
+        ARES_HOOK_STDIN: "1",
       },
     });
+    // Deliver the payload and close stdin; ignore EPIPE if the hook doesn't read.
+    try {
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(stdinPayload + "\n");
+    } catch { /* hook closed stdin early */ }
     let output = "";
     const append = (chunk: Buffer) => {
       output += chunk.toString("utf8");

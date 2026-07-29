@@ -272,10 +272,10 @@ export function makeConductorTool(deps: ConductorToolDeps) {
   return buildTool({
     name: "Conductor",
     description: CONDUCTOR_DESCRIPTION,
-    // The wrapper is read-only; child forks enforce their own per-tool
-    // permissions inside their scoped engines (and the runtime strips
-    // human-gated tools from a leaf's catalog under the unattended posture).
-    safety: "read-only",
+    // Build phases and worktree merges can write the parent workspace. A
+    // conservative parent checkpoint lets Session derive the exact merged diff
+    // and schedule one authoritative parent-level verification generation.
+    safety: "workspace-write",
     // It owns its own internal fan-out, so it must solo (no engine-level batching).
     concurrency: "exclusive",
     // Fleets legitimately run minutes; bounded by the parent's deadline signal.
@@ -408,16 +408,17 @@ export function makeConductorTool(deps: ConductorToolDeps) {
 
 const CONDUCTOR_DESCRIPTION = `Author and run a deterministic agent FLEET for work with structure the model-driven Task tool can't guarantee: capped parallel fan-out, typed multi-stage pipelines, schema-validated outputs, build phases that write code, and a token budget.
 
-EASY MODE (preferred for builds): set "plan" to a ONE-LINE goal — e.g. {"plan":"build a browser multiplayer FPS with Node/Vite"} — and the planner expands it into a WIDE research→plan→build→verify fleet for you. Omit "phases" when you use "plan". This is the right call for "build me X": you get a deep, tooled, self-verifying fleet without hand-authoring it.
+EASY MODE (preferred for builds): set "plan" to a ONE-LINE goal — e.g. {"plan":"build a browser multiplayer FPS with Node/Vite"} — and the planner expands it into an adaptive research→plan→build→verify fleet. Omit "phases" when you use "plan". This is the right call for "build me X": you get a tooled, self-verifying fleet without hand-authoring it.
 
 ADVANCED: emit "phases" yourself. Either way a deterministic runtime executes it start-to-finish — it owns concurrency, cancellation, schema retries, the pipeline hand-off barrier, build-phase write tools, and the budget. You do NOT manage the fan-out turn-by-turn.
 
-REACH FOR THIS for any non-trivial BUILD or research task. DECOMPOSE DEEPLY — fan
-5-16 agents across phases, not 3-4. A 3-agent fleet is a review panel, NOT a build:
-for "build me X", structure it as research (parallel, wide) → plan (pipeline) →
-build (parallel, file-disjoint modules) → verify (a stage that runs the build/tests
-and fails closed). Under-decomposing into a few agents is the #1 way a fleet
-underdelivers — when in doubt, fan WIDER and add a verify phase.
+REACH FOR THIS when a task has genuinely independent research questions,
+file-disjoint implementation boundaries, or a staged integration/repair loop.
+Default to 3-8 agents total and use fewer when the ownership graph is small;
+exceed 8 only when the repository really has that many independent boundaries.
+For "build me X", structure it as focused research → integration plan →
+file-disjoint build → independent verify/repair. More agents are not progress
+unless each owns distinct evidence or code.
 
 WHEN TO USE — fan out ONLY for parallelizable read/search/analysis work or isolated write shards (disjoint files/dirs):
 - Build something real: research the stack in parallel, then build modules in parallel, then verify.

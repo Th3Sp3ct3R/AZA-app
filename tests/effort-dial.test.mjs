@@ -73,6 +73,47 @@ test("guard: a healthy stream passes through untouched", async () => {
   assert.deepEqual(events.map((e) => e.type), ["text_delta", "message_done"]);
 });
 
+test("guard: heartbeats keep a silent prefill alive and never reach the consumer", async () => {
+  // A long cache-write prefill sends only pings for longer than the idle
+  // window; the request is alive and must not be cut. Heartbeats are guard
+  // food, not output — the consumer never sees them.
+  let stalled = false;
+  async function* prefillThenAnswer() {
+    for (let i = 0; i < 5; i++) {
+      await new Promise((r) => setTimeout(r, 40));
+      yield { type: "stream_heartbeat" };
+    }
+    yield { type: "text_delta", text: "hi" };
+    yield msgDone("hi");
+  }
+  const events = [];
+  for await (const ev of guardStreamStalls(prefillThenAnswer(), { idleMs: 100, thinkCeilingMs: 10_000, onStall: () => (stalled = true) })) {
+    events.push(ev);
+  }
+  assert.equal(stalled, false);
+  assert.deepEqual(events.map((e) => e.type), ["text_delta", "message_done"]);
+});
+
+test("guard: heartbeats re-arm but do not widen the pre-output window", async () => {
+  // Pings prove liveness; they are not output. A stream that pings then goes
+  // truly dead is still cut on the SHORT pre-output window, not the generous
+  // post-output one.
+  let stalled = false;
+  async function* pingThenDie() {
+    yield { type: "stream_heartbeat" };
+    yield { type: "stream_heartbeat" };
+    await new Promise(() => {});
+  }
+  const startedAt = Date.now();
+  const events = [];
+  for await (const ev of guardStreamStalls(pingThenDie(), { idleMs: 100, activeIdleMs: 5_000, thinkCeilingMs: 10_000, onStall: () => (stalled = true) })) {
+    events.push(ev);
+  }
+  assert.ok(stalled);
+  assert.equal(events.at(-1).error.code, "stream_stall");
+  assert.ok(Date.now() - startedAt < 2_000, "cut on the pre-output window, not activeIdleMs");
+});
+
 // ── engine integration: stall → downgrade → same-turn retry ──────────
 
 test("engine: reasoning stall downgrades one notch and the turn completes", async () => {
@@ -157,6 +198,31 @@ test("engine: ARES_STALL_DOWNGRADE=0 retries at the same level", async () => {
   }
 });
 
+test("engine: an empty premature provider close retries and completes", async () => {
+  let calls = 0;
+  const provider = {
+    name: "close-once",
+    async *stream() {
+      calls++;
+      if (calls === 1) return;
+      yield { type: "text_delta", text: "recovered" };
+      yield msgDone("recovered");
+    },
+  };
+  const engine = new QueryEngine(
+    { provider, model: "test", systemPrompt: "test", tools: [], workspace: "D:\\Ares", maxTurns: 2 },
+    "sess_close_retry",
+  );
+  engine.appendUserMessage("keep working");
+  const events = [];
+  for await (const ev of engine.streamTurn()) events.push(ev);
+
+  assert.equal(calls, 2, "the empty close is retried once");
+  assert.equal(events.at(-1)?.status, "completed");
+  assert.ok(events.some((e) => e.type === "system_reminder_injected" && /no_message_done/.test(e.text)));
+  assert.ok(!events.some((e) => e.type === "error"), "a recovered close is not shown as a failure");
+});
+
 test("guard: post-output silence gets the ACTIVE window, not the pre-output cutoff", async () => {
   // The Minecraft-clone regression: model streams text, then goes silent while
   // composing a big buffered Write. The old guard cut at idleMs and killed a
@@ -186,4 +252,23 @@ test("guard: pre-output hang still cuts fast even with a generous active window"
   }
   assert.ok(stalled);
   assert.equal(events[0].error.code, "stream_stall");
+});
+
+test("guard: silence AFTER thinking gets the generous window, not the pre-output cutoff", async () => {
+  // The surface-build regression: the model streams reasoning, then goes quiet
+  // for longer than the short pre-output idle while composing a huge canvas
+  // program. The connection is demonstrably alive (thinking arrived), so the
+  // pause must be tolerated up to the thinking ceiling — not cut at idleMs.
+  async function* reasonThenCompose() {
+    yield { type: "thinking_delta", text: "planning the castle…" };
+    await new Promise((r) => setTimeout(r, 200)); // silent 200ms >> idleMs (60)
+    yield { type: "text_delta", text: "<canvas>" };
+    yield msgDone("<canvas>");
+  }
+  const events = [];
+  for await (const ev of guardStreamStalls(reasonThenCompose(), { idleMs: 60, activeIdleMs: 5_000, thinkCeilingMs: 4_000, onStall: () => {} })) {
+    events.push(ev);
+  }
+  assert.ok(events.every((e) => e.type !== "error"), "alive-after-thinking pause must not be cut");
+  assert.equal(events.at(-1).type, "message_done");
 });

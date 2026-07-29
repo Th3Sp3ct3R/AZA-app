@@ -1,6 +1,6 @@
 // Extracted from entry.ts — sessionFactory.
 
-import { Session, ContinuousVerifier, HookManager, loadStartupReminders, loadSessionSnapshot, type EngineTool, sideQuery, collectTrimmedFilePaths } from "@ares/core";
+import { Session, ContinuousVerifier, HookManager, CodingJournal, loadStartupReminders, loadSessionSnapshot, type EngineTool, sideQuery, collectTrimmedFilePaths } from "@ares/core";
 import path from "node:path";
 import { TodoStore, ShellRegistry, type FileReadStamp } from "@ares/tools";
 import type { ContentBlock, Message, PermissionPromptDecision, ReasoningLevel } from "@ares/protocol";
@@ -44,6 +44,11 @@ export interface LiveSession {
   resumed?: ResumedSessionInfo;
   /** V6: living-memory ids injected into the current turn — settled at turn end. */
   lastRecallIds?: string[];
+  /** Lazy coding-only repository cartography cadence. */
+  repositoryMapCodingTurns?: number;
+  repositoryMapLastTurn?: number;
+  repositoryMapTouchedCount?: number;
+  repositoryMapText?: string;
   /** V5: the user message of the current turn, for the Witness snapshot. */
   lastUserMessage?: string;
   /** Terminal auto-routing lane currently owning this conversation. */
@@ -54,6 +59,8 @@ export interface LiveSession {
    *  (no-arg) and /settings reported the env/persisted value, not what the engine
    *  is actually streaming with. */
   reasoningLevel: ReasoningLevel;
+  /** Structured coding state that survives compaction and process restart. */
+  codingJournal: CodingJournal;
 }
 
 /**
@@ -73,7 +80,7 @@ async function confirmTurnEndWith(
     .drainReminders()
     .map((r) => ({ text: `${r.text}
 
-Fix this before finishing — your edits this turn caused it.`, source: "verifier" as const }));
+Fix this before finishing. The edited scope is red; establish whether this change introduced the failure or it is a documented baseline issue, and provide evidence either way.`, source: "verifier" as const }));
 }
 
 export async function createSession(
@@ -198,13 +205,92 @@ export function isProviderFatalError(err: { code?: string; message?: string } | 
   );
 }
 
+/**
+ * Does this model see pixels? Best-known per-model-id vision capability, same
+ * pattern style as modelContextWindow above. This exists because NOTHING else
+ * threads vision metadata to the live turn — a user pasted a screenshot into a
+ * pinned deepseek-v4-pro session and got "Can't view the image format
+ * directly" while the app happily shipped the image to a blind model
+ * (sess_e4c6022d). Conservative: unknown ids default to false so we never
+ * skip escalation for a model that turns out blind.
+ */
+export function modelLikelyHasVision(modelId: string): boolean {
+  const id = (modelId ?? "").toLowerCase();
+  // Text-only families first — some ids would otherwise match broader patterns.
+  if (/deepseek|gpt-oss|glm-|kimi-k|qwen3-coder|qwen3-next|minimax|gpt-3\.5|o1-mini|o3-mini/.test(id) && !/vl|vision/.test(id)) return false;
+  if (/claude|sonnet|opus|haiku|fable|mythos/.test(id)) return true;
+  if (/gpt-4o|gpt-4\.1|gpt-4-turbo|gpt-5|\bo3\b|\bo4\b|o3-pro|o4-mini/.test(id)) return true;
+  if (/gemini|gemma3|gemma-3/.test(id)) return true;
+  if (/qwen.{0,3}vl|llava|pixtral|minicpm-v|internvl|phi-4-multimodal|llama-3\.2.*vision|llama-4|grok-[34]/.test(id)) return true;
+  if (/vision|multimodal/.test(id)) return true;
+  return false;
+}
+
+/**
+ * Pick a vision-capable selection for an image turn when the pinned model is
+ * blind. Same candidate philosophy as pickHealthyFallback (never cascade off
+ * the Ares Gateway onto local keys), but the requirement is "can actually see
+ * the pasted image", and a family whose DEFAULT model is blind gets a known
+ * vision model forced instead of being skipped.
+ */
+export async function pickVisionFallback(
+  current: ProviderSelection,
+  dead: ReadonlySet<string> = new Set(),
+): Promise<ProviderSelection | null> {
+  const settings = await loadUiSettings().catch(() => null);
+  if (!settings) return null;
+  const currentFamily = providerFamilyForSelection(current);
+  // Gateway users route through the owner's metered keys — silently spending a
+  // DIFFERENT key because they pasted an image defeats the product. Notice-only.
+  if (currentFamily === "ares") return null;
+  const candidates: Array<{ family: string; visionModel?: string; authed: boolean }> = [
+    { family: "anthropic", authed: Boolean(settings.anthropicKey) || Boolean(process.env.ANTHROPIC_API_KEY) || Boolean(process.env.ARES_ANTHROPIC_API_KEY) },
+    // OpenRouter's default may be a text-only route; force a cheap vision model.
+    { family: "openrouter", visionModel: "openai/gpt-4o-mini", authed: Boolean(settings.openRouterKey) },
+  ];
+  for (const c of candidates) {
+    if (dead.has(c.family) || !c.authed) continue;
+    try {
+      const flags = new Map([["provider", c.family]]);
+      let sel = await selectProvider(flags);
+      if (!modelLikelyHasVision(sel.model)) {
+        if (!c.visionModel) continue;
+        sel = await selectProvider(new Map([["provider", c.family], ["model", c.visionModel]]));
+      }
+      return sel;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+/**
+ * Terminal-path vision guard (no daemon routing available): when the turn
+ * carries image blocks and the active model is blind, queue an honesty
+ * reminder so the model says so instead of hallucinating the image.
+ * The daemon path does full one-turn escalation; this is the floor.
+ */
+export function guardVisionForTurn(live: LiveSession, content: readonly ContentBlock[]): void {
+  if (!content.some((block) => block.type === "image")) return;
+  if (modelLikelyHasVision(live.selection.model)) return;
+  live.queueSystemReminder(
+    `The user attached an image, but the current model (${live.selection.model}) cannot see images. Say so plainly, suggest switching to a vision-capable model (Claude, GPT-4o, or Gemini), and work from the user's text only. Do NOT guess at the image's contents.`,
+    "hook",
+  );
+}
+
 /** Pick a healthy provider to fall back to when the current one is failing.
  *  Prefers Anthropic (most tool-reliable) when it's authenticated and isn't the
  *  one that just failed. Returns null when there's no better option. */
 export async function pickHealthyFallback(
   current: ProviderSelection,
   dead: ReadonlySet<string> = new Set(),
+  options: { allowCrossProvider?: boolean } = {},
 ): Promise<ProviderSelection | null> {
+  // Manual model selection is a pin, not a suggestion. Cross-provider failover
+  // is only legal when the owner explicitly enables Auto routing.
+  if (options.allowCrossProvider !== true) return null;
   const settings = await loadUiSettings().catch(() => null);
   if (!settings) return null;
   const currentFamily = providerFamilyForSelection(current);
@@ -248,12 +334,18 @@ export function chatContextBudget(selection: ProviderSelection): number {
   const env = Number(process.env.ARES_CONTEXT_BUDGET);
   if (Number.isFinite(env) && env > 0) return Math.floor(env);
   const windowTokens = modelContextWindow(selection.model);
-  // The cap exists so a mistake in the window table can't produce an absurd
-  // prompt; at 800k it no longer strangles genuine 1M-window models (Opus 4.8,
-  // DeepSeek v4, GLM 5.1) down to a fifth of their capacity. Long sessions on
-  // 1M models cost real money — pin ARES_CONTEXT_BUDGET(_CAP) to spend less.
-  const cap = Number(process.env.ARES_CONTEXT_BUDGET_CAP) || 800_000;
-  return Math.max(32_000, Math.min(Math.floor(windowTokens * 0.75), cap));
+  // A large advertised window is an upper bound, not a spending target. The
+  // old 800k default let a handful of tool rounds report millions of replayed
+  // input tokens. Keep a generous working set and make giant-window sessions
+  // an explicit opt-in through ARES_CONTEXT_BUDGET(_CAP).
+  const cap = Number(process.env.ARES_CONTEXT_BUDGET_CAP) || 192_000;
+  // Practical serving ceiling: ollama-cloud REJECTS or silently stalls on
+  // prompts far below deepseek's marketing window — a session that grew to
+  // ~335k input tokens got hard-rejected, then the retry stalled 90s×2+ (bug
+  // 4a8ac088). Budget to what the serving layer actually handles so compaction
+  // fires long before the provider chokes. ARES_CONTEXT_BUDGET overrides.
+  const providerCap = /ollama/i.test(selection.provider?.name ?? "") ? 160_000 : Number.POSITIVE_INFINITY;
+  return Math.max(32_000, Math.min(Math.floor(windowTokens * 0.75), cap, providerCap));
 }
 
 /**
@@ -397,10 +489,11 @@ export async function createSessionWithSelection(
   };
   const shellRegistry = new ShellRegistry();
   const todoStore = new TodoStore();
+  let codingJournal: CodingJournal | undefined;
   const verifier = new ContinuousVerifier({
     workspace: context.workspace,
     onEvent: (event) => {
-      void event;
+      codingJournal?.recordVerifyEvent(event);
     },
   });
   const hooks = await HookManager.load(context.workspace);
@@ -454,6 +547,7 @@ export async function createSessionWithSelection(
     const snapshot = await loadSessionSnapshot(context.workspace, resumeSessionId, {
       maxMessages: resumeMessageLimit(),
     });
+    todoStore.replace(snapshot.todos);
     const session = new Session({
       workspace: context.workspace,
       provider: selection.provider,
@@ -467,7 +561,14 @@ export async function createSessionWithSelection(
       hookManager: hooks,
       sessionMeta: snapshot.meta,
       initialMessages: snapshot.messages,
+      initialTodos: snapshot.todos,
       initialSeq: snapshot.nextSeq,
+      requireVerificationEvidence: process.env.ARES_CODING_PROOF_GATE !== "0",
+      verificationEvidence: () => verifier.evidenceSnapshot(),
+      outstandingVerificationRequired: () => codingJournal?.verificationRequiredForCurrentTurn() ?? false,
+      persistedVerificationDebt: () => codingJournal?.persistedVerificationDebtForCurrentTurn() ?? false,
+      persistedVerificationScopeComplete: () => codingJournal?.persistedVerificationScopeCompleteForCurrentTurn() ?? true,
+      observedMutationAt: () => codingJournal?.latestObservedMutationAtForCurrentTurn() ?? 0,
       selfTerritoryRoots: context.selfTerritoryRoots,
       reasoningLevel: resolveReasoningLevel(settings),
       maxOutputTokens: chatMaxOutputTokens(selection),
@@ -477,6 +578,8 @@ export async function createSessionWithSelection(
       summarizeSpan,
     });
     sessionRef = session;
+    codingJournal = await CodingJournal.open({ workspace: context.workspace, sessionId: session.meta.id });
+    session.observeEvents((event) => codingJournal?.recordTurnEvent(event));
     const live: LiveSession = {
       session,
       selection,
@@ -497,6 +600,7 @@ export async function createSessionWithSelection(
       tools,
       queueSystemReminder,
       reasoningLevel: resolveReasoningLevel(settings),
+      codingJournal,
     };
     live.agentRuntime = new AresAgentRuntime(agent, {
       workspace: context.workspace,
@@ -516,6 +620,12 @@ export async function createSessionWithSelection(
     requestPermission,
     drainSystemReminders,
     confirmTurnEnd: () => confirmTurnEndWith(verifier),
+    requireVerificationEvidence: process.env.ARES_CODING_PROOF_GATE !== "0",
+    verificationEvidence: () => verifier.evidenceSnapshot(),
+    outstandingVerificationRequired: () => codingJournal?.verificationRequiredForCurrentTurn() ?? false,
+    persistedVerificationDebt: () => codingJournal?.persistedVerificationDebtForCurrentTurn() ?? false,
+    persistedVerificationScopeComplete: () => codingJournal?.persistedVerificationScopeCompleteForCurrentTurn() ?? true,
+    observedMutationAt: () => codingJournal?.latestObservedMutationAtForCurrentTurn() ?? 0,
     recallFailureFix: (input) => recallFailureFixFromMemory(context.mind.memoryFile, input),
     hookManager: hooks,
     selfTerritoryRoots: context.selfTerritoryRoots,
@@ -527,7 +637,9 @@ export async function createSessionWithSelection(
     summarizeSpan,
   });
   sessionRef = session;
-  const live: LiveSession = { session, selection, context, runtime, verifier, hooks, shellRegistry, todoStore, tools, queueSystemReminder, reasoningLevel: resolveReasoningLevel(settings) };
+  codingJournal = await CodingJournal.open({ workspace: context.workspace, sessionId: session.meta.id });
+  session.observeEvents((event) => codingJournal?.recordTurnEvent(event));
+  const live: LiveSession = { session, selection, context, runtime, verifier, hooks, shellRegistry, todoStore, tools, queueSystemReminder, reasoningLevel: resolveReasoningLevel(settings), codingJournal };
   live.agentRuntime = new AresAgentRuntime(agent, {
     workspace: context.workspace,
     sessionId: session.meta.id,

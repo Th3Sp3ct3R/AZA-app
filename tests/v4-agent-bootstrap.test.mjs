@@ -26,6 +26,8 @@ test("V4 V1: ensureAgentScaffold creates bootstrap and workspace TOOLS.md withou
   assert.equal(state.required, true);
   assert.match(await fs.readFile(path.join(home, "BOOTSTRAP.md"), "utf8"), /I just came online/);
   assert.match(await fs.readFile(workspaceToolsPath(workspace), "utf8"), /pnpm verify/);
+  assert.match(await fs.readFile(path.join(home, "skills", "browser-x", "SKILL.md"), "utf8"), /verify the posted text/);
+  assert.match(await fs.readFile(path.join(home, "skills", "browser-discord", "SKILL.md"), "utf8"), /closed DM/);
 });
 
 test("V4 V1: completeBootstrap writes identity files atomically and deletes BOOTSTRAP.md", async () => {
