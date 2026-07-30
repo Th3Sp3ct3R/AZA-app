@@ -88,6 +88,16 @@ test("cdp: a configured-but-unreachable endpoint falls back to launching", async
   assert.ok(pw.calls.launch.length >= 1);
 });
 
+test("handshake: attach-only failure never launches a replacement browser", async () => {
+  const pw = fakePw({ cdp: "fail", launch: "ok" });
+  await assert.rejects(
+    () => acquireBrowserPage(pw, { ...base, cdpUrl: "http://127.0.0.1:9222", requireCdp: true }),
+    /BROWSER_ATTACH_UNAVAILABLE/,
+  );
+  assert.deepEqual(pw.calls.connect, ["http://127.0.0.1:9222"]);
+  assert.equal(pw.calls.launch.length, 0, "an attach handshake must never substitute a different browser");
+});
+
 // ── 3. No CDP URL → current behavior unchanged (no connect, straight to launch) ─
 
 test("no cdp: behavior is unchanged — straight to the launch chain, no connect", async () => {

@@ -64,6 +64,21 @@ export async function safeOverwrite(opts: SafeOverwriteOptions): Promise<SafeOve
   await fs.writeFile(opts.absPath, opts.content, "utf8");
   const stat = await fs.stat(opts.absPath);
 
+  // Post-write readback: writeFile resolving is NOT proof the bytes landed —
+  // cloud-sync filesystems (OneDrive placeholders) have produced files that
+  // read back EMPTY while the tool reported success, sending the agent down
+  // "why is my scene blank" rabbit holes. Verify what's actually on disk.
+  const expectedBytes = Buffer.byteLength(opts.content, "utf8");
+  if (stat.size !== expectedBytes) {
+    const readback = await fs.readFile(opts.absPath, "utf8").catch(() => null);
+    if (readback !== opts.content) {
+      throw new Error(
+        `${opts.label}: post-write verification failed for ${opts.absPath} — expected ${expectedBytes} bytes but the file on disk has ${stat.size}. ` +
+          `The filesystem (cloud-sync folder?) did not persist the content. Retry the write; if it keeps failing, work outside the synced folder.`,
+      );
+    }
+  }
+
   return { bytesWritten: stat.size, created: original === null, backupPath };
 }
 

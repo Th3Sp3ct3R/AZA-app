@@ -48,6 +48,18 @@ const inputSchema = z
       .string()
       .optional()
       .describe("Why this skill is being crafted. Logged for traceability."),
+    provides: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Capabilities this skill SUPPLIES to Ares, so a toggled-on skill can override a built-in. Currently 'tts' (text-to-speech). THE TTS PROVIDER CONTRACT (stable — build any voice engine against it): the handler answers two ops. (1) input {op:'voices'} → {ok:true, voices:[{id,label,gender?,description?}], default?}. (2) input {op:'tts', text, voice, speed} → {ok:true, audio:'<base64>', mime:'<container>'}. `audio` is base64 of a WHOLE encoded audio file in ANY standard container — audio/wav (any sample rate/bit depth), audio/mpeg (mp3), audio/ogg (opus/vorbis), audio/flac, audio/webm. The desktop decodes it with the Web Audio API, so you do NOT resample, do NOT hand-patch WAV headers, and do NOT match a specific rate — just return the engine's native bytes + the right mime. On error return {ok:false, error}. This works identically for a local binary (Piper/Kokoro/Coqui) or an HTTP API (ElevenLabs/OpenAI/Azure) — fetch/spawn, base64 the response bytes, set mime. When enabled, Ares speaks through this instead of the built-in voice. ALSO 'stt' (speech-to-text) — THE STT PROVIDER CONTRACT: the handler answers input {op:'transcribe', audio:'<base64>', mime:'<container>'} → {ok:true, text:'<transcript>'}; audio is a whole recorded clip (typically audio/webm opus from the mic). Works for whisper.cpp, Deepgram, any engine. When enabled, Ares transcribes the mic through it.",
+      ),
+    surfaces: z
+      .array(z.object({ id: z.string(), label: z.string(), icon: z.string().optional(), input: z.unknown().optional(), hint: z.string().optional() }))
+      .optional()
+      .describe(
+        "UI buttons this skill contributes to the active-skills tray. Each button, when clicked, runs THIS skill's handler with its `input` (a surface can only invoke its own skill). e.g. [{id:'brief', label:'Daily brief', icon:'📋', input:{op:'brief'}}].",
+      ),
   })
   .strict();
 
@@ -64,7 +76,8 @@ export interface SkillCraftOutput {
 export const SkillCraftTool = buildTool({
   name: "SkillCraft",
   description:
-    "Forge your own skills under ~/.ares/skills/. When you notice a capability gap — something you'll need to do that you don't have a clean path for yet — scaffold a skill instead of asking. A skill is just SKILL.md (description, usage, examples) plus optional handler.js. `create` scaffolds a contract-correct starter handler.js for you (ESM default export `async (input, ctx) => result`, tolerant input parsing) — fill it in rather than re-deriving the shape; `import` and `require` both work, and `input` is whatever JSON you pass to RunSkill. After crafting, append the skill name to CAPABILITIES.md via SelfEvolve. You can also update / remove / list / read your own skills. This is part of your self-extension: you grow your own body.",
+    "Forge your own skills under ~/.ares/skills/. When you notice a capability gap — something you'll need to do that you don't have a clean path for yet — scaffold a skill instead of asking. A skill is just SKILL.md (description, usage, examples) plus optional handler.js. `create` scaffolds a contract-correct starter handler.js for you (ESM default export `async (input, ctx) => result`, tolerant input parsing) — fill it in rather than re-deriving the shape; `import` and `require` both work, and `input` is whatever JSON you pass to RunSkill. After crafting, append the skill name to CAPABILITIES.md via SelfEvolve. You can also update / remove / list / read your own skills. This is part of your self-extension: you grow your own body. " +
+    "HARD RULES for skills that spawn OS processes/windows: (1) any window/app the skill opens (Edge --app, Start-Process, etc.) MUST be tracked (record the PID) and closed by the skill's stop/cleanup action — a fire-and-forget window orphans a dead grey rectangle on the user's screen when its backing server dies; (2) any local server the skill starts must have a stop action that ALSO closes windows pointing at it; (3) web UIs a skill serves must render a visible error state when their backend is unreachable, never a blank page.",
   safety: "workspace-write",
   concurrency: "exclusive",
   inputZod: inputSchema,
@@ -125,7 +138,7 @@ export const SkillCraftTool = buildTool({
     }
 
     await fs.mkdir(skillDir, { recursive: true });
-    const skillMdBody = input.skill_md ?? defaultSkillMd(input.name, input.description ?? "");
+    const skillMdBody = input.skill_md ?? defaultSkillMd(input.name, input.description ?? "", input.provides, input.surfaces);
     await writeFileAtomic(skillMdPath, ensureTrailingNewline(skillMdBody));
     const touched: string[] = [skillMdPath];
     // On create, scaffold a contract-correct starter handler when none is given —
@@ -196,10 +209,18 @@ async function listSkills(dir: string): Promise<Array<{ name: string; descriptio
   }
 }
 
-function defaultSkillMd(name: string, description: string): string {
+function defaultSkillMd(
+  name: string,
+  description: string,
+  provides?: string[],
+  surfaces?: Array<{ id: string; label: string; icon?: string; input?: unknown; hint?: string }>,
+): string {
+  const providesLine = provides && provides.length ? `\nprovides: ${provides.join(", ")}` : "";
+  // surfaces MUST be a single JSON line — the frontmatter reader is line-based.
+  const surfacesLine = surfaces && surfaces.length ? `\nsurfaces: ${JSON.stringify(surfaces)}` : "";
   return `---
 name: ${name}
-description: ${description}
+description: ${description}${providesLine}${surfacesLine}
 ---
 
 # ${name}
@@ -243,6 +264,9 @@ function defaultHandlerJs(name: string): string {
 //               bare string, an object, or undefined, so parse defensively below.
 //       ctx   = { home, name }  (your Ares home dir + this skill's name)
 //   • Return any JSON-serializable value — it becomes RunSkill's \`result\`.
+//   • Network skills must bind ctx.host + ctx.port (also ARES_SKILL_HOST /
+//     ARES_SKILL_PORT and HOST / PORT). Ares leases that loopback port from the
+//     OS for this run; never hardcode a service port.
 //   • Heavy work (image/video/model calls): pass a generous \`timeout_ms\` to
 //     RunSkill (it self-caps on that — a too-small value is the only early abort).
 

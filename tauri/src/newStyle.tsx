@@ -15,14 +15,23 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
 import { motion, useReducedMotion, useSpring, useTransform } from "framer-motion";
 
-export type UiStyle = "legacy" | "new";
+export type UiStyle = "legacy" | "new" | "modern";
 
 /** Provided at the app root from prefs.uiStyle. Defaults to legacy so any
  *  stray render outside the provider stays on the untouched path. */
 export const StyleCtx = createContext<UiStyle>("legacy");
 
+/** True for every non-legacy skin. "modern" (the glass-forge reskin) keeps all
+ *  the Forged runtime behaviors — springs, gauges, token flow — and restyles
+ *  the surfaces in CSS (modern.css, scoped under data-style="modern"). */
 export function useNewStyle(): boolean {
-  return useContext(StyleCtx) === "new";
+  return useContext(StyleCtx) !== "legacy";
+}
+
+/** The raw skin, for the few places that must render different MARKUP (not just
+ *  different CSS) — e.g. the composer swapping its glyphs for Ares sigils. */
+export function useUiStyle(): UiStyle {
+  return useContext(StyleCtx);
 }
 
 // ─── SpringNumber — a numeric readout that glides instead of jumping ────────
@@ -101,7 +110,16 @@ export function SpringHeight({
       transition={{ type: "spring", stiffness: 380, damping: 34 }}
       style={{ overflow: "hidden", height: h === null || reduced ? "auto" : undefined }}
     >
-      <div ref={inner}>{children}</div>
+      {/* The animated height is `inner.offsetHeight`, which does NOT include the
+          OUTER element's padding — so any padding on the container makes its
+          content overflow its own box and get clipped by overflow:hidden, worse
+          the taller the content grows. Skins must therefore hang card padding on
+          this inner wrapper (see .springInner in modern.css), never on the
+          animated container. min-width:0 keeps a wide child (a long path, a code
+          fragment) from forcing intrinsic width instead of wrapping. */}
+      <div ref={inner} className="springInner" style={{ minWidth: 0 }}>
+        {children}
+      </div>
     </motion.div>
   );
 }
@@ -123,10 +141,13 @@ export function pushTokenFlow(chars: number): void {
  *  follows tokens/sec (≈ chars/4). One rAF loop, owned here; paused when the
  *  document is hidden and unmounted entirely when the turn isn't busy. */
 export function TokenFlowStrip({ busy }: { busy: boolean }) {
-  const newStyle = useNewStyle();
+  // Forged ONLY. The modern skin says "working" with a single ember sweep under
+  // the composer (pure CSS); dropping this canvas pulse-line on top of it read
+  // as a stray heart-rate monitor shoving the transcript around mid-turn.
+  const forged = useUiStyle() === "new";
   const reduced = useReducedMotion();
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const active = newStyle && busy && !reduced;
+  const active = forged && busy && !reduced;
 
   useEffect(() => {
     if (!active) return;

@@ -38,7 +38,7 @@ import {
   type ToolResultBlock,
   type TurnEvent,
 } from "@ares/protocol";
-import { stringifyModelToolOutput, type QueryEngine, type ToolPermissionRequest } from "@ares/core";
+import { FrictionRecorder, registerSessionLocation, stringifyModelToolOutput, type QueryEngine, type ToolPermissionRequest } from "@ares/core";
 import type { SessionSummary } from "./protocol.js";
 import { garrisonDir } from "./token.js";
 
@@ -103,6 +103,7 @@ interface LiveSession {
   createdAt: string;
   busy: boolean;
   engine: QueryEngine;
+  friction: FrictionRecorder;
   controller: AbortController;
   subscribers: Set<SessionSubscriber>;
   /** Serializes rollout/meta writes so JSONL lines land in event order. */
@@ -182,11 +183,21 @@ export class SessionManager {
       session.engine.appendUserMessage(text);
       for await (const event of session.engine.streamTurn()) {
         this.appendRollout(session, event);
+        session.friction.record(event);
+        // Match Core Session's turn boundary: when a client observes turn_end,
+        // the complete rollout and friction envelope are already durable. This
+        // closes a real reboot/rehydration race exposed by the front-door test.
+        if (event.type === "turn_end") {
+          await Promise.all([session.ioChain, session.friction.settle()]);
+        }
         this.fanOut(session, event);
       }
     } finally {
       session.busy = false;
       if (session.controller.signal.aborted) this.rebuildEngine(session);
+      // Turn completion is the durability boundary for the shared telemetry
+      // plane, matching core Session. Recording stays off the streaming path.
+      await session.friction.settle();
     }
   }
 
@@ -225,7 +236,7 @@ export class SessionManager {
 
   /** Await all queued rollout/meta writes (tests and graceful shutdown). */
   async flush(): Promise<void> {
-    await Promise.all([...this.live.values()].map((s) => s.ioChain));
+    await Promise.all([...this.live.values()].flatMap((s) => [s.ioChain, s.friction.settle()]));
   }
 
   /**
@@ -329,6 +340,19 @@ export class SessionManager {
       signal: controller.signal,
       requestPermission: this.permissionHandlerFor(p.id),
     });
+    const friction = new FrictionRecorder(p.id, {
+      dir: path.join(this.home, "telemetry"),
+      source: "garrison",
+      workspace: made.workspace,
+      provider: made.providerName,
+      model: made.model,
+      location: {
+        registryHome: this.home,
+        rolloutPath: rolloutPath(this.home, p.id),
+        metaPath: metaPath(this.home, p.id),
+        format: "garrison-rollout-v1",
+      },
+    });
     const session: LiveSession = {
       id: p.id,
       title: p.title ?? FALLBACK_TITLE,
@@ -339,6 +363,7 @@ export class SessionManager {
       createdAt: p.createdAt ?? new Date(this.now()).toISOString(),
       busy: false,
       engine: made.engine,
+      friction,
       controller,
       subscribers: new Set(),
       ioChain: fs
@@ -424,6 +449,23 @@ export class SessionManager {
       made.engine.hydrate([...session.engine.history()]);
       session.engine = made.engine;
       session.controller = controller;
+      session.provider = made.providerName;
+      session.model = made.model;
+      session.workspace = made.workspace;
+      session.friction.updateContext({
+        workspace: made.workspace,
+        provider: made.providerName,
+        model: made.model,
+      });
+      void registerSessionLocation({
+        sessionId: session.id,
+        source: "garrison",
+        format: "garrison-rollout-v1",
+        workspace: made.workspace,
+        rolloutPath: rolloutPath(this.home, session.id),
+        metaPath: metaPath(this.home, session.id),
+      }, { home: this.home });
+      this.queueMetaWrite(session);
     } catch {
       // Factory refused: keep the old engine — turns may report interrupted,
       // but the session and its history stay reachable.

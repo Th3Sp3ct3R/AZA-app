@@ -1,6 +1,5 @@
-// 1M-context plumbing — the window table, the budget cap, and the gauge all
-// have to agree, or Opus 4.8 / DeepSeek v4 / GLM 5.1 run at a fifth of their
-// capacity while the fuel needle lies about it.
+// Large-context plumbing — advertised windows stay accurate while the default
+// working set remains cost-safe. Owners can still opt into a larger budget.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { modelContextWindow, chatContextBudget } from "../packages/cli/dist/entry/sessionFactory.js";
@@ -19,13 +18,13 @@ test("non-1M families keep their real windows", () => {
   assert.equal(modelContextWindow("deepseek-v3.1"), 160_000);
 });
 
-test("budget: a 1M model gets 750k (75% of window), not the old 192k strangle", () => {
+test("budget: giant windows use a cost-safe 192k working set unless explicitly raised", () => {
   const prevBudget = process.env.ARES_CONTEXT_BUDGET;
   const prevCap = process.env.ARES_CONTEXT_BUDGET_CAP;
   delete process.env.ARES_CONTEXT_BUDGET;
   delete process.env.ARES_CONTEXT_BUDGET_CAP;
   try {
-    assert.equal(chatContextBudget({ model: "claude-opus-4-8" }), 750_000);
+    assert.equal(chatContextBudget({ model: "claude-opus-4-8" }), 192_000);
     assert.equal(chatContextBudget({ model: "claude-fable-5" }), 150_000, "200k models unchanged");
     process.env.ARES_CONTEXT_BUDGET_CAP = "100000";
     assert.equal(chatContextBudget({ model: "claude-opus-4-8" }), 100_000, "cap env still wins");

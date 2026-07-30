@@ -1383,11 +1383,11 @@ function fleetArchitectPrompt(goal: string, toolNames: string[]): string {
     `Output ONLY a JSON object (no prose, no fences) of shape:\n` +
     `{ "goal": string, "concurrency": number, "phases": [ { "id": string, "kind": "parallel"|"pipeline", "build"?: boolean, "reduce"?: "concat"|"first"|"judge", "agents": [ { "role": string, "prompt": string, "tools"?: string[], "schema"?: object } ] } ] }\n\n` +
     `RULES:\n` +
-    `- DECOMPOSE DEEPLY: 4-8 research agents, then plan, then 3-8 build agents, then verify. Aim for 10-20 agents total. A thin 3-4 agent spec is a FAILURE.\n` +
-    `- Phase 1 'research' (kind:parallel, reduce:judge): N agents each investigating ONE angle (stack, networking, mechanics, assets, etc). Whitelist research tools: ["WebSearch","WebFetch","Read","Grep","Glob"].\n` +
-    `- Phase 2 'plan' (kind:pipeline): 1 agent that turns {{research.reduced}} into a concrete file-by-file build plan. Give it a schema like {"files":["..."],"steps":["..."]}.\n` +
-    `- Phase 3 'build' (kind:pipeline, build:true): one agent PER module/file-group, each FILE-DISJOINT, run serially so they don't clobber. Whitelist ["Read","Write","Edit","Bash","Grep","Glob"]. Each prompt must be self-contained and reference {{plan.reduced}}.\n` +
-    `- Phase 4 'verify' (kind:pipeline, build:true): 1 agent that installs+builds+runs the project via Bash, reports failures, and FIXES them. Whitelist ["Bash","Read","Edit","Write","Grep"].\n` +
+    `- ADAPTIVE SIZE: use the fewest agents that create independent evidence or file-disjoint implementation. Default to 3-8 total. Exceed 8 only for that many genuine ownership boundaries; never add agents to hit a quota.\n` +
+    `- Research (kind:parallel, reduce:judge): 1-3 agents, each answering a distinct question that changes the plan. Prefer repository evidence via ["Read","Grep","Glob"]; use WebSearch/WebFetch only for required external/current facts. Skip broad research when local code already answers the task.\n` +
+    `- Plan (kind:pipeline): 1 integration owner turns evidence into dependency order, explicit file ownership, acceptance checks, and a concrete build plan. Use a schema like {"files":["..."],"steps":["..."],"checks":["..."]}.\n` +
+    `- Build (build:true): partition by subsystem, not arbitrary file count. ONE writer owns a file for the entire fleet; overlapping writers are forbidden. Parallelize only disjoint groups, otherwise pipeline them. Whitelist ["Read","Write","Edit","Bash","Grep","Glob"]. Each prompt states owned files and acceptance criteria.\n` +
+    `- Verify (kind:pipeline, build:true): 1 independent integration agent runs affected checks first, then the broadest practical regression suite; it may fix failures but must report exact commands and unresolved evidence. Whitelist ["Bash","Read","Edit","Write","Grep"].\n` +
     `- Every prompt is STATELESS and self-contained (a leaf sees none of your context). Use {{phaseId.reduced}} / {{prev.field}} to pass work forward.\n` +
     `- Only whitelist tools from this catalog: ${toolNames.join(", ")}.\n` +
     `Return the JSON now.`

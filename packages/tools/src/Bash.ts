@@ -134,12 +134,36 @@ export async function runShell(
 ): Promise<BashOutput> {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
-    const child = spawn(program, args, { cwd, signal, windowsHide: true });
+    // Own abort handling instead of passing `signal` to spawn. On Windows the
+    // built-in path kills only PowerShell/cmd, leaving grandchildren alive with
+    // inherited stdout handles so the Promise never reaches `close`.
+    const child = spawn(program, args, { cwd, windowsHide: true });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let timedOut = false;
+
+    const killTree = () => {
+      if (process.platform === "win32" && child.pid) {
+        spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => {
+          try {
+            child.kill();
+          } catch {
+            /* ignore */
+          }
+        });
+      } else {
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    const onAbort = () => killTree();
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) queueMicrotask(onAbort);
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -177,10 +201,12 @@ export async function runShell(
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       reject(err);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       const stdout = decodeOutput(Buffer.concat(stdoutChunks));
       const stderr = decodeOutput(Buffer.concat(stderrChunks));
       const truncatedOut = stdout.length > MAX_OUTPUT_CHARS;

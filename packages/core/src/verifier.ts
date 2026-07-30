@@ -44,10 +44,10 @@ export interface VerifyResult {
 }
 
 export type VerifyEvent =
-  | { type: "scheduled"; files: string[]; commands: VerifyCommand[] }
-  | { type: "running"; command: VerifyCommand }
-  | { type: "finished"; result: VerifyResult }
-  | { type: "all_finished"; ok: boolean; results: VerifyResult[] };
+  | { type: "scheduled"; files: string[]; commands: VerifyCommand[]; generation?: number }
+  | { type: "running"; command: VerifyCommand; generation?: number }
+  | { type: "finished"; result: VerifyResult; generation?: number }
+  | { type: "all_finished"; ok: boolean; results: VerifyResult[]; cancelled?: boolean; superseded?: boolean; generation?: number };
 
 /**
  * Runs a single verify command to completion. Injectable so tests can supply a
@@ -72,12 +72,34 @@ export interface VerifyCacheStats {
   size: number;
 }
 
+/** Concrete proof visible to the completion gate. A green verifier run and a
+ * verifier that never ran must never collapse to the same empty-reminder state. */
+export interface VerificationEvidenceSnapshot {
+  /** Increments whenever changed files are scheduled. */
+  mutationGeneration: number;
+  scheduledRuns: number;
+  finishedCommands: number;
+  passedCommands: number;
+  failedCommands: number;
+  skippedCommands: number;
+  latestFinishedAt?: number;
+  latestPassedAt?: number;
+  latestFailedAt?: number;
+  /** Outcome of the newest completed run for the newest mutation generation. */
+  latestRunGeneration?: number;
+  latestRunStatus?: "passed" | "failed" | "cancelled" | "no_checks";
+  latestRunStrength?: "syntax" | "static" | "behavioral";
+  latestLabels: string[];
+}
+
 export interface VerifierOptions {
   workspace: string;
   /** Debounce window for batching successive edits. Default 800ms. */
   debounceMs?: number;
   /** Cap on output tail captured per command. Default 4000 chars. */
   outputTailChars?: number;
+  /** Per-command process timeout. Default 5 minutes; ARES_VERIFY_COMMAND_TIMEOUT_MS overrides. */
+  commandTimeoutMs?: number;
   /** Hook for the CLI/TUI to render verify events live. */
   onEvent?: (event: VerifyEvent) => void;
   /**
@@ -106,6 +128,7 @@ export class ContinuousVerifier {
   private readonly workspace: string;
   private readonly debounceMs: number;
   private readonly outputTailChars: number;
+  private readonly commandTimeoutMs: number;
   private readonly onEvent?: (event: VerifyEvent) => void;
   private readonly runCommand: CommandRunner;
   private readonly cacheMax: number;
@@ -113,6 +136,9 @@ export class ContinuousVerifier {
   private pendingFiles = new Set<string>();
   private debounceTimer: NodeJS.Timeout | null = null;
   private inFlight: { abort: AbortController; done: Promise<void> } | null = null;
+  private runChain: Promise<void> = Promise.resolve();
+  private queuedRuns = 0;
+  private cancelled = false;
   private pendingReminders: PendingReminder[] = [];
   /** Detected once per workspace and cached. */
   private detectedSetupPromise: Promise<WorkspaceSetup> | null = null;
@@ -124,8 +150,17 @@ export class ContinuousVerifier {
    * skip re-running. Insertion-ordered so the oldest key is `keys().next()`.
    * Only PASSES are ever stored (see fireRun) — failures always re-run.
    */
-  private passCache = new Map<string, true>();
+  private passCache = new Map<string, number>();
   private stats: VerifyCacheStats = { hits: 0, misses: 0, stores: 0, evictions: 0, size: 0 };
+  private evidence: VerificationEvidenceSnapshot = {
+    mutationGeneration: 0,
+    scheduledRuns: 0,
+    finishedCommands: 0,
+    passedCommands: 0,
+    failedCommands: 0,
+    skippedCommands: 0,
+    latestLabels: [],
+  };
 
   constructor(opts: VerifierOptions) {
     this.workspace = opts.workspace;
@@ -136,6 +171,9 @@ export class ContinuousVerifier {
     const envDebounce = Number(process.env.ARES_VERIFY_DEBOUNCE_MS);
     this.debounceMs = opts.debounceMs ?? (Number.isFinite(envDebounce) && envDebounce >= 0 ? Math.floor(envDebounce) : 1500);
     this.outputTailChars = opts.outputTailChars ?? 4000;
+    const envCommandTimeout = Number(process.env.ARES_VERIFY_COMMAND_TIMEOUT_MS);
+    this.commandTimeoutMs = opts.commandTimeoutMs ??
+      (Number.isFinite(envCommandTimeout) && envCommandTimeout > 0 ? Math.floor(envCommandTimeout) : 300_000);
     this.onEvent = opts.onEvent;
     // Injectable runner: tests count invocations here; prod uses the spawner.
     this.runCommand = opts.runCommand ?? ((cmd, signal) => this.spawnRunOne(cmd, signal));
@@ -148,10 +186,22 @@ export class ContinuousVerifier {
     return { ...this.stats, size: this.passCache.size };
   }
 
+  /** Snapshot used by the coding completion gate and durable task journal. */
+  evidenceSnapshot(): VerificationEvidenceSnapshot {
+    return { ...this.evidence, latestLabels: [...this.evidence.latestLabels] };
+  }
+
   /** Called by QueryEngine after every tool_end with touchedFiles. */
   scheduleFor(files: readonly string[]): void {
     if (files.length === 0) return;
-    for (const f of files) this.pendingFiles.add(path.resolve(f));
+    this.cancelled = false;
+    this.evidence.mutationGeneration++;
+    this.inFlight?.abort.abort();
+    for (const f of files) {
+      const absolute = path.isAbsolute(f) ? path.resolve(f) : path.resolve(this.workspace, f);
+      this.pendingFiles.add(absolute);
+      if (isWorkspaceSetupLandmark(absolute)) this.detectedSetupPromise = null;
+    }
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
@@ -176,8 +226,22 @@ export class ContinuousVerifier {
    */
   async settle(timeoutMs = 10_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
-    const untilDeadline = (): Promise<void> =>
-      new Promise((r) => setTimeout(r, Math.max(0, deadline - Date.now())));
+    const raceUntilDeadline = async (work: Promise<unknown>): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          work,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+          }),
+        ]);
+      } finally {
+        // Clear the losing timeout. The old Promise.race left a live 60-second
+        // timer after every fast successful verification, keeping CLI/eval/test
+        // processes alive for a full minute after the work had finished.
+        if (timer) clearTimeout(timer);
+      }
+    };
     // Flush a pending debounce window right now. AWAIT the fired run (raced
     // against the deadline): fire-and-forget here let settle() observe
     // inFlight===null and pendingFiles empty (fireRun clears pendingFiles before
@@ -187,7 +251,7 @@ export class ContinuousVerifier {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
-      await Promise.race([this.fireRun().catch(() => undefined), untilDeadline()]);
+      await raceUntilDeadline(this.fireRun().catch(() => undefined));
     }
     // Runs can chain (a fireRun may have been queued while one was active),
     // so loop until quiet or out of time. Returning at the deadline while work
@@ -196,19 +260,21 @@ export class ContinuousVerifier {
     // through pushUnsettledReminder() instead of a bare return.
     while (Date.now() < deadline) {
       const inFlight = this.inFlight;
-      if (!inFlight && this.pendingFiles.size === 0) return; // fully settled — clean exit
+      if (!inFlight && this.pendingFiles.size === 0 && this.queuedRuns === 0) return; // fully settled — clean exit
       if (inFlight) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) return this.pushUnsettledReminder();
-        await Promise.race([inFlight.done, new Promise((r) => setTimeout(r, remaining))]);
+        await raceUntilDeadline(inFlight.done);
       } else if (this.pendingFiles.size > 0) {
-        await Promise.race([this.fireRun().catch(() => undefined), untilDeadline()]);
+        await raceUntilDeadline(this.fireRun().catch(() => undefined));
+      } else if (this.queuedRuns > 0) {
+        await raceUntilDeadline(this.runChain.catch(() => undefined));
       }
     }
     // Fell out of the loop because the deadline passed. If anything is still
     // running or queued, the verdict hasn't landed — surface that, don't
     // silently let the turn finish.
-    if (this.inFlight || this.pendingFiles.size > 0) this.pushUnsettledReminder();
+    if (this.inFlight || this.pendingFiles.size > 0 || this.queuedRuns > 0) this.pushUnsettledReminder();
   }
 
   /**
@@ -231,6 +297,7 @@ export class ContinuousVerifier {
 
   /** Cancel any in-flight run; used on session shutdown. */
   async cancel(): Promise<void> {
+    this.cancelled = true;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -244,9 +311,24 @@ export class ContinuousVerifier {
       }
       this.inFlight = null;
     }
+    await this.runChain.catch(() => undefined);
+    dependencyIndexCache.delete(canonicalPath(this.workspace));
   }
 
-  private async fireRun(): Promise<void> {
+  private fireRun(): Promise<void> {
+    this.queuedRuns++;
+    const run = this.runChain
+      .catch(() => undefined)
+      .then(() => this.fireRunOnce())
+      .finally(() => {
+        this.queuedRuns--;
+      });
+    this.runChain = run;
+    return run;
+  }
+
+  private async fireRunOnce(): Promise<void> {
+    if (this.cancelled) return;
     // If another run is already going, cancel it — we have newer files.
     if (this.inFlight) {
       this.inFlight.abort.abort();
@@ -260,16 +342,23 @@ export class ContinuousVerifier {
 
     const files = [...this.pendingFiles];
     this.pendingFiles.clear();
+    if (files.length === 0) return;
+    const generation = this.evidence.mutationGeneration;
 
     const setup = await this.detectSetup();
     // Editing a source file should exercise its tests, not just its types —
     // pull in existing sibling/related test files for everything touched.
     const related = await findRelatedTestFiles(files, this.workspace);
     const coveredFiles = [...files, ...related];
-    const commands = deriveNarrowVerify(coveredFiles, this.workspace, setup);
-    if (commands.length === 0) return;
-
-    this.onEvent?.({ type: "scheduled", files, commands });
+    const commands = await deriveScopedVerify(coveredFiles, this.workspace, setup);
+    this.evidence.scheduledRuns++;
+    this.evidence.latestLabels = commands.map((command) => command.label).slice(-12);
+    this.onEvent?.({ type: "scheduled", files, commands, generation });
+    if (commands.length === 0) {
+      this.recordRunOutcome(generation, "no_checks");
+      this.onEvent?.({ type: "all_finished", ok: false, results: [], generation });
+      return;
+    }
 
     // FINGERPRINT CACHING — hash the content of the files this run covers ONCE
     // (all commands in a run share the same input set), then combine that with
@@ -278,21 +367,31 @@ export class ContinuousVerifier {
     // to a covered file changes its content hash → new fingerprint → re-run.
     const filesDigest = await this.hashFiles(coveredFiles);
 
+    // Derivation and hashing can be expensive in a large repository. If a new
+    // edit arrived during that preflight window, do not start an already-stale
+    // project process; the serialized successor will verify the newest files.
+    if (generation !== this.evidence.mutationGeneration || this.cancelled) {
+      this.onEvent?.({ type: "all_finished", ok: false, results: [], generation, superseded: true });
+      return;
+    }
+
     const abort = new AbortController();
     let resolveDone!: () => void;
     const done = new Promise<void>((r) => (resolveDone = r));
     this.inFlight = { abort, done };
 
     const results: VerifyResult[] = [];
-    let allOk = true;
+    let ranConcreteCheck = false;
 
     try {
       for (const cmd of commands) {
         if (abort.signal.aborted) break;
         const fp = fingerprintCommand(cmd, filesDigest);
+        const cacheable = isScopedPassCacheSafe(cmd);
         // Cache hit: this exact command already passed against these exact file
         // contents. Serve a synthetic pass instantly — no spawn.
-        if (this.passCache.has(fp)) {
+        const cachedGeneration = cacheable ? this.passCache.get(fp) : undefined;
+        if (cachedGeneration !== undefined && (cachedGeneration === generation || cachedGeneration === generation - 1)) {
           this.stats.hits++;
           this.touchCacheEntry(fp);
           const cached: VerifyResult = {
@@ -305,22 +404,44 @@ export class ContinuousVerifier {
             durationMs: 0,
           };
           results.push(cached);
-          this.onEvent?.({ type: "finished", result: cached });
+          ranConcreteCheck = true;
+          this.recordEvidence(cached);
+          this.onEvent?.({ type: "finished", result: cached, generation });
           continue;
         }
         this.stats.misses++;
-        this.onEvent?.({ type: "running", command: cmd });
+        this.onEvent?.({ type: "running", command: cmd, generation });
         const result = await this.runCommand(cmd, abort.signal);
         results.push(result);
-        if (!result.ok) allOk = false;
+        if (!result.skipped) ranConcreteCheck = true;
+        this.recordEvidence(result);
         // Only cache PASSES, and never cache a skipped/ENOENT "pass" (the tool
         // was absent, not verified) or an aborted run. A real failure is left
         // uncached so it re-runs next time — the user is presumably fixing it.
-        if (result.ok && !result.skipped && !abort.signal.aborted) this.storePass(fp);
-        this.onEvent?.({ type: "finished", result });
+        if (cacheable && result.ok && !result.skipped && !abort.signal.aborted) this.storePass(fp, generation);
+        this.onEvent?.({ type: "finished", result, generation });
       }
-      this.onEvent?.({ type: "all_finished", ok: allOk, results });
-      if (!allOk) {
+      const cancelled = abort.signal.aborted;
+      const superseded = generation !== this.evidence.mutationGeneration;
+      const concreteResults = results.filter((result) => !result.skipped);
+      const allConcretePassed = ranConcreteCheck && concreteResults.length > 0 && concreteResults.every((result) => result.ok);
+      const runStatus: VerificationEvidenceSnapshot["latestRunStatus"] = cancelled
+        ? "cancelled"
+        : concreteResults.some((result) => !result.ok)
+          ? "failed"
+          : allConcretePassed
+            ? "passed"
+            : "no_checks";
+      if (!superseded) this.recordRunOutcome(generation, runStatus, verificationStrength(concreteResults.map((result) => result.command)));
+      this.onEvent?.({
+        type: "all_finished",
+        ok: runStatus === "passed" && !superseded,
+        results,
+        generation,
+        ...(cancelled ? { cancelled: true } : {}),
+        ...(superseded ? { superseded: true } : {}),
+      });
+      if (!superseded && !cancelled && runStatus === "failed") {
         this.pendingReminders.push({
           text: this.formatReminder(results.filter((r) => !r.ok)),
           source: "verifier",
@@ -330,6 +451,38 @@ export class ContinuousVerifier {
       resolveDone();
       if (this.inFlight && this.inFlight.done === done) this.inFlight = null;
     }
+  }
+
+  private recordEvidence(result: VerifyResult): void {
+    const now = Date.now();
+    this.evidence.finishedCommands++;
+    this.evidence.latestFinishedAt = now;
+    this.evidence.latestLabels = [...new Set([...this.evidence.latestLabels, result.command.label])].slice(-12);
+    if (result.skipped) {
+      this.evidence.skippedCommands++;
+      return;
+    }
+    if (result.ok) {
+      this.evidence.passedCommands++;
+    } else {
+      this.evidence.failedCommands++;
+    }
+  }
+
+  private recordRunOutcome(
+    generation: number,
+    status: NonNullable<VerificationEvidenceSnapshot["latestRunStatus"]>,
+    strength?: VerificationEvidenceSnapshot["latestRunStrength"],
+  ): void {
+    // Only the newest mutation generation can certify current workspace state.
+    if (generation !== this.evidence.mutationGeneration) return;
+    this.evidence.latestRunGeneration = generation;
+    this.evidence.latestRunStatus = status;
+    this.evidence.latestRunStrength = strength;
+    const now = Date.now();
+    this.evidence.latestFinishedAt = now;
+    if (status === "passed") this.evidence.latestPassedAt = now;
+    if (status === "failed") this.evidence.latestFailedAt = now;
   }
 
   private formatReminder(failed: VerifyResult[]): string {
@@ -357,12 +510,58 @@ Fix the ROOT CAUSE first — one bad symbol or import usually explains a whole p
       const t0 = Date.now();
       const child = spawn(cmd.program, cmd.args, {
         cwd: cmd.cwd,
-        signal,
         windowsHide: true,
-        shell: process.platform === "win32",
+        // Windows needs a shell for package-manager .cmd shims. Direct tools
+        // (node/tsc/cargo/go/python linters) stay argv-native so repository
+        // paths cannot become shell syntax.
+        shell: process.platform === "win32" && /^(?:npm|npx|pnpm|yarn)$/i.test(cmd.program),
+        detached: process.platform !== "win32",
       });
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      let timedOut = false;
+      let forceTimer: NodeJS.Timeout | null = null;
+      const finish = (result: VerifyResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (forceTimer) clearTimeout(forceTimer);
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      };
+      const terminateTree = () => {
+        if (!child.pid) return;
+        if (process.platform === "win32") {
+          spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+            .on("error", () => child.kill());
+          return;
+        }
+        try {
+          process.kill(-child.pid, "SIGTERM");
+        } catch {
+          child.kill("SIGTERM");
+        }
+      };
+      const forceResult = (reason: string) => finish({
+        ok: false,
+        command: cmd,
+        exitCode: null,
+        stdoutTail: stdout.slice(-this.outputTailChars),
+        stderrTail: `${stderr}\n(${reason})`.slice(-this.outputTailChars),
+        durationMs: Date.now() - t0,
+      });
+      const onAbort = () => {
+        terminateTree();
+        forceTimer = setTimeout(() => forceResult("cancelled; process tree did not exit promptly"), 5_000);
+      };
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        terminateTree();
+        forceTimer = setTimeout(() => forceResult(`timed out after ${this.commandTimeoutMs}ms; process tree did not exit promptly`), 5_000);
+      }, this.commandTimeoutMs);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
       const onChunk = (buf: Buffer, target: "out" | "err") => {
         const s = buf.toString("utf8");
         if (target === "out") {
@@ -383,7 +582,7 @@ Fix the ROOT CAUSE first — one bad symbol or import usually explains a whole p
         // ENOENT = the tool isn't installed (e.g. ruff/pytest/tsc missing).
         // That's "verifier unavailable", NOT a code failure — never nag for it.
         const missing = err?.code === "ENOENT";
-        resolve({
+        finish({
           ok: missing ? true : false,
           skipped: missing,
           command: cmd,
@@ -396,12 +595,12 @@ Fix the ROOT CAUSE first — one bad symbol or import usually explains a whole p
         });
       });
       child.on("close", (code) => {
-        resolve({
-          ok: code === 0,
+        finish({
+          ok: code === 0 && !timedOut && !signal.aborted,
           command: cmd,
           exitCode: code,
           stdoutTail: stdout.slice(-this.outputTailChars),
-          stderrTail: stderr.slice(-this.outputTailChars),
+          stderrTail: `${stderr}${timedOut ? `\n(timed out after ${this.commandTimeoutMs}ms)` : ""}`.slice(-this.outputTailChars),
           durationMs: Date.now() - t0,
         });
       });
@@ -422,8 +621,24 @@ Fix the ROOT CAUSE first — one bad symbol or import usually explains a whole p
    */
   private async hashFiles(files: readonly string[]): Promise<string> {
     const h = createHash("sha1");
-    for (const f of [...files].sort()) {
-      const abs = path.resolve(f);
+    const covered = new Set(files.map((file) => path.isAbsolute(file) ? path.resolve(file) : path.resolve(this.workspace, file)));
+    const landmarks = [
+      "package.json", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "tsconfig.json",
+      "pyproject.toml", "requirements.txt", "Cargo.toml", "Cargo.lock", "go.mod", "go.sum",
+    ];
+    for (const file of files) {
+      let current = path.dirname(path.isAbsolute(file) ? file : path.resolve(this.workspace, file));
+      const root = path.resolve(this.workspace);
+      while (current === root || current.startsWith(root + path.sep)) {
+        for (const name of landmarks) {
+          const candidate = path.join(current, name);
+          if (await fs.stat(candidate).then((entry) => entry.isFile()).catch(() => false)) covered.add(candidate);
+        }
+        if (current === root) break;
+        current = path.dirname(current);
+      }
+    }
+    for (const abs of [...covered].sort()) {
       const content = await fs.readFile(abs).catch(() => null);
       h.update(abs);
       h.update("\0");
@@ -438,12 +653,13 @@ Fix the ROOT CAUSE first — one bad symbol or import usually explains a whole p
   }
 
   /** Insert a passing fingerprint, evicting the oldest entry past the bound. */
-  private storePass(fp: string): void {
+  private storePass(fp: string, generation: number): void {
     if (this.passCache.has(fp)) {
+      this.passCache.set(fp, generation);
       this.touchCacheEntry(fp);
       return;
     }
-    this.passCache.set(fp, true);
+    this.passCache.set(fp, generation);
     this.stats.stores++;
     while (this.passCache.size > this.cacheMax) {
       // Map preserves insertion order → the first key is the oldest (LRU-ish;
@@ -457,9 +673,10 @@ Fix the ROOT CAUSE first — one bad symbol or import usually explains a whole p
 
   /** Move a key to the most-recently-used end so eviction skips hot entries. */
   private touchCacheEntry(fp: string): void {
-    if (!this.passCache.has(fp)) return;
+    const generation = this.passCache.get(fp);
+    if (generation === undefined) return;
     this.passCache.delete(fp);
-    this.passCache.set(fp, true);
+    this.passCache.set(fp, generation);
   }
 }
 
@@ -483,6 +700,27 @@ function fingerprintCommand(cmd: VerifyCommand, filesDigest: string): string {
   return h.digest("hex");
 }
 
+function isScopedPassCacheSafe(command: VerifyCommand): boolean {
+  // These commands inspect an owning project/package, not merely coveredFiles.
+  // Reusing them from a touched-file digest can miss a changed dependent or
+  // configuration file, so correctness beats the cache on completion proof.
+  return ![
+    "typescript",
+    "package-tests",
+    "pytest(package)",
+    "cargo-test",
+    "go-test",
+  ].includes(command.label);
+}
+
+function verificationStrength(commands: readonly VerifyCommand[]): VerificationEvidenceSnapshot["latestRunStrength"] {
+  if (commands.some((command) => /(?:tests?|vitest|jest|pytest|cargo-test|go-test|runtime)/i.test(command.label))) {
+    return "behavioral";
+  }
+  if (commands.some((command) => !command.label.startsWith("node-check"))) return "static";
+  return commands.length > 0 ? "syntax" : undefined;
+}
+
 // ─── Narrow verify command derivation ──────────────────────────────────
 
 export interface WorkspaceSetup {
@@ -493,8 +731,12 @@ export interface WorkspaceSetup {
   hasPackageJson: boolean;
   hasPnpm: boolean;
   hasNpm: boolean;
+  /** TypeScript compiler is installed locally or on PATH; never auto-download it. */
+  hasTsc?: boolean;
   /** Project's actual JS/TS test runner, read from package.json. */
   testRunner: "vitest" | "jest" | "node" | null;
+  /** package.json defines an executable test script. */
+  hasTestScript?: boolean;
   hasPyproject: boolean;
   hasRuff: boolean;
   hasPytest: boolean;
@@ -550,10 +792,12 @@ async function detectWorkspaceSetup(workspace: string): Promise<WorkspaceSetup> 
 
   // Real test runner from package.json (devDeps + the `test` script), not a guess.
   let testRunner: WorkspaceSetup["testRunner"] = null;
+  let hasTestScript = false;
   if (pkg) {
     const p = await readJson("package.json");
     const deps = { ...((p?.devDependencies as object) ?? {}), ...((p?.dependencies as object) ?? {}) } as Record<string, unknown>;
     const testScript = ((p?.scripts as Record<string, unknown>)?.test as string) ?? "";
+    hasTestScript = testScript.trim().length > 0 && !/^(?:echo\s+)?(?:no tests?|error: no test specified)/i.test(testScript.trim());
     if ("vitest" in deps || /\bvitest\b/.test(testScript)) testRunner = "vitest";
     else if ("jest" in deps || /\bjest\b/.test(testScript)) testRunner = "jest";
     else if (/node\s+--test/.test(testScript)) testRunner = "node";
@@ -563,6 +807,7 @@ async function detectWorkspaceSetup(workspace: string): Promise<WorkspaceSetup> 
   const [hasRuff, hasPytest] = pyproject
     ? await Promise.all([onPath("ruff"), onPath("pytest")])
     : [false, false];
+  const hasTsc = await exists("node_modules/typescript/bin/tsc");
 
   return {
     hasTsconfig: tsc,
@@ -570,7 +815,9 @@ async function detectWorkspaceSetup(workspace: string): Promise<WorkspaceSetup> 
     hasPackageJson: pkg,
     hasPnpm: pnpmLock,
     hasNpm: pkg && !pnpmLock,
+    hasTsc,
     testRunner,
+    hasTestScript,
     hasPyproject: pyproject,
     hasRuff,
     hasPytest,
@@ -585,8 +832,20 @@ async function detectWorkspaceSetup(workspace: string): Promise<WorkspaceSetup> 
  * `x.test.*` / `x.spec.*`, `__tests__/x.test.*`, and `tests/x*.test.*` beside
  * or near the source. Only returns files that actually exist; never guesses.
  */
+interface DependencyTestIndex {
+  builtAt: number;
+  files: Map<string, string>;
+  reverse: Map<string, Set<string>>;
+  tests: Set<string>;
+}
+
+const dependencyIndexCache = new Map<string, DependencyTestIndex>();
+const DEPENDENCY_INDEX_CACHE_MAX = 8;
+const INDEXABLE_SOURCE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/i;
+
 export async function findRelatedTestFiles(files: readonly string[], workspace: string): Promise<string[]> {
   const found = new Set<string>();
+  const root = path.resolve(workspace);
   const exists = async (p: string) =>
     fs
       .stat(p)
@@ -620,55 +879,212 @@ export async function findRelatedTestFiles(files: readonly string[], workspace: 
             path.join(workspace, "test", `${stem}.test.${ext}`),
           ];
     for (const candidate of candidates) {
-      if (found.size >= 12) return [...found]; // narrow means narrow
+      if (found.size >= 24) return [...found].sort(); // narrow means narrow
       if (await exists(candidate)) found.add(path.resolve(candidate));
     }
   }
-  return [...found];
+
+  // Naming conventions miss integration tests far from the source. Walk the
+  // bounded reverse import graph up to four edges and add tests that can
+  // actually reach a changed JS/TS module.
+  if (files.some((file) => INDEXABLE_SOURCE.test(file))) {
+    const index = await dependencyTestIndex(root, files);
+    const queue = files
+      .filter((file) => INDEXABLE_SOURCE.test(file))
+      .map((file) => ({ key: canonicalPath(path.isAbsolute(file) ? file : path.resolve(root, file)), depth: 0 }));
+    const seen = new Set(queue.map((item) => item.key));
+    while (queue.length > 0 && found.size < 24) {
+      const current = queue.shift()!;
+      if (current.depth >= 4) continue;
+      for (const dependent of [...(index.reverse.get(current.key) ?? [])].sort()) {
+        if (seen.has(dependent)) continue;
+        seen.add(dependent);
+        const absolute = index.files.get(dependent);
+        if (absolute && index.tests.has(dependent)) found.add(absolute);
+        queue.push({ key: dependent, depth: current.depth + 1 });
+      }
+    }
+  }
+  return [...found].sort();
+}
+
+async function dependencyTestIndex(workspace: string, touched: readonly string[]): Promise<DependencyTestIndex> {
+  const cacheKey = canonicalPath(workspace);
+  const cached = dependencyIndexCache.get(cacheKey);
+  if (cached) {
+    dependencyIndexCache.delete(cacheKey);
+    dependencyIndexCache.set(cacheKey, cached);
+  }
+  if (cached && Date.now() - cached.builtAt < 30_000) {
+    let fresh = true;
+    for (const file of touched) {
+      if (!INDEXABLE_SOURCE.test(file)) continue;
+      const absolute = path.isAbsolute(file) ? path.resolve(file) : path.resolve(workspace, file);
+      const info = await fs.stat(absolute).catch(() => null);
+      // A just-deleted/renamed file can still use the pre-delete reverse graph
+      // to locate affected tests. Rebuilding immediately would erase the very
+      // dependency edges needed to validate the deletion.
+      if ((!info && !cached.files.has(canonicalPath(absolute))) || (info && (info.mtimeMs > cached.builtAt || !cached.files.has(canonicalPath(absolute))))) {
+        fresh = false;
+        break;
+      }
+    }
+    if (fresh) return cached;
+  }
+
+  const absoluteFiles = await walkIndexableFiles(workspace, 6_000);
+  const fileMap = new Map(absoluteFiles.map((file) => [canonicalPath(file), file]));
+  const reverse = new Map<string, Set<string>>();
+  const tests = new Set<string>();
+  for (const importer of absoluteFiles) {
+    const importerKey = canonicalPath(importer);
+    if (isJsTestFile(importer)) tests.add(importerKey);
+    const info = await fs.stat(importer).catch(() => null);
+    if (!info || info.size > 750_000) continue;
+    const source = await fs.readFile(importer, "utf8").catch(() => "");
+    for (const specifier of extractRelativeImports(source)) {
+      const target = resolveIndexedImport(importer, specifier, fileMap);
+      if (!target) continue;
+      const dependents = reverse.get(target) ?? new Set<string>();
+      dependents.add(importerKey);
+      reverse.set(target, dependents);
+    }
+  }
+  const index: DependencyTestIndex = { builtAt: Date.now(), files: fileMap, reverse, tests };
+  dependencyIndexCache.set(cacheKey, index);
+  while (dependencyIndexCache.size > DEPENDENCY_INDEX_CACHE_MAX) {
+    const oldest = dependencyIndexCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    dependencyIndexCache.delete(oldest);
+  }
+  return index;
+}
+
+async function walkIndexableFiles(workspace: string, maxFiles: number): Promise<string[]> {
+  const ignored = new Set([".git", ".ares", ".next", ".turbo", "build", "coverage", "dist", "node_modules", "out", "target", "vendor"]);
+  const pending = [workspace];
+  const files: string[] = [];
+  while (pending.length > 0 && files.length < maxFiles) {
+    const dir = pending.shift()!;
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const absolute = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!ignored.has(entry.name)) pending.push(absolute);
+      } else if (entry.isFile() && INDEXABLE_SOURCE.test(entry.name)) {
+        files.push(path.resolve(absolute));
+        if (files.length >= maxFiles) break;
+      }
+    }
+  }
+  return files.sort();
+}
+
+function extractRelativeImports(source: string): string[] {
+  const found = new Set<string>();
+  const patterns = [
+    /\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g,
+    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+  ];
+  for (const pattern of patterns) {
+    for (let match = pattern.exec(source); match; match = pattern.exec(source)) {
+      if (match[1].startsWith(".")) found.add(match[1]);
+    }
+  }
+  return [...found].sort();
+}
+
+function resolveIndexedImport(importer: string, specifier: string, files: ReadonlyMap<string, string>): string | null {
+  const base = path.resolve(path.dirname(importer), specifier);
+  const candidates = [base];
+  const ext = path.extname(base);
+  if (!ext) {
+    for (const suffix of [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]) {
+      candidates.push(base + suffix, path.join(base, `index${suffix}`));
+    }
+  } else if ([".js", ".jsx", ".mjs", ".cjs"].includes(ext.toLowerCase())) {
+    const stem = base.slice(0, -ext.length);
+    for (const suffix of [".ts", ".tsx", ".mts", ".cts"]) candidates.push(stem + suffix);
+  }
+  for (const candidate of candidates) {
+    const key = canonicalPath(candidate);
+    if (files.has(key)) return key;
+  }
+  return null;
+}
+
+function isJsTestFile(file: string): boolean {
+  const normalized = file.replace(/\\/g, "/");
+  return /(^|\/)(__tests__|tests?|specs?)(\/|$)|\.(test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(normalized);
+}
+
+function canonicalPath(file: string): string {
+  const resolved = path.resolve(file);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isWorkspaceSetupLandmark(file: string): boolean {
+  const base = path.basename(file).toLowerCase();
+  return /^(?:package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?|tsconfig(?:\.[^.]+)?\.json|vitest\.config\.[^.]+|jest\.config\.[^.]+|pyproject\.toml|pytest\.ini|ruff\.toml|requirements(?:-[^.]+)?\.txt|cargo\.toml|cargo\.lock|go\.mod|go\.sum)$/.test(base);
 }
 
 export function deriveNarrowVerify(
   files: readonly string[],
   workspace: string,
   setup: WorkspaceSetup,
+  existingFiles?: ReadonlySet<string>,
 ): VerifyCommand[] {
   const cmds: VerifyCommand[] = [];
 
   const tsFiles = files.filter((f) => /\.(ts|tsx|mts|cts)$/.test(f));
   const jsFiles = files.filter((f) => /\.(js|jsx|mjs|cjs)$/.test(f));
-  const tsTestFiles = files.filter((f) => /\.test\.(ts|tsx|mts|cts)$/.test(f));
-  const jsTestFiles = files.filter((f) => /\.test\.(js|jsx|mjs|cjs)$/.test(f));
+  const tsTestFiles = files.filter((f) => /\.(ts|tsx|mts|cts)$/.test(f) && isJsTestFile(f));
+  const jsTestFiles = files.filter((f) => /\.(js|jsx|mjs|cjs)$/.test(f) && isJsTestFile(f));
   const pyFiles = files.filter((f) => f.endsWith(".py"));
   const pyTestFiles = files.filter((f) => /test_.*\.py$|.*_test\.py$/.test(path.basename(f)));
   const rsFiles = files.filter((f) => f.endsWith(".rs"));
   const goFiles = files.filter((f) => f.endsWith(".go"));
+  const exists = (file: string) => !existingFiles || existingFiles.has(canonicalPath(file));
+  const existingTsFiles = tsFiles.filter(exists);
+  const existingJsFiles = jsFiles.filter(exists);
+  const existingPyFiles = pyFiles.filter(exists);
+  const basenames = new Set(files.map((file) => path.basename(file).toLowerCase()));
+  const packageSetupTouched = [...basenames].some((base) => /^(?:package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?)$/.test(base));
+  const tsSetupTouched = [...basenames].some((base) => /^tsconfig(?:\.[^.]+)?\.json$/.test(base));
+  const pythonSetupTouched = [...basenames].some((base) => /^(?:pyproject\.toml|pytest\.ini|ruff\.toml|requirements(?:-[^.]+)?\.txt)$/.test(base));
+  const cargoSetupTouched = basenames.has("cargo.toml") || basenames.has("cargo.lock");
+  const goSetupTouched = basenames.has("go.mod") || basenames.has("go.sum");
+  const tsRelevant = tsFiles.length > 0 || tsSetupTouched;
 
   // TypeScript: `tsc -b` ONLY when the project is composite/has references —
   // otherwise tsc -b errors. For non-composite projects use a project-wide
   // `tsc --noEmit -p .` (catches cross-file regressions without emitting), and
   // fall back to per-file --noEmit when there's no tsconfig at all.
-  if (tsFiles.length > 0 && setup.hasTsconfig && setup.hasPackageJson && setup.tsconfigComposite) {
+  if (tsRelevant && setup.hasTsc !== false && setup.hasTsconfig && setup.hasPackageJson && setup.tsconfigComposite) {
     cmds.push({
       program: setup.hasPnpm ? "pnpm" : "npx",
-      args: setup.hasPnpm ? ["exec", "tsc", "-b", "--pretty", "false"] : ["tsc", "-b", "--pretty", "false"],
+      args: setup.hasPnpm ? ["exec", "tsc", "-b", "--pretty", "false"] : ["--no-install", "tsc", "-b", "--pretty", "false"],
       cwd: workspace,
       label: "typescript",
     });
-  } else if (tsFiles.length > 0 && setup.hasTsconfig) {
+  } else if (tsRelevant && setup.hasTsc !== false && setup.hasTsconfig) {
     cmds.push({
       program: setup.hasPnpm ? "pnpm" : "npx",
       args: setup.hasPnpm
         ? ["exec", "tsc", "--noEmit", "-p", ".", "--pretty", "false"]
-        : ["-y", "tsc", "--noEmit", "-p", ".", "--pretty", "false"],
+        : ["--no-install", "tsc", "--noEmit", "-p", ".", "--pretty", "false"],
       cwd: workspace,
       label: "typescript",
     });
-  } else if (tsFiles.length > 0) {
+  } else if (existingTsFiles.length > 0 && setup.hasTsc !== false) {
     cmds.push({
-      program: "npx",
-      args: ["-y", "tsc", "--noEmit", "--pretty", "false", ...tsFiles],
+      program: "tsc",
+      args: ["--noEmit", "--pretty", "false", ...existingTsFiles],
       cwd: workspace,
-      label: `tsc(${tsFiles.length})`,
+      label: `tsc(${existingTsFiles.length})`,
     });
   }
 
@@ -677,18 +1093,28 @@ export function deriveNarrowVerify(
   // without type stripping. So: vitest/jest run any touched test file; bare
   // node --test runs only JS test files.
   const allTestFiles = [...tsTestFiles, ...jsTestFiles];
+  const runnableTestFiles = process.platform === "win32"
+    ? allTestFiles.filter((file) => !/[&|<>^%\r\n]/.test(path.relative(workspace, file)))
+    : allTestFiles;
   const rel = (f: string) => path.relative(workspace, f);
-  if (allTestFiles.length > 0 && (setup.testRunner === "vitest" || setup.testRunner === "jest")) {
+  if ((tsFiles.length > 0 || jsFiles.length > 0 || packageSetupTouched || tsSetupTouched) && setup.hasTestScript) {
+    cmds.push({
+      program: setup.hasPnpm ? "pnpm" : "npm",
+      args: ["test"],
+      cwd: workspace,
+      label: "package-tests",
+    });
+  } else if (runnableTestFiles.length > 0 && (setup.testRunner === "vitest" || setup.testRunner === "jest")) {
     const runner = setup.testRunner;
     cmds.push({
       program: setup.hasPnpm ? "pnpm" : "npx",
       args: [
-        ...(setup.hasPnpm ? ["exec", runner] : ["-y", runner]),
+        ...(setup.hasPnpm ? ["exec", runner] : ["--no-install", runner]),
         ...(runner === "vitest" ? ["run"] : []),
-        ...allTestFiles.map(rel),
+        ...runnableTestFiles.map(rel),
       ],
       cwd: workspace,
-      label: `${runner}(${allTestFiles.length})`,
+      label: `${runner}(${runnableTestFiles.length})`,
     });
   } else if (jsTestFiles.length > 0) {
     cmds.push({
@@ -700,45 +1126,47 @@ export function deriveNarrowVerify(
   }
 
   // Python: ruff first (cheap), then pytest if test files touched.
-  if (pyFiles.length > 0 && setup.hasRuff) {
+  if ((existingPyFiles.length > 0 || pythonSetupTouched) && setup.hasRuff) {
     cmds.push({
       program: "ruff",
-      args: ["check", ...pyFiles],
+      args: ["check", ...existingPyFiles],
       cwd: workspace,
       label: `ruff(${pyFiles.length})`,
     });
   }
-  if (pyTestFiles.length > 0 && setup.hasPytest) {
+  if ((pyFiles.length > 0 || pythonSetupTouched) && setup.hasPytest) {
     cmds.push({
       program: "pytest",
-      args: ["-x", "--tb=short", ...pyTestFiles],
+      args: ["-x", "--tb=short", ...(pyTestFiles.length > 0 ? pyTestFiles : [])],
       cwd: workspace,
-      label: `pytest(${pyTestFiles.length})`,
+      label: pyTestFiles.length > 0 ? `pytest(${pyTestFiles.length})` : "pytest(package)",
     });
   }
 
-  // Rust + Go: project-level cheap checks.
-  if (rsFiles.length > 0 && setup.hasCargo) {
+  // Rust + Go: package-level behavioral tests. These compile the owned project
+  // and exercise its test suite; compile-only checks were too weak to certify
+  // a coding task as complete.
+  if ((rsFiles.length > 0 || cargoSetupTouched) && setup.hasCargo) {
     cmds.push({
       program: "cargo",
-      args: ["check", "--message-format=short"],
+      args: ["test", "--no-fail-fast"],
       cwd: workspace,
-      label: "cargo-check",
+      label: "cargo-test",
     });
   }
-  if (goFiles.length > 0 && setup.hasGoMod) {
+  if ((goFiles.length > 0 || goSetupTouched) && setup.hasGoMod) {
     cmds.push({
       program: "go",
-      args: ["build", "./..."],
+      args: ["test", "./..."],
       cwd: workspace,
-      label: "go-build",
+      label: "go-test",
     });
   }
 
   // Last resort: if we touched JS but no test files, at least make sure
   // there are no syntax errors via node --check (per-file).
-  if (jsFiles.length > 0 && jsTestFiles.length === 0 && tsFiles.length === 0) {
-    for (const f of jsFiles) {
+  if (existingJsFiles.length > 0 && jsTestFiles.length === 0 && tsFiles.length === 0 && !setup.hasTestScript) {
+    for (const f of existingJsFiles) {
       cmds.push({
         program: "node",
         args: ["--check", path.relative(workspace, f)],
@@ -749,6 +1177,89 @@ export function deriveNarrowVerify(
   }
 
   return cmds;
+}
+
+/**
+ * Derive checks at the owning project boundary instead of assuming every
+ * language is configured at repository root. Polyglot monorepos commonly keep
+ * Cargo.toml/pyproject/tsconfig inside apps or packages; root-only detection
+ * silently skipped those edits.
+ */
+export async function deriveScopedVerify(
+  files: readonly string[],
+  workspace: string,
+  rootSetup?: WorkspaceSetup,
+): Promise<VerifyCommand[]> {
+  if (files.length === 0) return [];
+  const root = path.resolve(workspace);
+  const setupAtRoot = rootSetup ?? await detectWorkspaceSetup(root);
+  const groups = new Map<string, string[]>();
+  for (const raw of files) {
+    const file = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(root, raw);
+    const markers = file.endsWith(".rs")
+      ? ["Cargo.toml"]
+      : file.endsWith(".py")
+        ? ["pyproject.toml"]
+        : file.endsWith(".go")
+          ? ["go.mod"]
+          : /\.(?:ts|tsx|mts|cts)$/.test(file)
+            ? ["tsconfig.json"]
+            : /\.(?:js|jsx|mjs|cjs)$/.test(file)
+              ? ["package.json"]
+              : [];
+    const directSetupOwner = isWorkspaceSetupLandmark(file) &&
+      (path.dirname(file) === root || path.dirname(file).startsWith(root + path.sep))
+      ? path.dirname(file)
+      : null;
+    const owner = directSetupOwner ?? (markers.length ? await nearestProjectRoot(path.dirname(file), root, markers) : root);
+    const list = groups.get(owner) ?? [];
+    list.push(file);
+    groups.set(owner, list);
+  }
+
+  const commands: VerifyCommand[] = [];
+  const seen = new Set<string>();
+  for (const [owner, ownedFiles] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const detected = owner === root ? setupAtRoot : await detectWorkspaceSetup(owner);
+    const setup = owner === root
+      ? detected
+      : {
+          ...detected,
+          hasPnpm: detected.hasPnpm || setupAtRoot.hasPnpm,
+          hasNpm: detected.hasNpm || (!setupAtRoot.hasPnpm && setupAtRoot.hasNpm),
+          hasTsc: detected.hasTsc || setupAtRoot.hasTsc,
+          testRunner: detected.testRunner ?? setupAtRoot.testRunner,
+          hasTestScript: detected.hasTestScript,
+        };
+    const existingFiles = new Set<string>();
+    await Promise.all(ownedFiles.map(async (file) => {
+      const present = await fs.stat(file).then((entry) => entry.isFile()).catch(() => false);
+      if (present) existingFiles.add(canonicalPath(file));
+    }));
+    for (const command of deriveNarrowVerify(ownedFiles, owner, setup, existingFiles)) {
+      const key = `${command.cwd}\0${command.program}\0${command.args.join("\0")}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      commands.push(command);
+    }
+  }
+  return commands;
+}
+
+async function nearestProjectRoot(start: string, workspace: string, markers: readonly string[]): Promise<string> {
+  let current = path.resolve(start);
+  const root = path.resolve(workspace);
+  while (current === root || current.startsWith(root + path.sep)) {
+    for (const marker of markers) {
+      const present = await fs.stat(path.join(current, marker)).then((entry) => entry.isFile()).catch(() => false);
+      if (present) return current;
+    }
+    if (current === root) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return root;
 }
 
 // ─── Failure triage — a wall of red becomes N root causes ───────────────

@@ -193,9 +193,61 @@ export function parseToolInputLenient<S extends z.ZodTypeAny>(schema: S, input: 
     const stripped = stripUnknownKeys(input, unknownKeyIssues);
     const retry = schema.safeParse(stripped);
     if (retry.success) return retry.data;
-    return throwToolInputError(retry.error, toolName);
+    return retryWithParsedJsonStrings(schema, stripped, retry.error, toolName);
   }
-  return throwToolInputError(first.error, toolName);
+  return retryWithParsedJsonStrings(schema, input, first.error, toolName);
+}
+
+/**
+ * Second repair pass: weaker models emit structured args as JSON-ENCODED
+ * STRINGS ("todos": "[{...}]") — zod reports invalid_type expected array/object,
+ * received string. Parse the string at each such path and retry once. Only
+ * fields the SCHEMA declares non-scalar are touched, so free-text params that
+ * happen to start with "[" are never mangled.
+ */
+function retryWithParsedJsonStrings<S extends z.ZodTypeAny>(
+  schema: S,
+  input: unknown,
+  error: z.ZodError,
+  toolName: string,
+): z.infer<S> {
+  const coercible = error.issues.filter(
+    (i) =>
+      i.code === "invalid_type" &&
+      (i as { expected?: string }).expected !== undefined &&
+      ["array", "object"].includes((i as { expected: string }).expected) &&
+      (i as { received?: string }).received === "string",
+  );
+  if (coercible.length === 0 || input === null || typeof input !== "object") {
+    return throwToolInputError(error, toolName);
+  }
+  const clone: unknown = structuredClone(input);
+  let repaired = false;
+  for (const issue of coercible) {
+    let node: unknown = clone;
+    for (const seg of issue.path.slice(0, -1)) {
+      if (node && typeof node === "object") node = (node as Record<string | number, unknown>)[seg];
+    }
+    const leaf = issue.path[issue.path.length - 1];
+    if (!node || typeof node !== "object" || leaf === undefined) continue;
+    const value = (node as Record<string | number, unknown>)[leaf];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === "object") {
+        (node as Record<string | number, unknown>)[leaf] = parsed;
+        repaired = true;
+      }
+    } catch {
+      // not valid JSON — leave it; the original error stands
+    }
+  }
+  if (!repaired) return throwToolInputError(error, toolName);
+  const retry = schema.safeParse(clone);
+  if (retry.success) return retry.data;
+  return throwToolInputError(retry.error, toolName);
 }
 
 function stripUnknownKeys(input: unknown, issues: Array<{ path: (string | number)[]; keys: string[] }>): unknown {
@@ -232,6 +284,11 @@ export function toolError(message: string): Error {
   return new Error(`<tool_use_error>${message}</tool_use_error>`);
 }
 
+/** Tool names the user clicked "Allow always" on this process run. Backs the
+ *  non-command allow_always path in adaptToolForEngine — session-scoped on
+ *  purpose (a fresh daemon starts guarded again). */
+const toolAlwaysGrants = new Set<string>();
+
 export function adaptToolForEngine(
   tool: Tool<z.ZodTypeAny, unknown>,
   enrich: (base: ToolCallContext) => RichToolContext,
@@ -258,7 +315,15 @@ export function adaptToolForEngine(
         const verdict = await tool.validateInput(parsed, rich);
         if (!verdict.ok) throw toolError(verdict.message);
       }
-      const decision = await tool.checkPermissions(parsed, rich);
+      let decision = await tool.checkPermissions(parsed, rich);
+      // "Allow always" for non-command tools (ComputerUse, Browser, …) grants
+      // the TOOL for the rest of the process. Before this, allow_always was a
+      // silent no-op for any tool without commandFor — the user clicked Always
+      // and got re-prompted on the very next action (mid-automation, moving
+      // their mouse to the dialog and wrecking the run).
+      if (decision.kind === "ask" && toolAlwaysGrants.has(tool.schema.name)) {
+        decision = { kind: "allow" };
+      }
       if (decision.kind === "deny") {
         // A policy deny ("Read the file first", "disabled in plan mode") is a
         // correctable signal — envelope it like the validation gate so the model
@@ -283,12 +348,13 @@ export function adaptToolForEngine(
         // Persist an explicit "always allow this command" so the next session
         // doesn't re-ask. Path tools self-persist inside call() via
         // resolveWorkspacePath; command tools (Bash/PowerShell) route through
-        // here. No-op when the host store is read-only or the tool isn't
-        // command-shaped — i.e. exactly the old behavior in those cases.
+        // here. Non-command tools get a process-lifetime tool-name grant.
         if (answer === "allow_always") {
           const command = tool.commandFor?.(parsed);
           if (command !== undefined) {
             await rich.commandPermissions?.grant?.(tool.schema.name, command, "always");
+          } else {
+            toolAlwaysGrants.add(tool.schema.name);
           }
         }
       }

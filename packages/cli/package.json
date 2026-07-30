@@ -17,6 +17,7 @@
   "dependencies": {
     "@ares/agent": "workspace:*",
     "@ares/channels": "workspace:*",
+    "@ares/browser-extension-connector": "workspace:*",
     "@ares/connectors": "workspace:*",
     "@ares/core": "workspace:*",
     "@ares/effects": "workspace:*",

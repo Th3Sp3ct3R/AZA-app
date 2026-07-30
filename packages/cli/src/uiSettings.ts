@@ -14,6 +14,7 @@ const SECRET_FIELDS = [
   "braveKey",
   "tavilyKey",
   "deepSeekKey",
+  "kimiKey",
   "aresGatewayToken",
   "ollamaApiKey",
   "customApiKey",
@@ -38,7 +39,7 @@ async function encryptSecretFields(settings: UiSettings): Promise<UiSettings> {
 
 export interface UiSettings {
   theme?: ThemeName;
-  lastProvider?: "openai" | "ollama" | "mock" | "openrouter" | "anthropic" | "deepseek" | "custom";
+  lastProvider?: "openai" | "ollama" | "mock" | "openrouter" | "anthropic" | "deepseek" | "ares" | "custom" | "moa";
   lastOpenAIModel?: string;
   lastOllamaModel?: string;
   favoriteOllamaModels?: string[];
@@ -70,6 +71,10 @@ export interface UiSettings {
   deepSeekKey?: string;
   /** Last DeepSeek model id the owner selected. */
   lastDeepSeekModel?: string;
+  /** Kimi (Moonshot) API key for the api.kimi.com coding endpoint. */
+  kimiKey?: string;
+  /** Last Kimi model id the owner selected. */
+  lastKimiModel?: string;
   /** Ollama Cloud API key for direct ollama.com catalog and model access. */
   ollamaApiKey?: string;
   /** Custom OpenAI-compatible provider — base URL ending in the API root, e.g.
@@ -117,6 +122,9 @@ export interface EngineConfig {
   operatorTickMinutes?: number;
   /** Subagent turn limit (default 50). */
   subagentTurnLimit?: number;
+  /** Let ComputerUse activate/drive REAL browser windows with the physical
+   *  mouse (default false — web content must not reach the desktop input). */
+  computerUseBrowser?: boolean;
 }
 
 export function uiSettingsPath(): string {

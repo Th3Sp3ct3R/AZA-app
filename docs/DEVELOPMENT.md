@@ -21,6 +21,11 @@ pnpm verify   # lint, build, and test through the standard scripts
 pnpm clean    # remove generated build, Tauri, log, and smoke-test output
 ```
 
+The default long-horizon coding benchmark is `ares eval coding --suite coding-v2`.
+It records integrity, proof, false-green, token, prompt, task-manifest, and
+tool-schema data under the Ares home. Real-model runs execute candidate code;
+run them in a disposable VM/container and pass `--allow-unsafe-process-eval`.
+
 The CLI entrypoint is built to `packages/cli/dist/entry.js`. Use `pnpm build` before running `pnpm ares` or before launching the desktop companion after a clean.
 
 ## Permission Posture

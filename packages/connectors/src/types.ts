@@ -36,6 +36,11 @@ export interface ConsoleEntry {
 
 export interface BrowserConnector {
   readonly name: string;
+  /** How this browser was acquired: "cdp:<url>" = attached to a real, already-
+   *  running browser (the user's logged-in session); "launch:<label>" = a
+   *  browser Ares launched itself (its own persistent profile). Lets callers
+   *  tell the owner WHOSE browser the tabs/actions belong to. */
+  readonly strategy?: string;
   navigate(url: string): Promise<BrowserState>;
   /** DOM-first targeting: the structured tree, preferred over pixels. */
   accessibilityTree(): Promise<AccessibilityNode[]>;
@@ -54,4 +59,10 @@ export interface BrowserConnector {
   /** Evaluate JS in the page and return the JSON-serializable result — inspect
    *  state, call functions, verify behavior. */
   evaluate?(js: string): Promise<unknown>;
+  /** Tabs currently reachable through the browser control channel. This is
+   *  intentionally metadata-only: cookies and storage never leave the browser. */
+  tabs?(): Promise<Array<{ index: number; url: string; title?: string; active: boolean }>>;
+  /** Rebind this connector to an already-open tab. Returns false when no tab
+   *  matches, allowing the caller to navigate the Ares-owned page instead. */
+  attachToExisting?(query: string): Promise<boolean>;
 }

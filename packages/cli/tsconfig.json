@@ -7,6 +7,7 @@
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
   "references": [
+    { "path": "../browser-extension-connector" },
     { "path": "../protocol" },
     { "path": "../core" },
     { "path": "../tools" },

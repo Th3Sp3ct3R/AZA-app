@@ -8,6 +8,8 @@
 // Full DAG fork/diff/rollback come in M4; M1 provides linear rollout.
 
 import { mkdir, appendFile, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
@@ -19,8 +21,10 @@ import {
   type ProviderInfo,
   type Message,
   type ToolResultBlock,
+  type Todo,
+  type WorkStatus,
 } from "@ares/protocol";
-import { QueryEngine, stringifyModelToolOutput, type EngineTool, type Provider } from "./queryEngine.js";
+import { QueryEngine, stringifyModelToolOutput, type EngineTool, type Provider, type QueryEngineConfig } from "./queryEngine.js";
 import type { ToolPermissionRequest } from "./queryEngine.js";
 import type { PermissionPromptDecision, ReasoningLevel, Usage } from "@ares/protocol";
 import type { HookManager } from "./hooks.js";
@@ -40,6 +44,10 @@ type ReminderSource =
   | "recall"
   | "self-revise";
 
+function isOpaqueMutationTool(name: string | undefined): boolean {
+  return name === "Bash" || name === "PowerShell" || name === "CodeMode" || name === "Task" || name === "Conductor";
+}
+
 export interface SessionOptions {
   workspace: string;
   provider: Provider;
@@ -51,11 +59,20 @@ export interface SessionOptions {
   sessionId?: string;
   sessionMeta?: SessionMeta;
   initialMessages?: readonly Message[];
+  /** Last TodoWrite snapshot restored independently of lossy message replay. */
+  initialTodos?: readonly Todo[];
   initialSeq?: number;
   /** Pending system-reminders to inject at next turn_start. */
   drainSystemReminders?: () => Array<{ text: string; source: ReminderSource }>;
   /** C1 end-of-turn gate — see QueryEngineConfig.confirmTurnEnd. */
   confirmTurnEnd?: () => Promise<Array<{ text: string; source: "verifier" | "hook" }>>;
+  requireVerificationEvidence?: boolean;
+  verificationEvidence?: QueryEngineConfig["verificationEvidence"];
+  outstandingVerificationRequired?: QueryEngineConfig["outstandingVerificationRequired"];
+  persistedVerificationDebt?: QueryEngineConfig["persistedVerificationDebt"];
+  persistedVerificationScopeComplete?: QueryEngineConfig["persistedVerificationScopeComplete"];
+  observedMutationAt?: QueryEngineConfig["observedMutationAt"];
+  specDocs?: QueryEngineConfig["specDocs"];
   /** Failure-signature recall — see QueryEngineConfig.recallFailureFix. */
   recallFailureFix?: (input: { tool: string; signature: string; error: string }) => Promise<string | null>;
   hookManager?: HookManager;
@@ -72,7 +89,8 @@ export interface SessionOptions {
   maxOutputTokens?: number;
   /** Trim oldest history to keep estimated input under this many tokens. */
   contextBudgetTokens?: number;
-  /** Hard ceiling on tool-calling turns before the engine stops (default 80). */
+  /** Explicit hard ceiling on tool-calling turns. Unset = effectively
+   *  unbounded (huge backstop); loop-kill detectors terminate stuck turns. */
   maxTurns?: number;
   /** See QueryEngineConfig.onHistoryTrimmed — read-stamp invalidation on trim. */
   onHistoryTrimmed?: (dropped: readonly Message[]) => void;
@@ -80,6 +98,10 @@ export interface SessionOptions {
   summarizeSpan?: (messages: readonly Message[]) => Promise<string>;
   /** See QueryEngineConfig.compactionThresholdTokens. */
   compactionThresholdTokens?: number;
+  /** Explicit friction directory for isolated tests/portable runtimes. */
+  telemetryDir?: string;
+  /** Explicit global home for the session-location registry. */
+  sessionRegistryHome?: string;
 }
 
 export class Session {
@@ -94,6 +116,10 @@ export class Session {
   private readonly metaPath: string;
   private metaWritten = false;
   private lastCheckpointId: string | undefined;
+  private ioError: Error | null = null;
+  private readonly eventObservers = new Set<(event: TurnEvent) => void>();
+  /** Work truth from the most recent turn, used by post-turn learning. */
+  lastWorkStatus: WorkStatus = "not_applicable";
 
   constructor(private readonly opts: SessionOptions) {
     const sessionId = opts.sessionMeta?.id ?? opts.sessionId ?? `sess_${randomUUID()}`;
@@ -107,7 +133,19 @@ export class Session {
     const sessionDir = path.join(opts.workspace, ".ares", "sessions", sessionId);
     this.eventsPath = path.join(sessionDir, "events.jsonl");
     this.metaPath = path.join(sessionDir, "meta.json");
-    this.friction = new FrictionRecorder(sessionId);
+    this.friction = new FrictionRecorder(sessionId, {
+      dir: opts.telemetryDir,
+      source: "core",
+      workspace: opts.workspace,
+      provider: providerInfo.name,
+      model: providerInfo.model,
+      location: {
+        registryHome: opts.sessionRegistryHome,
+        rolloutPath: this.eventsPath,
+        metaPath: this.metaPath,
+        format: "core-rollout-v1",
+      },
+    });
     this.engine = new QueryEngine(
       {
         provider: opts.provider,
@@ -118,6 +156,13 @@ export class Session {
         signal: opts.signal,
         drainSystemReminders: opts.drainSystemReminders,
         confirmTurnEnd: opts.confirmTurnEnd,
+        requireVerificationEvidence: opts.requireVerificationEvidence,
+        verificationEvidence: opts.verificationEvidence,
+        outstandingVerificationRequired: opts.outstandingVerificationRequired,
+        persistedVerificationDebt: opts.persistedVerificationDebt,
+        persistedVerificationScopeComplete: opts.persistedVerificationScopeComplete,
+        observedMutationAt: opts.observedMutationAt,
+        specDocs: opts.specDocs,
         recallFailureFix: opts.recallFailureFix,
         hookManager: opts.hookManager,
         requestPermission: opts.requestPermission,
@@ -151,6 +196,7 @@ export class Session {
       sessionId,
     );
     if (opts.initialMessages) this.engine.hydrate(opts.initialMessages);
+    if (opts.initialTodos) this.engine.hydrateTodos(opts.initialTodos);
     if (opts.initialSeq) this.seq = opts.initialSeq;
     if (opts.sessionMeta) this.metaWritten = true;
   }
@@ -164,6 +210,13 @@ export class Session {
     this.engine.setMaxTurns(maxTurns);
   }
 
+  /** Subscribe below every UI surface so durable state and verification taps
+   * cannot be forgotten by one chat/daemon consumer. Returns an unsubscribe. */
+  observeEvents(observer: (event: TurnEvent) => void): () => void {
+    this.eventObservers.add(observer);
+    return () => this.eventObservers.delete(observer);
+  }
+
   /** Swap provider/model in place and persist the new session metadata. */
   async setProvider(
     provider: Provider,
@@ -172,6 +225,7 @@ export class Session {
   ): Promise<void> {
     this.engine.setProvider(provider, model, context);
     this.meta.provider = { name: provider.name, model };
+    this.friction.updateContext({ provider: provider.name, model });
     await this.ensureSessionDir();
     await writeFile(this.metaPath, JSON.stringify(this.meta, null, 2) + "\n", "utf8");
   }
@@ -223,11 +277,85 @@ export class Session {
 
   private async *streamAndPersist(): AsyncGenerator<TurnEvent> {
     const preToolCheckpoints = new Map<string, string>();
+    const toolNames = new Map<string, string>();
+    let observedMutationAt = 0;
+    let verificationGenerationAtObservedMutation = this.opts.verificationEvidence?.().mutationGeneration ?? 0;
     try {
-      for await (const event of this.engine.streamTurn()) {
+      for await (const rawEvent of this.engine.streamTurn()) {
+        let event = rawEvent;
+        if (event.type === "tool_start") toolNames.set(event.id, event.name);
+        if (event.type === "checkpoint_created" && event.toolUseId && event.reason === "pre_tool") {
+          preToolCheckpoints.set(event.toolUseId, event.checkpointId);
+        }
+
+        // Shell/CodeMode tools cannot declare touched files up front. Their
+        // pre-tool checkpoint is a full workspace snapshot, so diff it now and
+        // promote discovered changes onto tool_end. Every UI consumer already
+        // schedules verification from tool_end.touchedFiles; this closes the
+        // bypass without duplicating scheduling logic in each surface.
+        let preparedDiff: Awaited<ReturnType<typeof diffWorkspaceCheckpointUnified>> | null = null;
+        if (event.type === "tool_end" && (!event.touchedFiles || event.touchedFiles.length === 0)) {
+          const checkpointId = preToolCheckpoints.get(event.id);
+          if (checkpointId) {
+            try {
+              preparedDiff = await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId);
+            } catch (error) {
+              // Opaque execution tools can mutate through arbitrary programs
+              // (`node generator.mjs`, build scripts, formatters). If their
+              // checkpoint diff fails, failing open would label the turn
+              // not_applicable. Arm proof debt with an explicit sentinel and
+              // surface the unavailable diff as a truncated workspace event.
+              if (isOpaqueMutationTool(toolNames.get(event.id))) {
+                const sentinel = path.resolve(this.opts.workspace, ".ares-unknown-mutation");
+                const detail = error instanceof Error ? error.message : String(error);
+                preparedDiff = {
+                  files: [path.basename(sentinel)],
+                  diff: `Checkpoint diff unavailable after ${toolNames.get(event.id)}: ${detail}`,
+                  truncated: true,
+                };
+                event = { ...event, touchedFiles: [sentinel] };
+              }
+            }
+            if (preparedDiff?.files.length) {
+              event = {
+                ...event,
+                touchedFiles: preparedDiff.files.map((file) => path.resolve(this.opts.workspace, file)),
+              };
+            }
+          } else if (isOpaqueMutationTool(toolNames.get(event.id))) {
+            // Broad/home workspaces deliberately disable snapshots. Delegated
+            // writers and arbitrary code execution must still fail closed:
+            // exact files are unavailable, so arm an unknown mutation debt.
+            const sentinel = path.resolve(this.opts.workspace, ".ares-unknown-mutation");
+            preparedDiff = {
+              files: [path.basename(sentinel)],
+              diff: `Checkpoint unavailable after ${toolNames.get(event.id)}; workspace mutation scope is unknown.`,
+              truncated: true,
+            };
+            event = { ...event, touchedFiles: [sentinel] };
+          }
+        }
+        if (event.type === "tool_end" && event.touchedFiles?.length) {
+          verificationGenerationAtObservedMutation = this.opts.verificationEvidence?.().mutationGeneration ?? verificationGenerationAtObservedMutation;
+          observedMutationAt = Date.now();
+        }
+        if (event.type === "turn_end" && observedMutationAt > 0 && (!event.workStatus || event.workStatus === "not_applicable")) {
+          const evidence = this.opts.verificationEvidence?.();
+          const currentRun = evidence?.latestRunGeneration === evidence?.mutationGeneration;
+          const newerRun = (evidence?.latestRunGeneration ?? -1) > verificationGenerationAtObservedMutation;
+          const passedAfterMutation = currentRun && newerRun && evidence?.latestRunStatus === "passed" && evidence.latestRunStrength === "behavioral";
+          const failedAfterMutation = currentRun && newerRun && evidence?.latestRunStatus === "failed";
+          event = {
+            ...event,
+            workStatus: passedAfterMutation ? "verified" : failedAfterMutation ? "blocked" : "unverified",
+          };
+        }
+
         // Persistence is enqueued (not awaited) so a fast token stream never
         // waits on an NTFS append + Defender scan before reaching the consumer.
         this.persistEvent(event);
+        this.notifyEvent(event);
+        if (event.type === "turn_end") this.lastWorkStatus = event.workStatus ?? "not_applicable";
         // Friction telemetry rides the same tap — every surface (chat, TUI,
         // daemon) logs identically because they all stream through here.
         this.friction.record(event);
@@ -237,13 +365,12 @@ export class Session {
         // user's immediate next message).
         if (event.type === "turn_end") await this.flush();
         yield event;
-      if (event.type === "checkpoint_created" && event.toolUseId && event.reason === "pre_tool") {
-        preToolCheckpoints.set(event.toolUseId, event.checkpointId);
-      }
-        if (event.type === "tool_end" && event.touchedFiles && event.touchedFiles.length > 0) {
+
+        if (event.type === "tool_end") {
+          toolNames.delete(event.id);
           const checkpointId = preToolCheckpoints.get(event.id);
           if (!checkpointId) continue;
-          const diff = await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId, event.touchedFiles).catch(() => null);
+          const diff = preparedDiff ?? await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId, event.touchedFiles).catch(() => null);
           if (!diff || !diff.diff) continue;
           const diffEvent: TurnEvent = {
             type: "workspace_diff",
@@ -254,6 +381,7 @@ export class Session {
             truncated: diff.truncated,
           };
           this.persistEvent(diffEvent);
+          this.notifyEvent(diffEvent);
           yield diffEvent;
         }
       }
@@ -290,6 +418,12 @@ export class Session {
    * ioChain so writes never interleave and the hot path never waits on disk.
    */
   private persistEvent(event: TurnEvent): void {
+    // Live-stream ephemera never lands in the rollout. Replay reconstructs
+    // history from turn_start/message_done/tool_end/tool_error/compaction;
+    // tool_progress exists only to animate the in-flight UI — and the browser
+    // tool's frames are ~85KB of base64 JPEG apiece, which once ballooned a
+    // session log to 355MB and froze every full-file reader in the app.
+    if (event.type === "tool_progress") return;
     const persistedEvent: TurnEvent =
       event.type === "turn_end"
         ? { ...event, provider: this.meta.provider.name, model: this.meta.provider.model }
@@ -300,12 +434,40 @@ export class Session {
       event: persistedEvent,
     };
     const line = JSON.stringify(entry) + "\n";
-    this.ioChain = this.ioChain.then(() => appendFile(this.eventsPath, line, "utf8")).catch(() => {});
+    this.ioChain = this.ioChain
+      .catch(() => undefined)
+      .then(() => appendFile(this.eventsPath, line, "utf8"))
+      .catch((error: unknown) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        // Surface the FIRST failure immediately (disk full, perms, path gone) —
+        // the rollout is the durable session history; silently losing it until
+        // someone happens to await flush() was how sessions vanished with no
+        // trace. Log once (not per-event) so a persistent fault isn't spammy.
+        if (!this.ioError) {
+          try {
+            process.stderr.write(`[session] rollout persistence failing (${this.eventsPath}): ${err.message}\n`);
+          } catch { /* stderr unavailable */ }
+        }
+        this.ioError = err;
+      });
   }
 
   /** Await all pending rollout appends. */
-  private flush(): Promise<void> {
-    return this.ioChain;
+  private async flush(): Promise<void> {
+    await Promise.all([this.ioChain, this.friction.settle()]);
+    if (this.ioError) {
+      throw new Error(`session rollout persistence failed: ${this.ioError.message}`, { cause: this.ioError });
+    }
+  }
+
+  private notifyEvent(event: TurnEvent): void {
+    for (const observer of this.eventObservers) {
+      try {
+        observer(event);
+      } catch {
+        // Observability cannot invalidate a completed tool call or model turn.
+      }
+    }
   }
 }
 
@@ -324,6 +486,8 @@ export interface SessionSummary {
 export interface SessionSnapshot {
   meta: SessionMeta;
   messages: Message[];
+  /** Latest durable TodoWrite state, folded from rollout events. */
+  todos: Todo[];
   nextSeq: number;
   eventCount: number;
   preview: string;
@@ -347,18 +511,16 @@ export async function listSessions(workspace: string, limit = 20): Promise<Sessi
         const meta = await readSessionMeta(sessionDir);
         if (!meta) return null;
         const eventsPath = path.join(sessionDir, "events.jsonl");
-        const eventsText = await readFile(eventsPath, "utf8").catch(() => "");
-        const eventCount = eventsText.trim() ? eventsText.trim().split(/\r?\n/).length : 0;
+        const scan = await scanRolloutForListing(eventsPath);
         const updated = await stat(eventsPath).catch(() => null);
-        const preview = previewFromEvents(eventsText);
         return {
           id: meta.id,
           workspace: meta.workspace,
           provider: meta.provider,
           createdAt: meta.createdAt,
           updatedAt: updated?.mtime.toISOString() ?? meta.createdAt,
-          eventCount,
-          preview,
+          eventCount: scan.eventCount,
+          preview: scan.preview,
           label: meta.label,
         };
       }),
@@ -381,11 +543,13 @@ export async function loadSessionSnapshot(
   const eventsText = await readFile(eventsPath, "utf8").catch(() => "");
   const entries = parseRolloutEntries(eventsText);
   const rawMessages = messagesFromRollout(entries);
+  const todos = latestTodosFromRollout(entries);
   const replay = compactReplayMessages(rawMessages, sessionId, opts.maxMessages);
   const nextSeq = entries.length > 0 ? Math.max(...entries.map((entry) => entry.seq)) + 1 : 0;
   return {
     meta,
     messages: replay.messages,
+    todos,
     nextSeq,
     eventCount: entries.length,
     preview: previewFromMessages(rawMessages),
@@ -393,6 +557,14 @@ export async function loadSessionSnapshot(
     omittedMessageCount: replay.omittedMessageCount,
     replayedMessageCount: replay.messages.length,
   };
+}
+
+function latestTodosFromRollout(entries: readonly RolloutEntry[]): Todo[] {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const event = entries[index].event;
+    if (event.type === "todo_updated") return event.todos.map((todo) => ({ ...todo }));
+  }
+  return [];
 }
 
 /** The FULL raw rollout for a session — every persisted event, untouched by
@@ -592,8 +764,50 @@ function truncateSummaryText(text: string): string {
   return text.length > 220 ? `${text.slice(0, 217)}...` : text;
 }
 
-function previewFromEvents(text: string): string {
-  return previewFromMessages(messagesFromRollout(parseRolloutEntries(text)));
+/**
+ * One bounded pass over a rollout for the session picker: count events and
+ * find the newest user words WITHOUT loading the file into memory. The picker
+ * lists every session on disk, so it must never pay for a pathological log —
+ * a filmstrip-heavy rollout once reached 355MB and a readFile-per-session
+ * listing froze the whole app. Only the last turn_start (and, if newer, the
+ * last compaction snapshot) is ever parsed.
+ */
+async function scanRolloutForListing(eventsPath: string): Promise<{ eventCount: number; preview: string }> {
+  let eventCount = 0;
+  let lastTurnStart = "";
+  let lastCompaction = "";
+  let compactionIsNewer = false;
+  try {
+    const lines = createInterface({ input: createReadStream(eventsPath, "utf8"), crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      eventCount += 1;
+      // The entry's own event tag is the only place this substring appears
+      // unescaped — the same text inside message content is quote-escaped.
+      if (line.includes('"event":{"type":"turn_start"')) {
+        lastTurnStart = line;
+        compactionIsNewer = false;
+      } else if (line.includes('"event":{"type":"compaction"')) {
+        lastCompaction = line;
+        compactionIsNewer = true;
+      }
+    }
+  } catch {
+    return { eventCount: 0, preview: "" };
+  }
+  const candidates = compactionIsNewer ? [lastCompaction, lastTurnStart] : [lastTurnStart, lastCompaction];
+  for (const raw of candidates) {
+    if (!raw) continue;
+    const event = parseRolloutEntries(raw)[0]?.event;
+    if (event?.type === "turn_start") {
+      const preview = previewFromMessages([event.userMessage]);
+      if (preview) return { eventCount, preview };
+    } else if (event?.type === "compaction" && Array.isArray(event.messages)) {
+      const preview = previewFromMessages(event.messages);
+      if (preview) return { eventCount, preview };
+    }
+  }
+  return { eventCount, preview: "" };
 }
 
 function previewFromMessages(messages: readonly Message[]): string {

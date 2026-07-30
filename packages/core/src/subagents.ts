@@ -367,8 +367,17 @@ export class AresSubagentRunner implements SubagentRunner {
     const status: SubagentRunResult["status"] = result.status === "completed" ? "completed" : "failed";
 
     const hasAssistant = result.history.some((m) => m.role === "assistant");
-    const finalText =
-      result.finalText || (hasAssistant ? "(subagent produced no text output)" : "(subagent did not respond)");
+    // A child that died before writing prose still owes the parent an
+    // explanation — surface its last tool errors instead of the bare
+    // "(subagent produced no text output)" that made fleet deaths undebuggable.
+    const lastToolErrors = events
+      .filter((e) => e.type === "tool_error")
+      .slice(-3)
+      .map((e) => `- ${String((e as { error?: unknown }).error ?? "").slice(0, 300)}`);
+    const emptyText =
+      (hasAssistant ? "(subagent produced no text output)" : "(subagent did not respond)") +
+      (lastToolErrors.length ? `\nLast tool error(s):\n${lastToolErrors.join("\n")}` : "");
+    const finalText = result.finalText || emptyText;
 
     // Structured handoff: what the child actually DID (from engine events), fed
     // back alongside its prose so the parent doesn't have to trust the claims.

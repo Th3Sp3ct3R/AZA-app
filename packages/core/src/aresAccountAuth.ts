@@ -20,7 +20,7 @@
 // browser history / loopback logs — it's exchanged server-to-server over #2.
 
 import { createServer, type Server } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const DEFAULT_PORT = 53691;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -43,19 +43,43 @@ export function normalizeGatewayBase(base: string): string {
   return raw.replace(/^(https?:\/\/)doingteam\.com/i, "$1www.doingteam.com");
 }
 
-export function buildAresAuthorizeUrl(base: string, redirectUri: string, state: string): string {
+export interface AresAuthorizeOptions {
+  codeChallenge?: string;
+  deviceName?: string;
+}
+
+export function buildAresAuthorizeUrl(base: string, redirectUri: string, state: string, opts: AresAuthorizeOptions = {}): string {
   const u = new URL(`${normalizeGatewayBase(base)}/account/connect`);
   u.searchParams.set("redirect_uri", redirectUri);
   u.searchParams.set("state", state);
+  if (opts.codeChallenge) {
+    u.searchParams.set("code_challenge", opts.codeChallenge);
+    u.searchParams.set("code_challenge_method", "S256");
+  }
+  if (opts.deviceName) u.searchParams.set("device_name", opts.deviceName);
   return u.toString();
 }
 
+export interface AresExchangeOptions {
+  codeVerifier?: string;
+  redirectUri?: string;
+  deviceName?: string;
+  fetchImpl?: typeof fetch;
+}
+
 /** Server-to-server swap of the short-lived code for the account token. */
-export async function exchangeAresCode(base: string, code: string, fetchImpl: typeof fetch = fetch): Promise<string> {
+export async function exchangeAresCode(base: string, code: string, options: AresExchangeOptions | typeof fetch = {}): Promise<string> {
+  const opts: AresExchangeOptions = typeof options === "function" ? { fetchImpl: options } : options;
+  const fetchImpl = opts.fetchImpl ?? fetch;
   const res = await fetchImpl(`${normalizeGatewayBase(base)}/api/gateway/v1/oauth/exchange`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code }),
+    body: JSON.stringify({
+      code,
+      ...(opts.codeVerifier ? { code_verifier: opts.codeVerifier } : {}),
+      ...(opts.redirectUri ? { redirect_uri: opts.redirectUri } : {}),
+      ...(opts.deviceName ? { device_name: opts.deviceName } : {}),
+    }),
   }).catch((err: unknown) => {
     throw new Error(`couldn't reach the Ares gateway to finish sign-in: ${err instanceof Error ? err.message : String(err)}`);
   });
@@ -135,6 +159,8 @@ export interface AresSigninOptions {
   port?: number;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Friendly label shown in the account's Devices list. */
+  deviceName?: string;
   /** Injectable capture (tests) — defaults to the real loopback server. */
   captureCode?: (redirectUri: string, state: string, port: number, timeoutMs: number) => Promise<string>;
 }
@@ -146,11 +172,14 @@ export async function runAresAccountSignin(base: string, opts: AresSigninOptions
   const port = opts.port ?? DEFAULT_PORT;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const state = randomBytes(16).toString("hex");
-  const redirectUri = `http://localhost:${port}/oauth/callback`;
-  const authorizeUrl = buildAresAuthorizeUrl(normalized, redirectUri, state);
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+  const deviceName = opts.deviceName?.trim() || "Ares desktop";
+  const redirectUri = `http://127.0.0.1:${port}/oauth/callback`;
+  const authorizeUrl = buildAresAuthorizeUrl(normalized, redirectUri, state, { codeChallenge, deviceName });
   await opts.onAuthorizeUrl?.(authorizeUrl);
   const capture = opts.captureCode ?? captureLoopbackCode;
   const code = await capture(redirectUri, state, port, timeoutMs);
-  const token = await exchangeAresCode(normalized, code, opts.fetchImpl);
+  const token = await exchangeAresCode(normalized, code, { codeVerifier, redirectUri, deviceName, fetchImpl: opts.fetchImpl });
   return { token, base: normalized };
 }

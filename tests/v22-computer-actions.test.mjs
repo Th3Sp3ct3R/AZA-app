@@ -28,6 +28,12 @@ test("schema: windows needs no coordinates", () => {
   assert.equal(parsed.success, true);
 });
 
+test("guard: browser windows are rejected before ComputerUse can steal the mouse", async () => {
+  const verdict = await ComputerUseTool.validateInput({ action: "activate", text: "Home / X - Google Chrome" }, {});
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.message, /Use Browser tabs\/attach\/open/);
+});
+
 // ── Active-window capture: clicks map into the window, not the whole desktop ───
 
 test("window capture: a click maps into the window using its own origin", () => {

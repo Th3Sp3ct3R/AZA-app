@@ -9,6 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runtime = path.join(root, "tauri", "src-tauri", "runtime");
 const cliOut = path.join(runtime, "cli", "ares-cli.mjs");
 const templatesOut = path.join(runtime, "templates");
+const voiceServiceOut = path.join(runtime, "voice_service");
 const binOut = path.join(runtime, "bin");
 const modulesOut = path.join(runtime, "node_modules");
 const nodeName = process.platform === "win32" ? "node.exe" : "node";
@@ -60,6 +61,9 @@ await build({
 await cp(path.join(root, "packages", "agent", "templates"), templatesOut, {
   recursive: true,
 });
+await cp(path.join(root, "voice_service"), voiceServiceOut, {
+  recursive: true,
+});
 await cp(process.execPath, path.join(binOut, nodeName));
 
 const connectorRequire = createRequire(path.join(root, "packages", "connectors", "package.json"));
@@ -79,6 +83,7 @@ for (const [packageName, packageDir] of runtimePackages) {
 const outputs = [
   cliOut,
   path.join(binOut, nodeName),
+  path.join(voiceServiceOut, "server.py"),
   path.join(modulesOut, "playwright", "package.json"),
   path.join(modulesOut, "playwright-core", "package.json"),
 ];

@@ -19,6 +19,7 @@ import os from "node:os";
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:net";
 import { agentPaths, aresAgentHome } from "../paths.js";
 import { exists, writeFileAtomic } from "../files.js";
 import { SKILL_NAME } from "../tools/SkillCraft.js";
@@ -44,6 +45,31 @@ export interface SkillRunResult {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_LOG_CHARS = 8_000;
+const leasedSkillPorts = new Set<number>();
+
+/** Ask the OS for a free loopback port, then keep it reserved in Ares's own
+ * process-level lease table for the lifetime of the skill. The tiny close→spawn
+ * handoff is necessary because Node handlers bind their own socket; the OS is
+ * still the authority, so a non-Ares process occupying it makes the handler's
+ * bind fail honestly rather than killing anything. */
+async function leaseSkillPort(): Promise<number> {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const port = await new Promise<number>((resolve, reject) => {
+      const server = createServer();
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        const candidate = typeof address === "object" && address ? address.port : 0;
+        server.close((error) => error ? reject(error) : resolve(candidate));
+      });
+    });
+    if (port > 0 && !leasedSkillPorts.has(port)) {
+      leasedSkillPorts.add(port);
+      return port;
+    }
+  }
+  throw new Error("could not lease a loopback port for the skill");
+}
 
 // Written once to skills/ so handler.js resolves as ESM. .mjs runner is ESM
 // regardless, but handlers are plain .js and need the package.json type hint.
@@ -90,7 +116,12 @@ async function main() {
   if (typeof handler !== "function") {
     throw new Error("skill handler.js must export a default async function (input, ctx) => result");
   }
-  const ctx = { home: process.env.ARES_HOME, name: process.env.ARES_SKILL_NAME };
+  const ctx = {
+    home: process.env.ARES_HOME,
+    name: process.env.ARES_SKILL_NAME,
+    host: "127.0.0.1",
+    port: Number(process.env.ARES_SKILL_PORT || process.env.PORT || 0),
+  };
   const result = await handler(input, ctx);
   await writeOut({ ok: true, result: result === undefined ? null : result });
 }
@@ -161,45 +192,55 @@ export async function runSkill(opts: RunSkillOptions): Promise<SkillRunResult> {
   await writeFileAtomic(inputFile, JSON.stringify(opts.input ?? null));
 
   const startedAt = Date.now();
-  const run = await new Promise<{ logs: string; timedOut: boolean; exitCode: number | null; spawnError?: Error }>((resolve) => {
-    const child = spawn(process.execPath, [runner], {
-      cwd: skillDir,
-      windowsHide: true,
-      env: {
-        ...process.env,
-        ARES_HOME: home,
-        ARES_SKILL_NAME: opts.name,
-        ARES_SKILL_HANDLER: handlerPath,
-        ARES_SKILL_INPUT_FILE: inputFile,
-        ARES_SKILL_OUTPUT_FILE: outputFile,
-      },
+  const skillPort = await leaseSkillPort();
+  let run: { logs: string; timedOut: boolean; exitCode: number | null; spawnError?: Error };
+  try {
+    run = await new Promise<{ logs: string; timedOut: boolean; exitCode: number | null; spawnError?: Error }>((resolve) => {
+      const child = spawn(process.execPath, [runner], {
+        cwd: skillDir,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          ARES_HOME: home,
+          ARES_SKILL_NAME: opts.name,
+          ARES_SKILL_HANDLER: handlerPath,
+          ARES_SKILL_INPUT_FILE: inputFile,
+          ARES_SKILL_OUTPUT_FILE: outputFile,
+          ARES_SKILL_HOST: "127.0.0.1",
+          ARES_SKILL_PORT: String(skillPort),
+          HOST: "127.0.0.1",
+          PORT: String(skillPort),
+        },
+      });
+
+      const chunks: Buffer[] = [];
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill();
+      }, timeoutMs);
+
+      const onAbort = () => child.kill();
+      opts.signal?.addEventListener("abort", onAbort);
+
+      const collect = (chunk: Buffer) => chunks.push(chunk);
+      child.stdout.on("data", collect);
+      child.stderr.on("data", collect);
+
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+        resolve({ logs: clampLog(Buffer.concat(chunks).toString("utf8")), timedOut, exitCode: null, spawnError: err });
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+        resolve({ logs: clampLog(Buffer.concat(chunks).toString("utf8")), timedOut, exitCode: code });
+      });
     });
-
-    const chunks: Buffer[] = [];
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
-
-    const onAbort = () => child.kill();
-    opts.signal?.addEventListener("abort", onAbort);
-
-    const collect = (chunk: Buffer) => chunks.push(chunk);
-    child.stdout.on("data", collect);
-    child.stderr.on("data", collect);
-
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      opts.signal?.removeEventListener("abort", onAbort);
-      resolve({ logs: clampLog(Buffer.concat(chunks).toString("utf8")), timedOut, exitCode: null, spawnError: err });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      opts.signal?.removeEventListener("abort", onAbort);
-      resolve({ logs: clampLog(Buffer.concat(chunks).toString("utf8")), timedOut, exitCode: code });
-    });
-  });
+  } finally {
+    leasedSkillPorts.delete(skillPort);
+  }
 
   const durationMs = Date.now() - startedAt;
 

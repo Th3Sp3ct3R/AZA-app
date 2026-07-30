@@ -1,0 +1,18 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const manifest = JSON.parse(await readFile(new URL("../manifest.json", import.meta.url), "utf8"));
+const worker = await readFile(new URL("../src/service-worker.js", import.meta.url), "utf8");
+assert.equal(manifest.manifest_version, 3);
+assert.ok(manifest.permissions.includes("debugger"));
+assert.ok(manifest.permissions.includes("nativeMessaging"));
+assert.equal(manifest.host_permissions, undefined, "host access must remain optional");
+assert.match(manifest.key, /^[A-Za-z0-9+/=]+$/);
+assert.match(worker, /Ares is navigating/);
+assert.match(worker, /pointer-events:none/);
+assert.match(worker, /prefers-reduced-motion/);
+const start = worker.indexOf("const VISUAL_BOOTSTRAP = `") + "const VISUAL_BOOTSTRAP = `".length;
+const end = worker.indexOf("`;\n\nasync function ensureVisuals", start);
+assert.ok(start > 0 && end > start, "visual bootstrap source found");
+const visualExpression = new Function(`return \`${worker.slice(start, end)}\`;`)();
+new Function(`return (${visualExpression});`);
+console.log("manifest ok");

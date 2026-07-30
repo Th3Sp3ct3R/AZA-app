@@ -99,6 +99,33 @@ export const McpListToolsTool = buildTool({
   },
 });
 
+/** Tool listing for the desktop `/mcp` explorer: connects to one named server
+ *  (even a paused one — the panel shows what it WOULD provide) and returns its
+ *  tools. Not agent-facing; the daemon calls this on behalf of the panel. */
+export async function listMcpServerTools(
+  workspace: string,
+  server: string,
+  timeoutMs?: number,
+): Promise<{ tools: Array<{ name: string; description?: string }>; error?: string }> {
+  const loaded = await loadMcpConfig(workspace, true);
+  const cfg = loaded.servers[server];
+  if (!cfg) return { tools: [], error: `unknown MCP server: ${server}` };
+  try {
+    const result = await withMcpClient(cfg, timeoutMs ?? 15_000, async (client) => await client.request("tools/list", {}));
+    const raw = (result as { tools?: unknown[] }).tools ?? [];
+    const tools = raw
+      .filter((t): t is Record<string, unknown> => !!t && typeof t === "object")
+      .map((t) => ({
+        name: typeof t.name === "string" ? t.name : "",
+        description: typeof t.description === "string" ? t.description : undefined,
+      }))
+      .filter((t) => t.name);
+    return { tools };
+  } catch (err) {
+    return { tools: [], error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export const McpCallTool = buildTool({
   name: "McpCallTool",
   description:
@@ -155,7 +182,7 @@ function extractMcpErrorText(result: unknown): string {
   return "tool reported an error";
 }
 
-async function loadMcpConfig(workspace: string): Promise<{ servers: Record<string, McpServerConfig>; configFiles: string[] }> {
+async function loadMcpConfig(workspace: string, includeDisabled = false): Promise<{ servers: Record<string, McpServerConfig>; configFiles: string[] }> {
   const home = process.env.ARES_HOME || path.join(os.homedir(), ".ares");
   // mcp-remote.json is written by the connector gallery (remote HTTP servers);
   // mcp.json is the classic hand-authored (usually stdio) config.
@@ -169,7 +196,13 @@ async function loadMcpConfig(workspace: string): Promise<{ servers: Record<strin
   for (const file of candidates) {
     try {
       const json = JSON.parse(await fs.readFile(file, "utf8")) as McpConfig;
-      Object.assign(servers, json.servers ?? json.mcpServers ?? {});
+      const entries = json.servers ?? json.mcpServers ?? {};
+      for (const [name, cfg] of Object.entries(entries)) {
+        // A paused connector (enabled:false from the /mcp toggle) keeps its
+        // tokens but contributes no tools.
+        if (!includeDisabled && (cfg as { enabled?: boolean }).enabled === false) continue;
+        servers[name] = cfg;
+      }
       configFiles.push(file);
     } catch {
       // absent or invalid; ignore here so the tool still reports what is available
