@@ -102,7 +102,10 @@ const CODE_EXTENSIONS = new Set([
 
 const CHUNK_LINES = 40;
 const CHUNK_OVERLAP = 10;
-const MAX_FILE_BYTES = 256 * 1024;
+// Large generated artifacts are ignored by directory rules, but real product
+// entrypoints routinely exceed 256 KiB (Ares' desktop App.tsx did). Excluding
+// them made repository search silently blind to a central ownership surface.
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 export const CodebaseSearchTool = buildTool({
   name: "CodebaseSearch",
@@ -337,16 +340,17 @@ async function walk(root: string, visit: (file: string) => Promise<void>): Promi
     return;
   }
   for (const e of entries) {
-    if (e.name.startsWith(".") && e.name !== "." && e.name !== "..") {
-      // Skip dotfiles unless in CODE_EXTENSIONS by virtue of having one.
-      const ext = path.extname(e.name).toLowerCase();
-      if (!CODE_EXTENSIONS.has(ext)) continue;
-    }
     const full = path.join(root, e.name);
     if (e.isDirectory()) {
       if (IGNORED_DIRS.has(e.name)) continue;
+      // Search code-bearing dot directories such as .github; explicit cache,
+      // VCS, and Ares-state directories are already denied above.
       await walk(full, visit);
     } else if (e.isFile()) {
+      if (e.name.startsWith(".")) {
+        const ext = path.extname(e.name).toLowerCase();
+        if (!CODE_EXTENSIONS.has(ext)) continue;
+      }
       await visit(full);
     }
   }

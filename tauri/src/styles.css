@@ -1,4 +1,4 @@
-/* Ares desktop v3 — the token design system.
+/* Ares desktop v3 â€” the token design system.
    Flat obsidian, one bronze accent, steel = success, crimson = danger.
    Motion is everywhere but small: entrances, sweeps, pulses. The god
    relief is the only iconography, static at the edge of vision. */
@@ -6,7 +6,7 @@
 :root {
   color-scheme: dark;
 
-  /* Blood & Rage — obsidian scorched with ember, the god of war's forge. */
+  /* Blood & Rage â€” obsidian scorched with ember, the god of war's forge. */
   --bg: #0a0708;
   --bg-raised: #120c0d;
   --panel: #160d0e;
@@ -16,11 +16,11 @@
   --muted: #b99f93;
   --faint: #8b756d;
 
-  /* the accent — ember / blood-red. Overridden per theme on the root element.
-     NOTE: tokens DERIVED from --accent (--line, --bronze, …) must NOT live here.
+  /* the accent â€” ember / blood-red. Overridden per theme on the root element.
+     NOTE: tokens DERIVED from --accent (--line, --bronze, â€¦) must NOT live here.
      A custom property's var() resolves in the element it's declared on, so a
      derived token defined on :root would bake in :root's (default red) --accent
-     and inherit that down — the per-theme --accent override on .ares would never
+     and inherit that down â€” the per-theme --accent override on .ares would never
      reach it. Those derived tokens live on .ares instead (see below). */
   --accent: #d6402e;
   --accent-hi: #ff6a44;
@@ -43,10 +43,10 @@
   --mono: "Cascadia Code", ui-monospace, Consolas, monospace;
 }
 
-/* ── war-bands — each theme re-tints the WHOLE room, not just the accent.
+/* â”€â”€ war-bands â€” each theme re-tints the WHOLE room, not just the accent.
    We override the neutral obsidian tokens (bg/panel/text) and the working-heat
    ember so the entire UI shifts mood. --steel (success) and --crimson (error)
-   stay fixed everywhere — those are semantic status colors, not decoration.
+   stay fixed everywhere â€” those are semantic status colors, not decoration.
    Themed colors elsewhere flow automatically through var(--accent-rgb). */
 .ares[data-theme="rage"] {
   --accent: #d6402e; --accent-hi: #ff6a44; --accent-rgb: 214, 64, 46;
@@ -85,7 +85,7 @@
   --ember: #59c08c; --ember-hi: #93eab8; --ember-rgb: 89, 192, 140; --blood: #134029;
 }
 
-/* Tokens DERIVED from the accent — declared on .ares so their var() resolves
+/* Tokens DERIVED from the accent â€” declared on .ares so their var() resolves
    against the THEMED --accent (set by the [data-theme] rules above on this same
    element), not :root's default. This is what makes a theme switch actually
    re-tint borders, the bronze accent, links, and selection across the whole UI. */
@@ -99,6 +99,7 @@
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; width: 100%; }
 body { margin: 0; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+body[data-presence="1"] { background: transparent; }
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
 input, textarea { font: inherit; color: var(--text); }
@@ -115,7 +116,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 ::-webkit-scrollbar-thumb:hover { background: rgba(var(--accent-rgb), 0.36); }
 ::-webkit-scrollbar-track { background: transparent; }
 
-/* ── shell ──────────────────────────────────────────────────────────── */
+/* â”€â”€ shell â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 .ares {
   display: grid;
@@ -127,18 +128,46 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   height: 100%;
   position: relative;
   overflow: hidden;
+  /* Paint the themed background HERE, not just on <body>. The theme lives on
+     this element, so body's var(--bg) resolves to the ROOT (dark) default â€”
+     in daylight that left the center stage showing near-black through the
+     transparent shell. Painting .ares makes the light bg cover everything. */
+  background: var(--bg);
 }
 
 .ares { transition: grid-template-columns 280ms cubic-bezier(0.2, 0.9, 0.3, 1); }
 
+/* During an active Forge-grip drag the 280ms track animation fought the
+   pointer, so the panel rubber-banded and trailed the grip (the "glitches when
+   dragged" bug). Suppress the transition while dragging so width tracks 1:1. */
+.ares[data-dragging="1"] { transition: none; }
+
 .ares[data-panel="1"] {
-  grid-template-columns: 264px minmax(0, 1fr) var(--forge-w, 480px);
+  /* The forge track is minmax(0, â€¦) so it SHRINKS instead of overflowing when
+     the window narrows â€” a fixed px third track pushed the total past the
+     viewport and `overflow:hidden` clipped the right half of the UI. The JS
+     resize clamp (App.tsx) keeps --forge-w from ever crushing the chat. */
+  grid-template-columns: 264px minmax(0, 1fr) minmax(0, var(--forge-w, 480px));
   grid-template-areas:
     "title title title"
     "rail stage forge";
 }
 
-/* ── the backdrop: a war-god's command table ────────────────────────── */
+/* Navigation can disappear completely when the owner wants a clean canvas.
+   The stage keeps a small restore affordance; no mystery hover strip. */
+.ares[data-rail="collapsed"] { grid-template-columns: 0 minmax(0, 1fr); }
+.ares[data-panel="1"][data-rail="collapsed"] {
+  grid-template-columns: 0 minmax(0, 1fr) minmax(0, var(--forge-w, 480px));
+}
+.ares[data-rail="collapsed"] .rail {
+  transform: translateX(-100%);
+  opacity: 0;
+  pointer-events: none;
+  padding: 0;
+  border: 0;
+}
+
+/* â”€â”€ the backdrop: a war-god's command table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .backdrop {
   position: absolute;
   inset: 0;
@@ -146,7 +175,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   z-index: 0;
   overflow: hidden;
 }
-/* the painted battlefield — the helm artwork carries the room */
+/* the painted battlefield â€” the helm artwork carries the room */
 .backdrop::before {
   content: "";
   position: absolute;
@@ -155,7 +184,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   background-size: cover;
   background-position: right center;
   background-repeat: no-repeat;
-  /* The painting sets the mood but must never compete with the transcript —
+  /* The painting sets the mood but must never compete with the transcript â€”
      pushed far back, softly blurred, and DIMMED (not ignited) while working so
      the chat content is what pops under load. */
   opacity: 0.13;
@@ -173,13 +202,13 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   opacity: 0.6;
   pointer-events: none;
 }
-/* the astrolabe — concentric tick-ringed dials, slow counter-rotation */
+/* the astrolabe â€” concentric tick-ringed dials, slow counter-rotation */
 .backdrop .astrolabe {
   position: absolute;
   top: 50%; left: auto; right: -22%;
   width: 1180px; height: 1180px;
   transform: translateY(-50%);
-  /* the painted ring carries the motif now — the live dials sit faint on top */
+  /* the painted ring carries the motif now â€” the live dials sit faint on top */
   opacity: 0.1;
 }
 .backdrop .ringSlow { transform-origin: 500px 500px; animation: spin360 240s linear infinite; }
@@ -187,7 +216,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .backdrop .ringFast { transform-origin: 500px 500px; animation: spin360 80s linear infinite; }
 .backdrop .astrolabe { transition: opacity 700ms ease; }
 /* the war-dials ignite and spin up when Ares works (the dials carry the energy
-   now — the photo recedes instead of flaring) */
+   now â€” the photo recedes instead of flaring) */
 .ares[data-working="1"] .backdrop .astrolabe { opacity: 0.2; }
 .ares[data-working="1"] .backdrop .ringFast { animation-duration: 14s; stroke: var(--ember-hi); }
 .ares[data-working="1"] .backdrop .ringMid { animation-duration: 34s; stroke: var(--ember); }
@@ -195,8 +224,8 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 /* under load the painting DIMS and softens so the chat + dials own the frame */
 .ares[data-working="1"] .backdrop::before { animation-name: backdropWork; animation-duration: 12s; filter: blur(2px) saturate(0.85) brightness(0.82); }
 
-/* the great helm at the edge of vision — soft, deep, with a warm rim glow */
-/* the painted helm replaces the line-art helm — keep the node for layout
+/* the great helm at the edge of vision â€” soft, deep, with a warm rim glow */
+/* the painted helm replaces the line-art helm â€” keep the node for layout
    compatibility but render nothing */
 .backdrop .helm { display: none; }
 /* a drifting depth field of faint motes */
@@ -217,7 +246,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   background: radial-gradient(130% 100% at 36% 46%, transparent 52%, rgba(8, 6, 7, 0.62) 100%);
 }
 
-/* ── working glow: a breathing ember aura rising over the stage ───────── */
+/* â”€â”€ working glow: a breathing ember aura rising over the stage â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .workGlow {
   position: absolute;
   grid-area: stage;
@@ -243,8 +272,8 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .ares[data-working="1"] .workGlow { opacity: 1; animation: workBreath 2.2s ease-in-out infinite; }
 .ares[data-working="1"] .workGlow::before { opacity: 1; }
 
-/* ── THE RAGE VEIL: a cinematic full-screen ignition when Ares works ──────
-   Covers the entire UI (rail, stage, forge, titlebar) — the god goes to war
+/* â”€â”€ THE RAGE VEIL: a cinematic full-screen ignition when Ares works â”€â”€â”€â”€â”€â”€
+   Covers the entire UI (rail, stage, forge, titlebar) â€” the god goes to war
    and the whole frame feels it. Pure gradients + blend; GPU-cheap. */
 .ares::after {
   content: "";
@@ -268,7 +297,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 /* a thin blood line under the titlebar that pulses while working */
 .ares[data-working="1"] .titlebar { border-bottom-color: rgba(var(--accent-rgb), 0.5); }
 
-/* embers — sparse sparks drifting up from the forge, two parallax layers */
+/* embers â€” sparse sparks drifting up from the forge, two parallax layers */
 .embers {
   position: absolute;
   inset: 0;
@@ -285,15 +314,15 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   opacity: 0.5;
   transition: opacity 700ms ease;
 }
-/* when the god works, the forge roars — embers thicken and rise faster */
+/* when the god works, the forge roars â€” embers thicken and rise faster */
 .ares[data-working="1"] .embers { opacity: 0.95; animation-duration: 13s; }
-/* At REST the forge is near-silent — a faint glow, not a fireworks show. The
+/* At REST the forge is near-silent â€” a faint glow, not a fireworks show. The
    roar is reserved for when Ares is actually working, so motion always means
    something is happening. --draft/--heat still modulate, just from a low floor. */
 .ares .embers { opacity: calc(0.1 + var(--draft, 1) * 0.08 + var(--heat, 0.3) * 0.12); animation-duration: calc(34s / (0.5 + var(--draft, 1) * 0.6)); }
 .ares[data-working="1"] .embers { opacity: calc(0.62 + var(--heat, 0.3) * 0.3); }
 
-/* ACTION STRIKE — every agent action flares the screen edge + a felt micro-shake.
+/* ACTION STRIKE â€” every agent action flares the screen edge + a felt micro-shake.
    The god moves; you feel it, not just see a glow. One-shot, gated by reduced-motion. */
 .strikeFlash {
   position: fixed; inset: 0; pointer-events: none; z-index: 60;
@@ -322,7 +351,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 }
 
 
-/* ── titlebar ───────────────────────────────────────────────────────── */
+/* â”€â”€ titlebar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 .titlebar {
   grid-area: title;
@@ -371,7 +400,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .winControls button:hover { background: rgba(var(--accent-rgb), 0.1); color: var(--text); }
 .winControls .winClose:hover { background: var(--crimson); color: #fff; }
 
-/* ── left rail ──────────────────────────────────────────────────────── */
+/* â”€â”€ left rail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 .rail {
   grid-area: rail;
@@ -383,7 +412,21 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   border-right: 1px solid var(--line);
   z-index: 2;
   min-height: 0;
+  transition: transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1), opacity 160ms ease;
 }
+.railCollapse {
+  display: flex; align-items: center; justify-content: flex-end; gap: 7px;
+  min-height: 26px; padding: 2px 4px; color: var(--faint);
+  font: 600 9.5px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase;
+}
+.railCollapse:hover { color: var(--bronze-hi); }
+.railCollapse svg, .railReveal svg { width: 17px; height: 17px; }
+.railReveal {
+  flex: none; width: 30px; height: 30px; display: grid; place-items: center;
+  margin-right: 2px; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); background: rgba(var(--accent-rgb), .05);
+}
+.railReveal:hover { color: var(--bronze-hi); border-color: var(--line-strong); }
 
 .primary {
   padding: 10px 14px;
@@ -509,7 +552,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .daemonDot i[data-state="starting"] { background: var(--bronze-hi); animation: pulse 1.2s ease-in-out infinite; }
 .daemonDot i[data-state="error"], .daemonDot i[data-state="stopped"] { background: var(--crimson); }
 
-/* ── stage ──────────────────────────────────────────────────────────── */
+/* â”€â”€ stage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 .stage {
   grid-area: stage;
@@ -533,7 +576,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .stageHead h2 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0.01em; }
 .stageHead span { display: block; margin-top: 3px; font: 500 11px/1 var(--mono); color: var(--faint); }
 
-/* ── chat ───────────────────────────────────────────────────────────── */
+/* â”€â”€ chat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 .chat {
   position: relative;
@@ -546,11 +589,11 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .chat > * {
   animation: transcriptIn 360ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
   /* flex items shrink when the column fills, and overflow:hidden children
-     (tool cards, diff cards) have a 0 minimum — they were getting crushed to
+     (tool cards, diff cards) have a 0 minimum â€” they were getting crushed to
      their 2px borders in long transcripts. Never shrink; scrolling handles it. */
   flex-shrink: 0;
 }
-/* a more spatial entrance — items rise, scale up from 98.5%, and sharpen in */
+/* a more spatial entrance â€” items rise, scale up from 98.5%, and sharpen in */
 @keyframes transcriptIn {
   from { transform: translateY(10px) scale(0.985); opacity: 0; filter: blur(1.5px); }
   to { transform: none; opacity: 1; filter: blur(0); }
@@ -581,10 +624,31 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   border-color: rgba(var(--accent-rgb), 0.15);
   animation: ringSpin 50s linear infinite reverse;
 }
+/* the empty-state question line — quiet by default; the modern skin makes it
+   the headline (see modern.css). */
+.empty .emptyAsk { margin: 6px 0 0; font: 500 15px/1.4 var(--font); color: var(--muted); letter-spacing: 0.01em; }
+
+/* Modern-skin-only markup (Ares sigil medallions, the rail wordmark, the
+   titlebar tool row). It is rendered unconditionally so the tree stays simple;
+   these rules keep Forged and Legacy pixel-identical to before the reskin.
+   modern.css re-enables and styles them under [data-style="modern"]. */
+.ares:not([data-style="modern"]) .medallion,
+.ares:not([data-style="modern"]) .railBrand,
+.ares:not([data-style="modern"]) .titleTools { display: none; }
+/* The agent turn gained a body wrapper for the modern skin's medallion gutter.
+   `display:contents` makes it vanish from layout everywhere else, so Forged
+   and Legacy see the exact box tree they saw before. */
+.ares:not([data-style="modern"]) .turnBody { display: contents; }
+
+/* Modern-skin-only markup (medallion icons, rail wordmark, titlebar tools):
+   rendered unconditionally for simplicity, INVISIBLE outside data-style="modern"
+   so Forged/Legacy stay pixel-identical. modern.css re-enables and styles them. */
+.medallion, .railBrand, .titleTools { display: none; }
+
 .empty h3 { margin: 6px 0 0; font-weight: 650; color: var(--text); letter-spacing: 0.01em; }
 .empty p { margin: 0; font-size: 13px; max-width: 380px; color: var(--muted); }
 
-/* the wordmark — the empty stage carries the name like a title card */
+/* the wordmark â€” the empty stage carries the name like a title card */
 .wordmark {
   font-family: Georgia, "Times New Roman", serif;
   font-size: clamp(64px, 9vw, 118px);
@@ -628,9 +692,16 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   white-space: pre-wrap;
   line-height: 1.55;
 }
+/* attached images render as thumbnails in the sent bubble (was a base64 blob) */
+.bubbleImages { display: flex; flex-wrap: wrap; gap: 6px; }
+.bubbleText:not(:empty) { margin-top: 8px; }
+.bubbleImage {
+  max-width: 220px; max-height: 220px; border-radius: 10px; object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.12); display: block; cursor: default;
+}
 
 .turn.assistant { display: grid; gap: 10px; max-width: 86%; }
-/* live generation — a glowing ember caret rides the end of the streaming text */
+/* live generation â€” a glowing ember caret rides the end of the streaming text */
 .turn.assistant[data-streaming="1"] .prose::after {
   content: "";
   display: inline-block; vertical-align: text-bottom;
@@ -697,7 +768,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   background: linear-gradient(90deg, var(--line-strong), var(--line), transparent);
 }
 
-/* native tables — rendered from markdown, themed */
+/* native tables â€” rendered from markdown, themed */
 .prose .tableWrap { overflow-x: auto; margin: 10px 0; border: 1px solid var(--line); border-radius: var(--r-md); }
 .prose table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
 .prose thead th {
@@ -754,9 +825,9 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .authModalHint { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
 .authSteps { display: grid; gap: 6px; margin: 4px 0; padding: 0; list-style: none; width: 100%; }
 .authSteps li { display: flex; align-items: center; gap: 9px; font-size: 12px; color: var(--faint); }
-.authSteps li::before { content: "○"; color: var(--faint); }
+.authSteps li::before { content: "â—‹"; color: var(--faint); }
 .authSteps li[data-on="1"] { color: var(--steel); }
-.authSteps li[data-on="1"]::before { content: "●"; color: var(--steel); }
+.authSteps li[data-on="1"]::before { content: "â—"; color: var(--steel); }
 .authModal input { width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 13px; outline: none; font-family: var(--mono); font-size: 12.5px; }
 .authModal input:focus { border-color: var(--accent); }
 .authErr { margin: 0; font-size: 11.5px; color: var(--crimson); }
@@ -767,7 +838,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .signInRow { justify-content: space-between; }
 .signInBtn { color: var(--accent-hi); border-color: var(--line-strong); }
 
-/* model attribution badge — proves routing is live, per message */
+/* model attribution badge â€” proves routing is live, per message */
 .modelBadge {
   display: inline-flex; align-items: center; gap: 6px;
   align-self: flex-start;
@@ -823,25 +894,50 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .chartVal { flex: none; width: 52px; text-align: right; font: 600 12px/1 var(--mono); color: var(--accent-hi); }
 @keyframes chartGrow { from { width: 0 !important; } }
 
-.thinking {
-  display: flex; gap: 10px; align-items: baseline;
-  padding: 8px 12px;
-  border-left: 2px solid var(--line-strong);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
-  background: rgba(var(--accent-rgb), 0.04);
-  text-align: left;
-  color: var(--muted);
-  transition: background 140ms ease;
+/* the thought â€” a quiet aside, not a monument. No box, no slab, no uppercase
+   mono: just a soft collapsible line that streams while Ares reasons. */
+.thinking { color: var(--muted); }
+.thinkHead {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 3px 2px; background: transparent; border: none; cursor: pointer;
+  color: var(--faint); font: inherit; text-align: left;
 }
-.thinking:hover { background: rgba(var(--accent-rgb), 0.08); }
-.thinkLabel { flex: none; font: 600 10px/1.6 var(--mono); letter-spacing: 0.18em; color: var(--faint); text-transform: uppercase; }
-.thinkText { font-size: 12.5px; line-height: 1.5; font-style: italic; white-space: pre-wrap; }
-.thinking[data-open="0"] .thinkText { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; }
+.thinkHead:hover { color: var(--muted); }
+.thinkSigil {
+  flex: none; width: 5px; height: 5px; border-radius: 50%;
+  background: currentColor; opacity: 0.6; transition: background 200ms ease, box-shadow 200ms ease;
+}
+.thinking[data-live="1"] .thinkSigil { background: var(--accent); opacity: 1; box-shadow: 0 0 7px rgba(var(--accent-rgb), 0.7); animation: thinkPulse 1.3s ease-in-out infinite; }
+@keyframes thinkPulse { 50% { opacity: 0.4; } }
+.thinkLabel { flex: none; font-size: 12px; font-weight: 500; color: inherit; }
+.thinking[data-live="1"] .thinkLabel { color: var(--muted); }
+.thinkEllipsis { display: inline-flex; gap: 2px; }
+.thinkEllipsis i { width: 3px; height: 3px; border-radius: 50%; background: var(--faint); animation: thinkDot 1.1s ease-in-out infinite; }
+.thinkEllipsis i:nth-child(2) { animation-delay: 150ms; }
+.thinkEllipsis i:nth-child(3) { animation-delay: 300ms; }
+@keyframes thinkDot { 40% { transform: translateY(-2px); background: var(--accent); } }
+.thinkMeta { margin-left: auto; flex: none; font-size: 10.5px; color: var(--faint); opacity: 0.75; }
+.thinkChevron { flex: none; font-size: 9px; color: var(--faint); transition: transform 180ms ease; }
+.thinkChevron[data-open="1"] { transform: rotate(180deg); }
+.thinkText {
+  padding: 2px 2px 4px 12px; margin-left: 2px;
+  border-left: 1px solid var(--line);
+  font-size: 12.5px; line-height: 1.55; font-style: italic; color: var(--muted); white-space: pre-wrap;
+  /* Long unbroken tokens (paths, URLs, code fragments) must wrap downward,
+     never push the block wider than the column and shear the layout. */
+  overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; overflow-x: hidden;
+  user-select: text; cursor: text;
+}
+.thinking { min-width: 0; max-width: 100%; }
+.thinkText[data-open="0"] { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+@media (prefers-reduced-motion: reduce) {
+  .thinking[data-live="1"] .thinkSigil, .thinkEllipsis i { animation: none; }
+}
 
-/* ── the morphing tool card ────────────────────────────────────────────────
+/* â”€â”€ the morphing tool card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
    One reused card per tool batch. A single icon slot crossfades through each
    tool as it runs; the title rewrites to the live action; on finish it settles
-   to "N tools attempted". Slim translucent glass — hugs its content, no fat box. */
+   to "N tools attempted". Slim translucent glass â€” hugs its content, no fat box. */
 .toolCard {
   position: relative;
   width: fit-content; max-width: 80%;
@@ -858,7 +954,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   border-color: rgba(var(--ember-rgb), 0.3);
   animation: railEmber 2.8s ease-in-out infinite;
 }
-/* a soft ember halo while running — glow, not a fat rail */
+/* a soft ember halo while running â€” glow, not a fat rail */
 @keyframes railEmber {
   0%, 100% { box-shadow: 0 0 20px -10px rgba(var(--ember-rgb), 0.4); }
   50% { box-shadow: 0 0 28px -6px rgba(var(--ember-rgb), 0.6); }
@@ -874,8 +970,11 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   transition: background 140ms ease;
 }
 .toolCardHead:hover { background: rgba(255, 255, 255, 0.03); }
+.toolProgressRail { height: 2px; margin: 0 12px; overflow: hidden; border-radius: 2px; background: rgba(255,255,255,.035); }
+.toolProgressRail i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--bronze), var(--ember-hi)); box-shadow: 0 0 10px rgba(var(--ember-rgb), .55); transition: width 280ms cubic-bezier(.2,.9,.3,1); animation: toolRailBreathe 1.2s ease-in-out infinite; }
+@keyframes toolRailBreathe { 50% { filter: brightness(1.35); } }
 
-/* the morphing icon slot — a small rounded chip whose glyph swaps in place */
+/* the morphing icon slot â€” a small rounded chip whose glyph swaps in place */
 .toolCardIcon {
   flex: none; width: 26px; height: 26px;
   display: grid; place-items: center;
@@ -886,7 +985,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .toolCard[data-state="running"] .toolCardIcon { background: rgba(var(--ember-rgb), 0.14); }
 .toolCard[data-state="error"] .toolCardIcon { background: rgba(194, 80, 72, 0.14); }
 .morphGlyph { position: relative; width: 16px; height: 16px; font-size: 11px; background: none; border: none; animation: morphIn 360ms cubic-bezier(0.2, 0.9, 0.3, 1); }
-/* a little splash ring each time the card morphs to a new tool — keyed remount
+/* a little splash ring each time the card morphs to a new tool â€” keyed remount
    replays it, so every tool call gets a quick ember ripple */
 .morphGlyph::after {
   content: ""; position: absolute; inset: -7px; border-radius: 50%;
@@ -924,7 +1023,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .toolCardHead .caret[data-open="1"] { transform: rotate(90deg); border-left-color: var(--bronze); }
 .stepLiveTail.cardTail { margin: 0 12px 12px 58px; }
 
-/* shared glyph chip — used in trail (mini) and expanded steps */
+/* shared glyph chip â€” used in trail (mini) and expanded steps */
 .glyph {
   flex: none;
   display: grid; place-items: center;
@@ -935,14 +1034,14 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   border: 1px solid transparent;
   transition: color 200ms ease, border-color 200ms ease, background 200ms ease;
 }
-.glyph::before { content: "●"; font-size: 5px; }
-.glyph[data-glyph="file"]::before { content: "▤"; }
-.glyph[data-glyph="search"]::before { content: "⌕"; }
-.glyph[data-glyph="edit"]::before { content: "✎"; }
-.glyph[data-glyph="create"]::before { content: "✚"; }
-.glyph[data-glyph="shell"]::before { content: "❯_"; letter-spacing: -1px; }
-.glyph[data-glyph="web"]::before { content: "◍"; }
-.glyph[data-glyph="task"]::before { content: "⑂"; }
+.glyph::before { content: "â—"; font-size: 5px; }
+.glyph[data-glyph="file"]::before { content: "â–¤"; }
+.glyph[data-glyph="search"]::before { content: "âŒ•"; }
+.glyph[data-glyph="edit"]::before { content: "âœŽ"; }
+.glyph[data-glyph="create"]::before { content: "âœš"; }
+.glyph[data-glyph="shell"]::before { content: "â¯_"; letter-spacing: -1px; }
+.glyph[data-glyph="web"]::before { content: "â—"; }
+.glyph[data-glyph="task"]::before { content: "â‘‚"; }
 .glyph.mini[data-status="ok"] { color: var(--steel); }
 .glyph.mini[data-status="running"], .glyph.mini[data-status="drafting"] { color: var(--ember-hi); }
 .glyph.mini[data-status="error"] { color: var(--crimson); border-color: rgba(194, 80, 72, 0.4); }
@@ -961,7 +1060,7 @@ a:hover { border-bottom-color: var(--bronze-hi); }
 .stepLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stepMeta { margin-left: auto; font: 500 10px/1 var(--mono); color: var(--faint); flex: none; }
 .toolStep .stepIo b { display: block; color: var(--bronze); font: 600 9px/1.8 var(--mono); letter-spacing: 0.2em; text-transform: uppercase; }
-/* Live shell output while a tool runs — a small auto-scrolling terminal vein.
+/* Live shell output while a tool runs â€” a small auto-scrolling terminal vein.
    Deliberately NOT styled like the bronze, italic "thinking" block: this is a
    black terminal with an ember rail and a "running" header, so command output
    never gets mistaken for the model's inner monologue. */
@@ -975,12 +1074,12 @@ a:hover { border-bottom-color: var(--bronze-hi); }
   font: 11px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word;
 }
 .toolStep .stepLiveTail::before {
-  content: "❯ running"; position: absolute; top: 5px; left: 10px;
+  content: "â¯ running"; position: absolute; top: 5px; left: 10px;
   font: 700 8.5px/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase;
   color: var(--ember-hi); opacity: 0.85;
 }
 
-/* ── the vault (Artifacts page) ─────────────────────────────────────── */
+/* â”€â”€ the vault (Artifacts page) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .vault {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
@@ -1164,7 +1263,7 @@ a.vaultName { border-bottom: none; }
   .vaultLoc { grid-column: 2; }
 }
 
-/* ── the settings shell: left-nav modal ─────────────────────────────── */
+/* â”€â”€ the settings shell: left-nav modal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .scrim.center { justify-content: center; align-items: center; }
 .settingsShell {
   width: min(920px, 94vw); height: min(680px, 92vh);
@@ -1234,16 +1333,292 @@ a.vaultName { border-bottom: none; }
 .themeCard:hover { border-color: var(--line-strong); transform: translateY(-1px); }
 .themeCard[data-on="1"] { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.08); }
 .themeSwatch { width: 100%; height: 26px; border-radius: 6px; box-shadow: 0 0 16px currentColor; }
+
+/* â”€â”€ Voice Hub â”€â”€ */
+.voiceHub { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); }
+.voiceGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.voiceCard {
+  display: flex; align-items: stretch; gap: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  transition: all 150ms ease;
+  overflow: hidden;
+}
+.voiceCard:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.voiceCard[data-on="1"] { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.08); }
+.voiceCard em { color: var(--ink-dim); font-style: normal; font-size: 12px; }
+.voiceCardPick {
+  flex: 1; display: grid; gap: 3px;
+  padding: 10px 12px;
+  background: transparent; border: none; text-align: left; cursor: pointer;
+}
+.voicePreview {
+  flex: 0 0 34px; display: grid; place-items: center;
+  background: transparent; border: none; border-left: 1px solid var(--line);
+  color: var(--ink-dim); cursor: pointer; font-size: 12px;
+  transition: color 120ms ease, background 120ms ease;
+}
+.voicePreview:hover { color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
+.voiceSpeed { width: 100%; accent-color: var(--accent); margin-top: 4px; }
+
+/* â”€â”€ Karaoke: the sentence being spoken right now â”€â”€ */
+.speakingNow {
+  position: fixed; left: 50%; bottom: 86px; transform: translateX(-50%);
+  z-index: 38; max-width: min(680px, 74vw);
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 14px;
+  border: 1px solid var(--line-strong); border-radius: 999px;
+  background: var(--bg-raised);
+  box-shadow: 0 12px 36px -16px rgba(0, 0, 0, 0.7);
+  animation: dockIn 180ms ease;
+  pointer-events: none;
+}
+.speakingNowIcon {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  animation: dockPulse 1.2s ease-out infinite;
+}
+.speakingNowText {
+  font-size: 12.5px; color: var(--ink-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* â”€â”€ Read-aloud: floating speak button over a text selection â”€â”€ */
+.readAloudBtn {
+  position: fixed; z-index: 60;
+  padding: 6px 11px; font-size: 12px;
+  border: 1px solid var(--line-strong); border-radius: 999px;
+  background: var(--bg-raised); cursor: pointer;
+  box-shadow: 0 10px 28px -12px rgba(0, 0, 0, 0.7);
+  animation: dockIn 140ms ease;
+}
+.readAloudBtn:hover { border-color: var(--accent); }
+
+/* â”€â”€ Skill / voice dock â€” floating animated tray â”€â”€
+   Floats above the status bar, never on it: at bottom:18px the 52px orb sat
+   squarely on the HUD strip's right corner and covered the version readout. */
+.skillDock { position: fixed; right: 18px; bottom: 54px; z-index: 40; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; pointer-events: none; }
+.skillDock > * { pointer-events: auto; }
+.skillDockOrb {
+  width: 52px; height: 52px; border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background:
+    radial-gradient(120% 120% at 30% 25%, rgba(255, 255, 255, 0.08), transparent 55%),
+    var(--bg-raised);
+  box-shadow: 0 6px 22px -8px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  display: grid; place-items: center;
+  cursor: pointer; position: relative;
+  box-shadow: 0 8px 30px -12px rgba(0,0,0,0.6);
+  transition: transform 150ms ease, border-color 200ms ease;
+}
+.skillDockOrb:hover { transform: translateY(-2px); border-color: var(--accent); }
+.skillDockOrbCore { width: 18px; height: 18px; border-radius: 50%; background: var(--ink-dim); transition: background 250ms ease, box-shadow 250ms ease; }
+.skillDockOrb[data-state="ready"] .skillDockOrbCore { background: var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.7); }
+.skillDockOrb[data-state="speaking"] .skillDockOrbCore { background: var(--accent); box-shadow: 0 0 18px rgba(var(--accent-rgb), 0.95); }
+.skillDockOrb[data-state="listening"] .skillDockOrbCore { background: #6fd08a; box-shadow: 0 0 16px rgba(111, 208, 138, 0.9); }
+.skillDockOrbPulse {
+  position: absolute; inset: -4px; border-radius: 50%;
+  border: 2px solid currentColor; color: var(--accent); opacity: 0;
+  animation: dockPulse 1.4s ease-out infinite;
+}
+.skillDockOrb[data-state="listening"] .skillDockOrbPulse { color: #6fd08a; }
+@keyframes dockPulse { 0% { transform: scale(0.85); opacity: 0.7; } 100% { transform: scale(1.5); opacity: 0; } }
+/* orb revamp: a slow conic sheen ring whenever voice is alive, hotter while
+   speaking/listening â€” the collapsed presence you can read across the room */
+.skillDockOrb::before {
+  content: ""; position: absolute; inset: -2px; border-radius: 50%; padding: 2px;
+  background: conic-gradient(from 0deg, transparent 0 40%, rgba(var(--accent-rgb), 0.55) 50%, transparent 60% 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  opacity: 0; transition: opacity 300ms ease;
+}
+.skillDockOrb[data-state="ready"]::before { opacity: 0.45; animation: orbSheen 6s linear infinite; }
+.skillDockOrb[data-state="speaking"]::before, .skillDockOrb[data-state="listening"]::before { opacity: 1; animation: orbSheen 1.6s linear infinite; }
+.skillDockOrb[data-state="listening"]::before { background: conic-gradient(from 0deg, transparent 0 40%, rgba(111, 208, 138, 0.7) 50%, transparent 60% 100%); }
+@keyframes orbSheen { to { transform: rotate(360deg); } }
+
+/* â”€â”€ voice PRESENCE â€” monitor-edge glow + hands-free captions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.presenceGlow {
+  position: fixed; inset: 0; z-index: 48; pointer-events: none;
+  opacity: 0; animation: presenceIn 420ms ease forwards;
+}
+.presenceGlow[data-mode="listening"] {
+  box-shadow:
+    inset 0 0 90px 6px rgba(111, 208, 138, 0.22),
+    inset 0 0 26px 2px rgba(127, 166, 163, 0.35);
+  animation: presenceIn 420ms ease forwards, presenceBreath 2.4s ease-in-out 420ms infinite;
+}
+.presenceGlow[data-mode="speaking"] {
+  box-shadow:
+    inset 0 0 90px 6px rgba(var(--accent-rgb), 0.20),
+    inset 0 0 26px 2px rgba(var(--ember-rgb), 0.32);
+  animation: presenceIn 420ms ease forwards, presenceBreath 3.2s ease-in-out 420ms infinite;
+}
+@keyframes presenceIn { to { opacity: 1; } }
+@keyframes presenceBreath { 50% { opacity: 0.55; } }
+.presenceCaption {
+  position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
+  z-index: 49; pointer-events: none; max-width: min(620px, 80vw);
+  padding: 9px 18px; border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
+  backdrop-filter: blur(12px);
+  font-size: 13.5px; color: var(--text); text-align: center;
+  box-shadow: 0 12px 40px -14px rgba(0, 0, 0, 0.7);
+  animation: dockIn 200ms ease;
+}
+.presenceCaption[data-kind="listening"] { color: #8fd8a4; letter-spacing: 0.06em; font-weight: 600; }
+.presenceCaption[data-kind="heard"] { font-style: italic; color: var(--muted); }
+.presenceDot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 8px; vertical-align: 0;
+  background: #6fd08a; box-shadow: 0 0 10px rgba(111, 208, 138, 0.9);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+[data-perf="lite"] .presenceGlow { display: none; }
+[data-perf="lite"] .presenceCaption { backdrop-filter: none; background: var(--bg-raised); }
+@media (prefers-reduced-motion: reduce) {
+  .presenceGlow, .presenceCaption, .presenceDot, .skillDockOrb::before { animation: none; }
+  .presenceGlow { opacity: 1; }
+}
+
+/* Separate click-through desktop surface used while the main window is a pill.
+   It spans the pill's monitor, but Rust makes it input-transparent so the user
+   keeps full control of every app beneath it. */
+.presenceSurface {
+  position: fixed; inset: 0; overflow: hidden; pointer-events: none;
+  color: #f0e3da; font-family: var(--font); opacity: 0;
+}
+.presenceSurface[data-visible="1"] { opacity: 1; }
+.presenceEdge {
+  position: absolute; inset: 0; opacity: .78;
+  box-shadow: inset 0 0 28px 2px rgba(127, 166, 163, .28), inset 0 0 110px 10px rgba(127, 166, 163, .12);
+  animation: desktopPresenceBreath 2.25s ease-in-out infinite;
+}
+.presenceSurface[data-mode="listening"] .presenceEdge {
+  box-shadow: inset 0 0 30px 3px rgba(111, 208, 138, .48), inset 0 0 120px 12px rgba(111, 208, 138, .15);
+}
+.presenceSurface[data-mode="working"] .presenceEdge {
+  box-shadow: inset 0 0 30px 3px rgba(255, 178, 77, .42), inset 0 0 120px 12px rgba(255, 106, 48, .14);
+}
+.presenceSurface[data-mode="speaking"] .presenceEdge {
+  box-shadow: inset 0 0 30px 3px rgba(255, 106, 68, .44), inset 0 0 120px 12px rgba(214, 64, 46, .15);
+}
+.desktopCaption {
+  position: absolute; left: 50%; bottom: clamp(34px, 6vh, 72px); transform: translateX(-50%);
+  width: min(760px, calc(100vw - 80px)); display: grid; gap: 6px; justify-items: center;
+  padding: 13px 22px 14px; border: 1px solid rgba(255,255,255,.12); border-radius: 18px;
+  background: linear-gradient(180deg, rgba(22,13,14,.88), rgba(10,7,8,.82));
+  box-shadow: 0 18px 60px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.06);
+  backdrop-filter: blur(18px); animation: desktopCaptionIn 180ms cubic-bezier(.2,.9,.3,1);
+}
+.desktopCaptionState {
+  display: inline-flex; align-items: center; gap: 7px; color: #d8b08a;
+  font: 700 9px/1 var(--mono); letter-spacing: .18em;
+}
+.desktopCaptionState i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 10px currentColor; }
+.presenceSurface[data-mode="listening"] .desktopCaptionState { color: #8fe0a7; }
+.presenceSurface[data-mode="speaking"] .desktopCaptionState { color: #ff9a72; }
+.presenceSurface[data-mode="heard"] .desktopCaptionState { color: #9bc7c3; }
+.desktopCaptionText { max-width: 100%; color: #f5e9e1; font-size: clamp(14px, 1.35vw, 19px); line-height: 1.38; text-align: center; text-wrap: balance; }
+.desktopCaptionDetail { max-width: 100%; color: #a58d82; font: 500 10.5px/1.3 var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@keyframes desktopPresenceBreath { 50% { opacity: .42; } }
+@keyframes desktopCaptionIn { from { opacity: 0; transform: translate(-50%, 9px) scale(.985); } }
+@media (prefers-reduced-motion: reduce) {
+  .presenceEdge, .desktopCaption { animation: none; }
+}
+.skillDockPanel {
+  width: 268px; padding: 14px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-lg);
+  background: var(--bg-raised);
+  box-shadow: 0 18px 50px -20px rgba(0,0,0,0.7);
+  display: grid; gap: 10px;
+  animation: dockIn 200ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+@keyframes dockIn { from { transform: translateY(10px) scale(0.98); opacity: 0; } to { transform: none; opacity: 1; } }
+.skillDockHead { display: flex; justify-content: space-between; align-items: baseline; }
+.skillDockHead strong { font-size: 13px; }
+.skillDockProvider { font-size: 11px; color: var(--ink-dim); }
+.skillDockRow { display: flex; flex-wrap: wrap; gap: 6px; }
+.skillDockBtn {
+  flex: 1 1 auto; padding: 7px 10px; font-size: 12px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: transparent; cursor: pointer; transition: all 140ms ease;
+}
+.skillDockBtn:hover:not(:disabled) { border-color: var(--line-strong); }
+.skillDockBtn[data-on="1"] { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
+.skillDockBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+.skillDockBtn.stop { flex: 0 0 auto; }
+.skillDockSurfaces { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.skillDockSurface {
+  display: flex; align-items: center; gap: 7px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: transparent; cursor: pointer; text-align: left; font-size: 12px;
+  transition: all 140ms ease;
+}
+.skillDockSurface:hover { border-color: var(--accent); transform: translateY(-1px); }
+.skillDockIcon { font-size: 15px; }
+.skillDockHint { font-size: 11px; color: var(--ink-dim); margin: 0; }
+.skillDockHint.warn { color: #e0a468; }
+.skillDockHint code { font-size: 10.5px; padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px; }
+.skillDockRepair {
+  font: inherit; font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+  padding: 2px 9px; margin-left: 4px; cursor: pointer;
+  color: var(--text); background: rgba(var(--accent-rgb), 0.12);
+  border: 1px solid var(--line-strong); border-radius: 999px;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.skillDockRepair:hover { background: rgba(var(--accent-rgb), 0.24); border-color: var(--accent); }
+.skillDockSpin {
+  display: inline-block; width: 9px; height: 9px; margin-right: 5px; vertical-align: -1px;
+  border: 1.5px solid var(--line-strong); border-top-color: var(--accent);
+  border-radius: 50%; animation: skillDockSpin 800ms linear infinite;
+}
+@keyframes skillDockSpin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .skillDockSpin { animation: none; } }
+.skillDockToast {
+  max-width: 300px; padding: 8px 12px; font-size: 12px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-md);
+  background: var(--bg-raised); box-shadow: 0 10px 30px -14px rgba(0,0,0,0.6);
+  animation: dockIn 180ms ease;
+}
+.skillDockToast[data-ok="0"] { border-color: #c0504a; color: #e88; }
+
+/* â”€â”€ SkillHub browser â”€â”€ */
+.skillRowActions { display: flex; align-items: center; gap: 8px; }
+.skillCat.provides { background: rgba(var(--accent-rgb), 0.14); color: var(--accent); }
+.skillHubSection { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+.skillHubHead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.skillHubHead strong { font-size: 14px; }
+.skillHubSearch { display: flex; gap: 8px; margin-bottom: 10px; }
+.skillHubSearch .txt { flex: 1; }
+.skillHubNote { padding: 7px 10px; margin-bottom: 10px; font-size: 12px; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: rgba(var(--accent-rgb), 0.08); }
+.skillHubGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.skillHubCard { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-raised); transition: border-color 150ms ease; }
+.skillHubCard:hover { border-color: var(--line-strong); }
+.skillHubCardHead { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.skillHubCardHead strong { font-size: 13px; }
+.skillHubTag { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: rgba(var(--accent-rgb), 0.14); color: var(--accent); }
+.skillHubCard p { margin: 0; font-size: 12px; color: var(--ink-dim); }
+.skillHubCardFoot { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
+.skillHubCardFoot span { font-size: 11px; color: var(--ink-dim); }
 .themeCard strong { font-size: 12.5px; color: var(--text); }
 .themeCard[data-on="1"] strong { color: var(--accent-hi); }
 .themeCard em { font-style: normal; font-size: 10.5px; color: var(--faint); }
 
 /* skills list */
 .skillList { display: grid; gap: 2px; }
-.skillRow { display: flex; align-items: center; gap: 14px; padding: 11px 12px; border-radius: var(--r-sm); transition: background 120ms ease; }
-.skillRow:hover { background: rgba(var(--accent-rgb), 0.04); }
+.skillOverview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 2px 0 10px; }
+.skillOverview span { padding: 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: rgba(var(--accent-rgb), .035); color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.skillOverview strong { display: block; color: var(--bronze-hi); font: 700 18px/1.2 var(--mono); }
+.skillFilter { width: 100%; margin-bottom: 8px; }
+.skillRow { display: flex; align-items: center; gap: 14px; padding: 11px 12px; border: 1px solid transparent; border-radius: var(--r-sm); transition: 150ms ease; animation: dockIn 180ms ease both; }
+.skillRow:hover { background: rgba(var(--accent-rgb), 0.04); border-color: var(--line); transform: translateX(2px); }
 .skillInfo { display: grid; gap: 3px; flex: 1; min-width: 0; }
 .skillInfo strong { display: flex; align-items: center; gap: 8px; font: 600 13px/1.2 var(--mono); color: var(--text); }
+.skillReady { font: 600 8px/1 var(--mono) !important; letter-spacing: .08em; text-transform: uppercase; color: #86b98a !important; }
+.skillReady::before { content: "â—"; margin-right: 4px; }
+.skillReady[data-ready="0"] { color: var(--faint) !important; }
 .skillCat { font: 500 9px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; }
 .skillInfo span { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -1255,7 +1630,7 @@ a.vaultName { border-bottom: none; }
 
 /* engine rows */
 .engineRow { display: flex; align-items: center; gap: 16px; padding: 11px 0; border-bottom: 1px solid var(--line); }
-/* Per-category rows are overridden by "Act freely" — dim them so it reads as "all on". */
+/* Per-category rows are overridden by "Act freely" â€” dim them so it reads as "all on". */
 .engineRow[data-dim="1"] { opacity: 0.5; }
 .engineRow .toggle:disabled { cursor: not-allowed; }
 .engineInfo { flex: 1; display: grid; gap: 3px; }
@@ -1269,16 +1644,51 @@ a.vaultName { border-bottom: none; }
 .engineRow input:focus { border-color: var(--accent); }
 
 /* api key registry */
-.keyRegistry { display: grid; gap: 8px; }
-.keyGroupLabel { font: 600 10px/1 var(--mono); letter-spacing: 0.18em; text-transform: uppercase; color: var(--faint); padding: 10px 0 2px; }
-.keyRegRow { display: flex; align-items: center; gap: 14px; }
-.keyRegName { display: flex; align-items: center; gap: 9px; width: 150px; flex: none; }
-.keyRegName strong { font-size: 12.5px; }
-.keyRegRow input { flex: 1; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 12px; outline: none; font-family: var(--mono); font-size: 12px; }
-.keyRegRow input:focus { border-color: var(--accent); }
+/* â”€â”€ API Keys â€” clean logo cards with a status pill + inline input â”€â”€â”€â”€â”€â”€â”€â”€ */
+.keyGroupLabel { font: 600 10px/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase; color: var(--faint); padding: 14px 0 6px; }
+.keyCard {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 12px 13px; border-radius: 12px; margin-bottom: 8px;
+  border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 45%, transparent);
+  transition: border-color 150ms ease;
+}
+.keyCard[data-on="1"] { border-color: color-mix(in srgb, var(--steel) 40%, var(--line)); }
+.keyCard.signIn { align-items: center; }
+.keyLogo { width: 34px; height: 34px; flex: none; margin-top: 1px; }
+.keyLogo.brandLogo { border-radius: 10px; }
+.keyCardBody { flex: 1; min-width: 0; display: grid; gap: 6px; }
+.keyCardBody > strong { font-size: 13px; }
+.keyCardBody > em { font-style: normal; font-size: 11.5px; color: var(--faint); }
+.keyCardHead { display: flex; align-items: center; gap: 10px; }
+.keyCardHead strong { font-size: 13px; }
+.keyPill {
+  font: 700 9px/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--faint);
+}
+.keyPill[data-on="1"] { color: var(--steel); border-color: color-mix(in srgb, var(--steel) 50%, var(--line)); background: color-mix(in srgb, var(--steel) 10%, transparent); }
+.keyInput {
+  width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 11px; outline: none; font-family: var(--mono); font-size: 12px; color: var(--text);
+  transition: border-color 140ms ease;
+}
+.keyInput:focus { border-color: var(--accent); }
+.keySub { font-style: normal; font-size: 10.5px; color: var(--faint); }
+.keyClearBtn {
+  flex: none; width: 26px; height: 26px; border-radius: 7px; margin-top: 1px;
+  color: var(--faint); border: 1px solid transparent; font-size: 12px;
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+.keyClearBtn:hover { color: var(--crimson); background: rgba(194, 80, 72, 0.1); border-color: rgba(194, 80, 72, 0.4); }
+.keySignInBtn {
+  flex: none; padding: 8px 15px; border-radius: 9px; cursor: pointer;
+  font: inherit; font-size: 12.5px; font-weight: 700; color: var(--text);
+  background: rgba(var(--accent-rgb), 0.12); border: 1px solid var(--line-strong);
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.keySignInBtn:hover { background: rgba(var(--accent-rgb), 0.24); border-color: var(--accent); }
 
 /* about pane */
-/* What's New / Updates tab — the persistent changelog the popup used to be the only view of. */
+/* What's New / Updates tab â€” the persistent changelog the popup used to be the only view of. */
 .updatesHead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .updatesTitle { margin: 0 0 2px; font-size: 16px; font-weight: 700; color: var(--accent-hi); }
 .updatesReplay { flex: none; padding: 7px 12px; font-size: 12px; font-weight: 600; color: var(--accent-hi);
@@ -1344,7 +1754,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .usageCalls { font-size: 11px; color: var(--faint); flex: none; }
 .usageTok { font: 500 11px/1 var(--mono); color: var(--muted); flex: none; }
 
-/* ── tool display mode cards (settings) ─────────────────────────────── */
+/* â”€â”€ tool display mode cards (settings) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .displayModes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .displayModes button {
   display: grid; gap: 4px;
@@ -1359,6 +1769,32 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .displayModes strong { font-size: 13px; color: var(--text); }
 .displayModes button[data-on="1"] strong { color: var(--bronze-hi); }
 .displayModes span { font-size: 11px; color: var(--faint); line-height: 1.45; }
+
+/* Appearance â†’ the intentionally loud doorway into the experimental runtime. */
+.livingLaunchCard {
+  position: relative; overflow: hidden; display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) auto; align-items: center; gap: 16px;
+  min-height: 126px; padding: 18px; margin-bottom: 10px;
+  border: 1px solid rgba(239, 91, 50, .38); border-radius: 14px;
+  background:
+    radial-gradient(circle at 8% 50%, rgba(239,91,50,.16), transparent 28%),
+    linear-gradient(120deg, rgba(239,91,50,.07), rgba(255,255,255,.018));
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.018), 0 14px 44px rgba(0,0,0,.16);
+}
+.livingLaunchCard::after { content:""; position:absolute; width:180px; height:180px; right:-85px; top:-100px; border:1px solid rgba(239,91,50,.2); transform:rotate(45deg); pointer-events:none; }
+.livingLaunchSignal { position:relative; width:48px; height:48px; }
+.livingLaunchSignal i { position:absolute; inset:0; border:1px solid rgba(239,91,50,.52); transform:rotate(45deg); animation:livingSettingsSigil 6s linear infinite; }
+.livingLaunchSignal i:nth-child(2) { inset:10px; animation-direction:reverse; animation-duration:4s; }
+.livingLaunchSignal i:nth-child(3) { inset:19px; background:#ef5b32; box-shadow:0 0 24px rgba(239,91,50,.6); }
+.livingLaunchCopy { min-width:0; position:relative; z-index:1; }
+.livingLaunchCopy > span { display:block; margin-bottom:7px; color:#ef7958; font:800 8px/1 var(--mono); letter-spacing:.18em; }
+.livingLaunchCopy > strong { display:flex; align-items:center; gap:9px; color:var(--text); font:500 20px/1.1 Georgia,serif; }
+.livingLaunchCopy > strong b { color:#170d09; background:#ef5b32; padding:3px 5px; font:800 7px var(--mono); letter-spacing:.14em; }
+.livingLaunchCopy p { max-width:540px; margin:8px 0 0; color:var(--muted); font-size:11.5px; line-height:1.5; }
+.livingLaunchCard > button { position:relative; z-index:1; min-width:132px; height:40px; border:1px solid #ef5b32; color:#150d09; background:#ef5b32; font:800 9px var(--mono); letter-spacing:.1em; cursor:pointer; transition:.2s ease; }
+.livingLaunchCard > button:hover:not(:disabled) { transform:translateY(-2px); filter:brightness(1.12); box-shadow:0 10px 28px rgba(239,91,50,.18); }
+.livingLaunchCard > button:disabled { opacity:.35; cursor:not-allowed; }
+@keyframes livingSettingsSigil { to { transform:rotate(405deg); } }
 .toolStep pre {
   margin: 2px 8px 8px 24px;
   padding: 10px 12px;
@@ -1382,7 +1818,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .notice[data-tone="warn"] { color: var(--bronze-hi); border-color: rgba(var(--accent-rgb), 0.4); background: rgba(var(--accent-rgb), 0.05); }
 .notice[data-tone="bad"] { color: var(--crimson); border-color: rgba(194, 80, 72, 0.4); background: rgba(194, 80, 72, 0.06); animation: fadeUp 280ms ease both, shake 360ms ease 280ms; }
 
-/* The Gate — approval prompt, styled to match the translucent tool card:
+/* The Gate â€” approval prompt, styled to match the translucent tool card:
    slim glass panel, a shield glyph, and pill actions. No more fat amber box. */
 .gate {
   display: flex; align-items: center; gap: 12px;
@@ -1420,7 +1856,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .gateActions .gateDeny { color: var(--crimson); border-color: rgba(194, 80, 72, 0.4); }
 .gateActions .gateDeny:hover { background: rgba(194, 80, 72, 0.12); }
 
-/* ── The delegation choice popup: Claude Code / Codex / Ares ─────────────────── */
+/* â”€â”€ The delegation choice popup: Claude Code / Codex / Ares â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .cbOffer {
   width: fit-content; max-width: 92%; margin: 2px 0;
   padding: 12px 14px; border-radius: 14px;
@@ -1475,7 +1911,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   animation: tickerIn 240ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
 }
 
-/* diff cards — red/green proof of what changed */
+/* diff cards â€” red/green proof of what changed */
 .diffCard { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel); max-width: 86%; overflow: hidden; }
 .diffCard[data-open="1"] { border-color: var(--line-strong); }
 .diffHead { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 14px; color: var(--muted); font: 500 12px/1 var(--mono); }
@@ -1521,7 +1957,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .subagentBody span { font-size: 12.5px; color: var(--muted); }
 .subagentBody p { margin: 2px 0 0; font-size: 12px; color: var(--text); line-height: 1.5; white-space: pre-wrap; }
 
-/* todo panel — the live plan above the composer */
+/* todo panel â€” the live plan above the composer */
 .todoPanel {
   border: 1px solid var(--line);
   border-radius: var(--r-md);
@@ -1548,9 +1984,32 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .send.stop { background: linear-gradient(180deg, #d4685f, var(--crimson)); color: #2a0f0c; }
 .send.stop:hover { filter: brightness(1.08); box-shadow: 0 0 18px rgba(194, 80, 72, 0.4); }
 
-/* ── composer ───────────────────────────────────────────────────────── */
+/* â”€â”€ composer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
-.composer { padding: 4px clamp(20px, 6vw, 96px) 12px; display: grid; gap: 8px; }
+.composer { padding: 4px clamp(20px, 6vw, 96px) 12px; display: grid; gap: 8px; position: relative; }
+
+/* "/" command menu â€” floats above the composer, keyboard-driven. */
+.slashMenu {
+  position: absolute; bottom: calc(100% + 6px); left: clamp(20px, 6vw, 96px); right: clamp(20px, 6vw, 96px);
+  z-index: 30; display: flex; flex-direction: column; gap: 2px; padding: 6px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 18px 50px -18px rgba(0, 0, 0, 0.7);
+  animation: paletteIn 160ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.slashMenuTitle { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim, #8a8f98); font-weight: 700; padding: 2px 8px 4px; }
+.slashItem {
+  display: grid; grid-template-columns: 24px auto auto 1fr; align-items: center; gap: 10px;
+  padding: 7px 10px; border: none; border-radius: 8px; background: transparent;
+  color: var(--text); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer;
+}
+.slashItem[data-sel="1"] { background: rgba(var(--accent-rgb), 0.14); }
+.slashIcon { text-align: center; }
+.slashCmd { font-family: var(--mono); font-weight: 700; color: var(--accent-hi, var(--accent)); }
+.slashLabel { font-weight: 600; white-space: nowrap; }
+.slashHint { color: var(--dim, #8a8f98); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+[data-perf="lite"] .slashMenu { backdrop-filter: none; background: var(--bg-raised); }
 .chips { display: flex; gap: 8px; flex-wrap: wrap; }
 .attachments { display: flex; gap: 8px; flex-wrap: wrap; }
 .attachChip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 6px 4px 4px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel); max-width: 220px; }
@@ -1581,12 +2040,12 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   transition: border-color 180ms ease, box-shadow 180ms ease;
 }
 .composerRow:focus-within { border-color: var(--bronze); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.12), 0 0 32px -4px rgba(var(--accent-rgb), 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.04); }
-/* steering an in-flight turn — the rim warms to ember so it's clearly a hand-off */
+/* steering an in-flight turn â€” the rim warms to ember so it's clearly a hand-off */
 .composerRow[data-busy="1"] { border-color: rgba(var(--ember-rgb), 0.4); }
 .composerRow[data-busy="1"]:focus-within { border-color: var(--ember); box-shadow: 0 0 0 3px rgba(var(--ember-rgb), 0.12), 0 0 32px -4px rgba(var(--ember-rgb), 0.14); }
 
-/* ══ SCREEN FLAME BORDER — real shaped flame tongues lick INWARD around the whole
-   UI while Ares works. Replaces the flat red glow with actual fire. Subtle. ══ */
+/* â•â• SCREEN FLAME BORDER â€” real shaped flame tongues lick INWARD around the whole
+   UI while Ares works. Replaces the flat red glow with actual fire. Subtle. â•â• */
 .screenFlame {
   --flame-edge: 26px;
   position: fixed; inset: 0; z-index: 46; pointer-events: none;
@@ -1597,7 +2056,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .ares[data-ultra="1"][data-working="1"] .screenFlame { opacity: 0; }
 .hackerRain {
   position: fixed; inset: 0; z-index: 47; pointer-events: none;
-  /* rain only on the rims — the center is masked transparent so the transcript stays readable */
+  /* rain only on the rims â€” the center is masked transparent so the transcript stays readable */
   -webkit-mask: radial-gradient(ellipse 64% 60% at 50% 50%, transparent 52%, #000 80%);
   mask: radial-gradient(ellipse 64% 60% at 50% 50%, transparent 52%, #000 80%);
   opacity: 0; animation: rainIn 600ms ease forwards; mix-blend-mode: screen;
@@ -1605,7 +2064,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 @keyframes rainIn { to { opacity: 0.62; } }
 .screenFlame .fStrip { position: absolute; }
 .screenFlame .fStrip svg { display: block; width: 100%; height: 100%; }
-/* the three layers dance at different rates → volumetric, living fire */
+/* the three layers dance at different rates â†’ volumetric, living fire */
 .screenFlame .flame-back { transform-origin: center bottom; animation: flameLick 1.1s ease-in-out infinite alternate; mix-blend-mode: screen; }
 .screenFlame .flame-mid { transform-origin: center bottom; animation: flameLick 0.62s ease-in-out infinite alternate; animation-delay: -0.2s; mix-blend-mode: screen; }
 .screenFlame .flame-core { transform-origin: center bottom; animation: flameLickHard 0.34s ease-in-out infinite alternate; mix-blend-mode: screen; }
@@ -1613,32 +2072,78 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   from { transform: scaleY(0.82) translateY(2px); opacity: 0.7; }
   to { transform: scaleY(1.15) translateY(-2px); opacity: 1; }
 }
-/* bottom edge — tongues point up (the base orientation) */
+/* bottom edge â€” tongues point up (the base orientation) */
 .screenFlame .edge-bottom { left: 0; bottom: 0; width: 100%; height: var(--flame-edge); }
-/* top edge — flip so tongues point down into the screen */
+/* top edge â€” flip so tongues point down into the screen */
 .screenFlame .edge-top { left: 0; top: 0; width: 100%; height: var(--flame-edge); transform: scaleY(-1); }
-/* left edge — rotate the horizontal strip to run vertically, tongues pointing right */
+/* left edge â€” rotate the horizontal strip to run vertically, tongues pointing right */
 .screenFlame .edge-left { top: 0; left: 0; height: var(--flame-edge); width: 100vh; transform-origin: 0 0; transform: rotate(90deg) translateY(calc(-1 * var(--flame-edge))); }
-/* right edge — tongues pointing left */
+/* right edge â€” tongues pointing left */
 .screenFlame .edge-right { top: 0; right: 0; height: var(--flame-edge); width: 100vh; transform-origin: 100% 0; transform: rotate(-90deg) translateY(calc(-1 * var(--flame-edge))); }
 
-/* ── flame modes (status-bar toggle: immersive · clean · combat) ──────────
-   immersive = the default volumetric tongues above.
-   clean     = no tongues; just a soft ember rim that breathes, so the border
-               stops "bullying" the interface.
-   combat    = taller, hotter, more saturated tongues for full war-state. */
-.ares[data-flame="clean"] .screenFlame .fStrip { display: none; }
-.ares[data-flame="clean"] .screenFlame {
+/* ── EFFECTS (status-bar toggle: glow · minimal · off) ─────────────────────
+   Photosensitive-safe by construction. The old modes (immersive/combat flame
+   tongues, breathing rims, the per-action strikeFlash) oscillated luminance —
+   a real seizure trigger. Nothing in ANY mode flashes now:
+   glow    = a STATIC ember rim while working + slow ember drift. No tongues,
+             no breathing — the box-shadow is constant.
+   minimal = no rim, no embers, no veil; only the stageWork ring (smooth
+             rotation, constant luminance) says "working".
+   off     = the hard kill switch: nothing renders, nothing animates. */
+.ares[data-flame="glow"] .screenFlame .fStrip { display: none; }
+.ares[data-flame="glow"] .screenFlame {
   box-shadow: inset 0 0 64px -12px rgba(var(--ember-rgb), 0.26), inset 0 0 0 1px rgba(var(--ember-rgb), 0.10);
-  animation: rimBreathe 3.8s ease-in-out infinite;
+  animation: none;
 }
-@keyframes rimBreathe {
-  0%, 100% { box-shadow: inset 0 0 52px -16px rgba(var(--ember-rgb), 0.16), inset 0 0 0 1px rgba(var(--ember-rgb), 0.08); }
-  50% { box-shadow: inset 0 0 78px -8px rgba(var(--ember-rgb), 0.32), inset 0 0 0 1px rgba(var(--ember-rgb), 0.14); }
+/* the ember particles keep their smooth upward drift but never the "roar"
+   speed-up; the veil and stage glow hold a constant opacity while working */
+.ares[data-flame="glow"] .embers { animation-duration: 34s !important; }
+.ares[data-flame="glow"][data-working="1"] .embers { opacity: 0.5; animation-duration: 26s !important; }
+.ares[data-flame="glow"][data-working="1"]::after { animation: none; }
+.ares[data-flame="glow"] .workGlow { animation: none !important; }
+.ares[data-flame="glow"] .workGlow::before { display: none; } /* the sweeping hot line */
+.ares[data-flame="minimal"] .screenFlame,
+.ares[data-flame="minimal"] .embers,
+.ares[data-flame="minimal"] .workGlow { display: none !important; animation: none !important; }
+.ares[data-flame="minimal"]::after { display: none; }
+.ares[data-flame="off"] .screenFlame,
+.ares[data-flame="off"] .embers,
+.ares[data-flame="off"] .workGlow { display: none !important; animation: none !important; }
+.ares[data-flame="off"]::after { display: none; }
+
+/* ── the stageWork ring — the one working animation ─────────────────────────
+   A conic ember arc rotating at --fx-period (default 2.8s ≈ 0.36Hz, far under
+   any flash threshold; luminance is constant, only ANGLE changes). Ares can
+   retint/pace it via SetUiEffect: --fx-hue rotates the palette, --fx-period
+   slows or quickens the sweep. */
+.stageWork {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  margin-left: auto;
+  max-width: 40%;
+  filter: hue-rotate(var(--fx-hue, 0deg));
 }
-.ares[data-flame="combat"] .screenFlame { --flame-edge: 42px; filter: saturate(1.22) brightness(1.16); }
+.stageWork em {
+  font: 500 11px/1.3 var(--mono);
+  font-style: normal;
+  color: var(--ember-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stageWorkRing {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0 40%, rgba(var(--ember-rgb), 0.9) 78%, var(--ember-hi) 100%);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
+  animation: spin360 var(--fx-period, 2.8s) linear infinite;
+}
 @media (prefers-reduced-motion: reduce) {
-  .ares[data-flame="clean"] .screenFlame { animation: none; }
+  .stageWorkRing { animation: none; }
 }
 @keyframes flameLick {
   from { transform: scaleY(0.9) translateY(1px); }
@@ -1669,26 +2174,41 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .send:hover:not(:disabled) { filter: brightness(1.1); box-shadow: 0 0 18px rgba(var(--accent-rgb), 0.35); }
 .send:active:not(:disabled) { transform: translateY(1px); }
 
-/* ── mic / dictation button ─────────────────────────────────────────── */
+/* â”€â”€ mic / dictation button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .mic {
   flex: none;
-  width: 38px; height: 38px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--line);
-  background: var(--panel);
+  position: relative; isolation: isolate;
+  width: 42px; height: 38px;
+  border-radius: 14px;
+  border: 1px solid rgba(var(--accent-rgb),.18);
+  background: linear-gradient(145deg, rgba(var(--accent-rgb),.07), rgba(0,0,0,.15));
   color: var(--muted);
   display: grid; place-items: center;
-  transition: color 120ms ease, border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+  overflow: hidden;
+  transition: color 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 180ms ease, transform 160ms ease, width 180ms ease;
 }
-.mic svg { width: 16px; height: 16px; }
-.mic:hover { color: var(--text); border-color: var(--line-strong); }
+.mic::before { content: ""; position: absolute; z-index: -1; width: 28px; height: 28px; border-radius: 50%; background: radial-gradient(circle, rgba(var(--accent-rgb),.13), transparent 68%); opacity: .55; transition: opacity 180ms ease, transform 240ms ease; }
+.mic svg { width: 21px; height: 21px; overflow: visible; }
+.mic .voiceOrbit { opacity: .34; stroke-dasharray: 18 34; transform-origin: center; transition: opacity 180ms ease; }
+.mic:hover { color: var(--text); border-color: rgba(var(--accent-rgb),.44); transform: translateY(-1px); box-shadow: 0 8px 20px -12px rgba(var(--accent-rgb),.65); }
+.mic:hover::before { opacity: 1; transform: scale(1.12); }
+.composerRow[data-draft="1"] .mic:not([data-state="recording"]) { width: 38px; color: var(--faint); background: rgba(255,255,255,.018); }
 .mic[data-state="recording"] {
-  color: #fff; border-color: transparent;
-  background: linear-gradient(180deg, var(--ember-hi), var(--ember));
-  animation: micPulse 1.2s ease-in-out infinite;
+  color: #fff; border-color: rgba(255,190,150,.62);
+  background: radial-gradient(circle at 50% 30%, var(--ember-hi), var(--ember) 64%, #6c1715);
+  animation: voiceButtonLive 1.6s ease-in-out infinite;
 }
-.mic[data-state="thinking"] { color: var(--accent-hi); border-color: var(--line-strong); }
+.mic[data-state="recording"]::before { opacity: 1; background: radial-gradient(circle, rgba(255,255,255,.22), transparent 68%); animation: voiceCore 1.2s ease-in-out infinite; }
+.mic[data-state="recording"] .voiceOrbit { opacity: .75; animation: voiceOrbit 2.8s linear infinite; }
+.mic[data-state="recording"] .voiceBar1 { animation: voiceBar 720ms ease-in-out infinite alternate; }
+.mic[data-state="recording"] .voiceBar2 { animation: voiceBar 540ms ease-in-out infinite alternate-reverse; }
+.mic[data-state="recording"] .voiceBar3 { animation: voiceBar 860ms ease-in-out infinite alternate; }
+.mic[data-state="thinking"] { color: var(--accent-hi); border-color: rgba(var(--accent-rgb),.42); background: rgba(var(--accent-rgb),.08); }
 .mic[data-state="error"] { color: var(--crimson); border-color: rgba(194, 80, 72, 0.5); }
+@keyframes voiceButtonLive { 0%,100% { box-shadow: 0 0 0 0 rgba(var(--ember-rgb),.28), 0 8px 24px -12px rgba(var(--ember-rgb),.8); } 50% { box-shadow: 0 0 0 5px rgba(var(--ember-rgb),0), 0 10px 30px -8px rgba(var(--ember-rgb),.9); } }
+@keyframes voiceCore { 50% { transform: scale(1.22); opacity: .65; } }
+@keyframes voiceOrbit { to { transform: rotate(360deg); } }
+@keyframes voiceBar { from { transform: scaleY(.45); } to { transform: scaleY(1.3); } }
 @keyframes micPulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(var(--ember-rgb), 0.45); }
   50% { box-shadow: 0 0 0 6px rgba(var(--ember-rgb), 0); }
@@ -1700,59 +2220,65 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   animation: spin360 0.7s linear infinite;
 }
 
-/* ── the floating pill — Ares condensed to an always-on-top mic bar ───── */
+/* â”€â”€ the floating pill â€” Ares condensed to an always-on-top mic bar â”€â”€â”€â”€â”€ */
 .ares[data-pill="1"] { background: transparent; }
 .pillBar {
   position: fixed; inset: 0; z-index: 9000;
-  display: flex; align-items: center; gap: 10px;
-  padding: 0 10px 0 12px;
-  background: linear-gradient(180deg, var(--bg-raised), var(--panel));
-  border: 1px solid var(--line-strong);
-  border-radius: 14px;
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4), 0 10px 30px rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center;
+  padding: 4px 6px 4px 8px;
+  background: linear-gradient(145deg, rgba(20,13,14,.985), rgba(8,7,8,.985));
+  border: 1px solid rgba(var(--accent-rgb), .31);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.045), 0 9px 26px rgba(0,0,0,.52);
   -webkit-user-select: none; user-select: none;
   cursor: grab;
   animation: paletteIn 180ms cubic-bezier(0.2, 0.9, 0.3, 1);
 }
+.pillTopline { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; }
 .pillBar:active { cursor: grabbing; }
 .pillBar[data-busy="1"] { border-color: rgba(var(--ember-rgb), 0.5); }
+.pillBar[data-conversation="1"] { border-color: rgba(127, 166, 163, .48); box-shadow: inset 0 0 0 1px rgba(127,166,163,.08), 0 12px 34px rgba(0,0,0,.58); }
 .pillMark {
-  flex: none; width: 22px; height: 26px;
-  background: var(--god-uri) center/contain no-repeat;
-  opacity: 0.85;
+  flex: none; width: 24px; height: 24px; display: grid; place-items: center;
+  color: var(--accent-hi); border-radius: 9px;
+  background: rgba(var(--accent-rgb),.08);
 }
-.pillStatus { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.pillStatus .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--faint); }
+.pillMark .aresPillGlyph { width: 20px; }
+.aresPillGlyph { overflow: visible; }
+.aresPillGlyph[data-active="1"] { filter: drop-shadow(0 0 5px currentColor); }
+.pillStatus { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pillStatus .dot { width: 5px; height: 5px; border-radius: 50%; flex: none; background: var(--faint); }
 .pillStatus .dot[data-state="running"] { background: var(--steel); box-shadow: 0 0 7px rgba(127, 166, 163, 0.7); }
 .pillStatus .dot[data-state="error"], .pillStatus .dot[data-state="stopped"] { background: var(--crimson); }
 .pillStatus em {
-  font: 600 11px/1 var(--mono); font-style: normal; letter-spacing: 0.02em;
-  color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px;
+  font: 600 10px/1 var(--mono); font-style: normal; letter-spacing: 0.015em;
+  color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 76px;
 }
 .pillGrow { flex: 1; }
 .pillMic, .pillBtn {
   flex: none; display: grid; place-items: center;
-  border-radius: 9px;
+  border-radius: 8px;
   color: var(--muted);
   transition: color 120ms ease, background 120ms ease, box-shadow 120ms ease;
 }
-.pillMic { width: 36px; height: 36px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
-.pillMic svg { width: 17px; height: 17px; }
+.pillMic { width: 26px; height: 26px; border: 1px solid var(--line); background: rgba(255,255,255,.018); color: var(--text); }
+.pillMic svg { width: 13px; height: 13px; }
 .pillMic:hover { border-color: var(--line-strong); }
 .pillMic[data-state="recording"] {
   color: #fff; border-color: transparent;
   background: linear-gradient(180deg, var(--ember-hi), var(--ember));
   animation: micPulse 1.2s ease-in-out infinite;
 }
+.pillMic[data-state="armed"] { color: var(--steel); border-color: rgba(127,166,163,.5); background: rgba(127,166,163,.1); }
 .pillMic[data-state="error"] { color: var(--crimson); border-color: rgba(194, 80, 72, 0.5); }
-.pillBtn { width: 30px; height: 30px; }
-.pillBtn svg { width: 15px; height: 15px; }
+.pillBtn { width: 24px; height: 24px; }
+.pillBtn svg { width: 12px; height: 12px; }
 .pillBtn:hover { color: var(--text); background: rgba(var(--accent-rgb), 0.1); }
 .pillBtn[data-on="1"] { color: var(--accent-hi); background: rgba(var(--accent-rgb), 0.14); }
 
-/* ── status bar ─────────────────────────────────────────────────────── */
+/* â”€â”€ status bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
-/* The cockpit HUD strip — a single instrument bar, not a row of loose text.
+/* The cockpit HUD strip â€” a single instrument bar, not a row of loose text.
    Telemetry segments cluster on the left in a faint console panel; actions and
    readouts sit on the right. Every chip shares one height + structure. */
 .statusBar {
@@ -1770,7 +2296,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .statusBar .dot[data-state="starting"] { background: var(--bronze-hi); animation: pulse 1.2s ease-in-out infinite; }
 .statusBar .dot[data-state="error"], .statusBar .dot[data-state="stopped"] { background: var(--crimson); }
 
-/* a clustered instrument group — BOTH ends are matched console panels with
+/* a clustered instrument group â€” BOTH ends are matched console panels with
    hairline dividers, so the bar reads as one cockpit instrument, not loose text */
 .statusGroup {
   display: flex; align-items: center; gap: 2px;
@@ -1799,33 +2325,34 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .statusSeg:hover { color: var(--bronze-hi); background: rgba(var(--accent-rgb), 0.08); }
 .statusSeg:hover b { color: var(--bronze); }
 
-/* actions live INSIDE the right panel now — same height/radius as segments,
-   no individual pill outline (the panel is the container) */
-.statusAction {
-  display: inline-flex; align-items: center; gap: 5px;
-  height: 24px; padding: 0 10px;
-  font: inherit; color: var(--muted);
+/* right-side actions: compact ICON buttons (no crammed emoji+text labels) */
+.statusActions { gap: 1px; }
+.statusIcon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 24px; padding: 0;
+  font-size: 13px; line-height: 1; color: var(--faint);
   border-radius: 7px;
   transition: color 120ms ease, background 120ms ease;
 }
-.statusAction:hover { color: var(--bronze-hi); background: rgba(var(--accent-rgb), 0.08); }
+.statusIcon svg { width: 14px; height: 14px; }
+.statusIcon:hover:not(:disabled) { color: var(--bronze-hi); background: rgba(var(--accent-rgb), 0.1); }
+.statusIcon:disabled { opacity: 0.35; cursor: default; }
 
 .hudReadout {
   display: inline-flex; align-items: center; height: 24px; padding: 0 10px;
-  border-radius: 7px;
-  color: var(--muted); font-variant-numeric: tabular-nums; letter-spacing: 0.06em;
+  color: var(--muted); font-variant-numeric: tabular-nums; letter-spacing: 0.06em; font-size: 11.5px;
 }
 .hudVersion {
-  display: inline-flex; align-items: center; height: 24px; padding: 0 10px;
-  border-radius: 7px;
-  color: var(--faint); opacity: 0.75; letter-spacing: 0.1em;
+  display: inline-flex; align-items: center; height: 24px; padding: 0 6px 0 10px;
+  color: var(--faint); opacity: 0.6; letter-spacing: 0.06em; font-size: 10.5px; font-variant-numeric: tabular-nums;
 }
+.hudVersion::before { content: "v"; opacity: 0.7; }
 
-/* ── boot overlay ───────────────────────────────────────────────────── */
+/* â”€â”€ boot overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
-/* ══ INTRO SPLASH — a cinematic forge-ignition: the painted war table behind a
+/* â•â• INTRO SPLASH â€” a cinematic forge-ignition: the painted war table behind a
    heavy vignette, the Ares sigil rising inside spinning rune-rings, the wordmark
-   slamming in, then a hot bloom that dissolves into the live shell. ══ */
+   slamming in, then a hot bloom that dissolves into the live shell. â•â• */
 .boot {
   position: fixed; inset: 0; z-index: 90;
   display: grid; place-items: center;
@@ -1903,7 +2430,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   .bootRing1, .bootRing2, .bootEmbers, .bootHero { animation: none !important; }
 }
 
-/* ── settings drawer ────────────────────────────────────────────────── */
+/* â”€â”€ settings drawer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 .scrim { position: fixed; inset: 0; z-index: 60; background: rgba(8, 6, 7, 0.6); display: flex; justify-content: flex-end; animation: bootIn 160ms ease; backdrop-filter: blur(2px); }
 .drawer {
@@ -1956,7 +2483,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .drawer footer { margin-top: auto; flex: none; padding-top: 6px; }
 .drawer footer .primary { width: 100%; }
 
-/* ── settings: the premium surface ──────────────────────────────────── */
+/* â”€â”€ settings: the premium surface â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .settingsDrawer { width: 432px; }
 .settingsHero {
   display: flex; align-items: center; gap: 14px;
@@ -2013,7 +2540,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   word-break: break-word;
 }
 
-/* daemon console drawer — the log is the hero, lifecycle controls in the header */
+/* daemon console drawer â€” the log is the hero, lifecycle controls in the header */
 .consoleDrawer { display: flex; flex-direction: column; gap: 12px; height: min(680px, 84vh); }
 .consoleHead { display: flex; align-items: center; gap: 10px; }
 .consoleHead .pill { display: inline-flex; align-items: center; gap: 6px; }
@@ -2040,12 +2567,13 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   background: rgba(8, 6, 7, 0.55);
   /* Vertically centered with guaranteed top+bottom breathing room so tall
      popovers (the War Table, the model swap) are NEVER jammed against an edge
-     or clipped — the old top-anchor (padding-top:12vh, no bottom) cut off the
+     or clipped â€” the old top-anchor (padding-top:12vh, no bottom) cut off the
      footer button on shorter windows. */
   display: grid; justify-items: center; align-items: center;
   padding: 5vh 16px;
   animation: bootIn 140ms ease;
-  backdrop-filter: blur(2px);
+  /* a deeper blur reads as depth-of-field â€” the room recedes, the panel is the subject */
+  backdrop-filter: blur(7px) saturate(0.85);
 }
 .palette {
   width: min(560px, 90vw);
@@ -2077,6 +2605,220 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .paletteList button em { font-style: normal; font-size: 11px; color: var(--faint); margin-left: auto; flex: none; }
 .paletteEmpty { padding: 16px; text-align: center; font-size: 12px; color: var(--faint); }
 .palette.modelSwap { width: min(600px, 92vw); max-height: 82vh; gap: 10px; padding-bottom: 14px; }
+
+/* â”€â”€ model DISCOVERY panel â€” the big two-pane model browser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.palette.modelDiscovery {
+  width: min(1080px, 94vw); max-height: 86vh; height: min(720px, 86vh);
+  flex-direction: row; padding: 0; gap: 0;
+}
+.mdlRail {
+  flex: none; width: 248px; display: flex; flex-direction: column; gap: 4px;
+  padding: 14px 10px; border-right: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  overflow-y: auto;
+}
+.mdlRailTitle { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); font-weight: 700; padding: 0 8px 6px; }
+.mdlRailList { display: flex; flex-direction: column; gap: 3px; flex: 1; }
+.mdlProv {
+  display: flex; align-items: center; gap: 10px; text-align: left;
+  padding: 8px 8px; border-radius: 10px; border: 1px solid transparent;
+  background: transparent; color: var(--text); cursor: pointer; font: inherit;
+  animation: modelRowIn 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation-delay: calc(var(--i, 0) * 30ms);
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.mdlProv:hover { background: rgba(var(--accent-rgb), 0.07); }
+.mdlProv[data-on="1"] { background: rgba(var(--accent-rgb), 0.12); border-color: var(--line-strong); }
+.mdlMark {
+  flex: none; width: 30px; height: 30px; border-radius: 9px; overflow: hidden;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 2px 8px -3px rgba(0, 0, 0, 0.6);
+}
+.mdlMark svg rect { rx: 0; } /* tile provides its own corners via .mdlMark radius */
+.mdlMark.big { width: 46px; height: 46px; border-radius: 13px; }
+.mdlProvBody { min-width: 0; }
+.mdlProvBody strong { display: block; font-size: 12.5px; }
+.mdlProvBody em { display: block; font-style: normal; font-size: 10.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdlRail .autoRoutePick { margin: 6px 2px 0; }
+.mdlMain { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.mdlHero {
+  flex: none; display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px 10px; border-bottom: 1px solid var(--line);
+}
+.mdlHeroBody { flex: 1; min-width: 0; }
+.mdlHeroBody strong { display: block; font-size: 17px; letter-spacing: 0.01em; }
+.mdlHeroBody em { display: block; font-style: normal; font-size: 12px; color: var(--muted); }
+.mdlCount { flex: none; font: 600 11px/1 var(--mono); color: var(--faint); letter-spacing: 0.04em; }
+.mdlHero .ghost { flex: none; background: transparent; border: 1px solid var(--line); color: var(--text); padding: 6px 12px; border-radius: 8px; cursor: pointer; }
+.mdlControls { flex: none; display: flex; align-items: center; gap: 10px; padding: 10px 16px; }
+.mdlControls .modelSearch { flex: 1; }
+.mdlGrid {
+  flex: 1; overflow-y: auto; padding: 4px 16px 16px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px;
+  align-content: start;
+}
+.mdlCard {
+  display: flex; flex-direction: column; gap: 7px; text-align: left;
+  padding: 11px 12px; border-radius: 12px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  color: var(--text); cursor: pointer; font: inherit;
+  animation: modelRowIn 300ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation-delay: calc(var(--i, 0) * 22ms);
+  transition: border-color 150ms ease, transform 150ms ease, background 150ms ease;
+}
+.mdlCard:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); transform: translateY(-1px); }
+.mdlCard[data-on="1"] { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.08); }
+.mdlCardTop { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.mdlCardName { flex: 1; min-width: 0; }
+.mdlCardName strong { display: block; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdlCardName em { display: block; font-style: normal; font: 500 10px/1.3 var(--mono); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdlCardDesc {
+  font-size: 11.5px; line-height: 1.45; color: var(--muted);
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.mdlCardDesc.thin { color: var(--faint); }
+.mdlCardFoot { display: flex; flex-wrap: wrap; gap: 5px; margin-top: auto; }
+.mdlChip {
+  font: 600 10px/1 var(--mono); font-style: normal; letter-spacing: 0.03em;
+  padding: 3px 7px; border-radius: 999px; border: 1px solid var(--line);
+  color: var(--muted); white-space: nowrap;
+}
+.mdlChip.free { border-color: var(--steel); color: var(--steel); }
+.mdlChip.cap { color: var(--faint); }
+.mdlChip.current { border-color: var(--accent); color: var(--accent-hi, var(--accent)); }
+.mdlDetailWrap { flex: 1; overflow-y: auto; padding: 12px 16px 16px; position: relative; }
+/* real provider logos render as self-contained rounded tiles */
+.modelGlyph, .mdlMark, .mdGlyph, .settingsModelLogo { display: block; flex: none; }
+.modelGlyph svg, .mdlMark svg, .mdGlyph svg, .settingsModelLogo svg, .provIdent svg { width: 100%; height: 100%; display: block; }
+.modelGlyph { width: 22px; height: 22px; }
+.mdGlyph { width: 40px; height: 40px; }
+/* favicon logos loaded from the provider's own domain â€” clean light tile so a
+   dark or colored mark reads in any theme; the img is contained with padding */
+.brandLogo {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 22px; height: 22px; border-radius: 6px; overflow: hidden;
+  background: #f4f4f5; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+.brandLogo img { width: 100%; height: 100%; object-fit: contain; padding: 15%; }
+.brandLogo.mdlMark { width: 30px; height: 30px; border-radius: 9px; }
+.brandLogo.mdlMark.big { width: 46px; height: 46px; border-radius: 13px; }
+.brandLogo.mdGlyph { width: 40px; height: 40px; border-radius: 11px; }
+.brandLogo.settingsModelLogo { width: 38px; height: 38px; border-radius: 11px; }
+
+/* settings â†’ Model: a summary card that opens the full discovery browser */
+.settingsModelCard {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+  padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  cursor: pointer; transition: border-color 140ms ease, transform 140ms ease;
+}
+.settingsModelCard:hover { border-color: var(--accent); transform: translateY(-1px); }
+.settingsModelLogo { width: 38px; height: 38px; }
+.settingsModelBody { flex: 1; min-width: 0; }
+.settingsModelBody strong { display: block; font-size: 14px; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.settingsModelBody em { display: block; font-style: normal; font-size: 11.5px; color: var(--faint); }
+.settingsModelBrowse { flex: none; font-size: 12px; font-weight: 700; color: var(--accent-hi, var(--accent)); }
+
+/* settings â†’ Model: branded provider picker (was flat colored dots) */
+.provIdentGrid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 4px 0 6px; }
+.provIdent {
+  display: flex; align-items: center; gap: 10px; text-align: left;
+  padding: 9px 11px; border-radius: 11px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  color: var(--text); cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+.provIdent:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); transform: translateY(-1px); }
+.provIdent[data-on="1"] { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.09); }
+.provIdentBody { min-width: 0; }
+.provIdentBody strong { display: block; font-size: 12.5px; text-transform: capitalize; }
+.provIdentBody em { display: block; font-style: normal; font-size: 10.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* voice engine health strip (settings â†’ Voice) */
+.voiceEngineStatus {
+  display: flex; align-items: center; gap: 10px; margin: 2px 0 14px;
+  padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+}
+.voiceEngineStatus[data-tone="ok"] { border-color: color-mix(in srgb, var(--steel) 45%, var(--line)); }
+.voiceEngineStatus[data-tone="warn"] { border-color: color-mix(in srgb, #e0a468 50%, var(--line)); }
+.voiceEngineDot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--faint); display: grid; place-items: center; }
+.voiceEngineDot[data-tone="ok"] { background: var(--steel); box-shadow: 0 0 8px rgba(127,166,163,0.7); }
+.voiceEngineDot[data-tone="warn"] { background: #e0a468; }
+.voiceEngineDot[data-tone="busy"] { background: transparent; }
+.voiceEngineLabel { flex: 1; font-size: 12.5px; color: var(--text); }
+.voiceEngineRepair {
+  flex: none; font: inherit; font-size: 11.5px; font-weight: 700; letter-spacing: 0.03em;
+  padding: 5px 14px; border-radius: 999px; cursor: pointer; color: var(--text);
+  background: rgba(var(--accent-rgb), 0.12); border: 1px solid var(--line-strong);
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.voiceEngineRepair:hover:not(:disabled) { background: rgba(var(--accent-rgb), 0.24); border-color: var(--accent); }
+
+.mdlQuick { flex: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px 0; }
+.mdlQuickChip {
+  font: 600 11px/1 var(--mono); letter-spacing: 0.02em; cursor: pointer;
+  padding: 5px 10px; border-radius: 999px; color: var(--muted);
+  border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 55%, transparent);
+  transition: border-color 130ms ease, color 130ms ease, transform 130ms ease;
+  max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mdlQuickChip:hover { border-color: var(--accent); color: var(--text); transform: translateY(-1px); }
+.mdlQuickChip.fav { border-color: color-mix(in srgb, var(--bronze, #c79a4e) 60%, var(--line)); color: var(--bronze-hi, #d9b878); }
+.mdlQuickChip[data-on="1"] { border-color: var(--accent); color: var(--text); background: rgba(var(--accent-rgb), 0.1); }
+.mdlStar { flex: none; cursor: pointer; font-size: 13px; color: var(--faint); transition: color 130ms ease, transform 130ms ease; }
+.mdlStar:hover { color: var(--bronze-hi, #d9b878); transform: scale(1.15); }
+.mdlStar[data-on="1"] { color: var(--bronze, #c79a4e); }
+.mdlUsage {
+  flex: none; display: flex; align-items: center; gap: 14px;
+  margin: 8px 16px 0; padding: 7px 12px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  font: 500 11px/1 var(--mono); color: var(--muted); letter-spacing: 0.02em;
+  animation: paletteIn 200ms ease both;
+}
+.mdlUsage b { color: var(--text); font-weight: 700; }
+.mdlUsageLabel { font-weight: 800; font-size: 9px; letter-spacing: 0.14em; color: var(--faint); border: 1px solid var(--line); border-radius: 5px; padding: 2px 5px; }
+.mdlUsageCost { margin-left: auto; }
+.mdlUsageCost b { color: var(--steel); }
+.mdlSection {
+  grid-column: 1 / -1; display: flex; align-items: baseline; gap: 8px;
+  padding: 8px 2px 0; font-size: 10.5px; font-weight: 800;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint);
+  position: sticky; top: 0; z-index: 1;
+  background: linear-gradient(180deg, var(--bg-raised) 70%, transparent);
+}
+.mdlSection em { font-style: normal; font-weight: 600; color: var(--faint); opacity: 0.7; }
+.mdlCardMeta { display: flex; gap: 12px; font: 500 10.5px/1 var(--mono); color: var(--faint); }
+.mdlChip.pulled { border-color: var(--steel); color: var(--steel); }
+.mdlChip.cloud { border-color: color-mix(in srgb, #6ab7d8 60%, var(--line)); color: #8fc9e3; }
+.mdlChip.ghosted { border-style: dashed; color: var(--faint); }
+.mdlChip.pullBtn { cursor: pointer; border-color: var(--accent); color: var(--accent-hi, var(--accent)); transition: background 130ms ease; }
+.mdlChip.pullBtn:hover { background: rgba(var(--accent-rgb), 0.14); }
+.mdlPullBar {
+  position: relative; display: block; height: 14px; border-radius: 999px;
+  border: 1px solid var(--line-strong); overflow: hidden;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+}
+.mdlPullFill {
+  position: absolute; inset: 0 auto 0 0; border-radius: 999px;
+  background: linear-gradient(90deg, rgba(var(--accent-rgb), 0.5), var(--accent));
+  transition: width 300ms ease;
+}
+.mdlPullFill[data-indeterminate="1"] { width: 40% !important; animation: mdlPullSlide 1.2s ease-in-out infinite; }
+@keyframes mdlPullSlide { 0% { transform: translateX(-100%); } 100% { transform: translateX(280%); } }
+.mdlPullBar em {
+  position: relative; z-index: 1; display: block; text-align: center;
+  font: 700 9px/14px var(--mono); font-style: normal; color: var(--text); letter-spacing: 0.06em;
+}
+@media (prefers-reduced-motion: reduce) { .mdlPullFill[data-indeterminate="1"] { animation: none; } }
+.usageCost { flex: none; font: 600 11px/1 var(--mono); color: var(--steel); min-width: 58px; text-align: right; }
+.usageProv { font-style: normal; font-size: 10px; color: var(--faint); margin-left: 6px; }
+@media (max-width: 860px) {
+  .palette.modelDiscovery { flex-direction: column; height: 86vh; }
+  .mdlRail { width: 100%; flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 1px solid var(--line); }
+  .mdlRailTitle, .mdlProvBody em { display: none; }
+  .mdlRailList { flex-direction: row; flex-wrap: wrap; }
+}
 .palette.modelSwap .segment { padding: 12px 14px 2px; }
 .palette.modelSwap .modelPicker { padding: 0 14px; gap: 8px; }
 .palette.modelSwap .modelList { max-height: 46vh; }
@@ -2101,9 +2843,42 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 @keyframes paletteIn { from { transform: translateY(-14px) scale(0.985); opacity: 0; } to { transform: none; opacity: 1; } }
 
 /* small popovers (reasoning etc.) */
-.palette.reasoningPop { width: min(460px, 88vw); padding: 6px 6px 14px; gap: 2px; }
+.palette.reasoningPop {
+  width: min(720px, 92vw); padding: 0; gap: 0; overflow: hidden;
+  border-color: rgba(var(--accent-rgb), .28);
+  background: color-mix(in srgb, var(--bg-raised) 90%, transparent);
+  box-shadow: 0 34px 90px -32px rgba(0,0,0,.92), 0 0 0 1px rgba(var(--accent-rgb),.06);
+}
+.effortHead { display: flex; align-items: center; gap: 12px; padding: 17px 18px 15px; border-bottom: 1px solid var(--line); }
+.effortProviderMark { flex: none; width: 34px; height: 34px; border-radius: 11px; }
+.effortHead > span { min-width: 0; display: grid; gap: 4px; }
+.effortHead strong { font: 650 15px/1.1 var(--display); color: var(--text); letter-spacing: .015em; }
+.effortHead em { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 550 10px/1 var(--mono); font-style: normal; color: var(--faint); text-transform: uppercase; letter-spacing: .07em; }
+.effortHead .close { margin-left: auto; }
+.effortSignal { position: relative; height: 30px; margin: 16px 25px 3px; }
+.effortSignal::before { content: ""; position: absolute; inset: 13px 0 auto; height: 2px; border-radius: 2px; background: rgba(255,255,255,.065); }
+.effortSignal > i { position: absolute; left: 0; top: 13px; height: 2px; border-radius: 2px; background: linear-gradient(90deg, var(--bronze), var(--ember-hi)); box-shadow: 0 0 12px rgba(var(--ember-rgb),.42); transition: width 280ms cubic-bezier(.2,.9,.3,1); }
+.effortSignal > b { position: absolute; top: 9px; width: 10px; height: 10px; transform: translateX(-50%); border-radius: 50%; background: var(--panel-2); border: 1px solid var(--line-strong); transition: transform 180ms ease, background 180ms ease, box-shadow 180ms ease; }
+.effortSignal > b[data-on="1"] { transform: translateX(-50%) scale(1.35); background: var(--ember-hi); border-color: #f5c2a2; box-shadow: 0 0 0 4px rgba(var(--ember-rgb),.11), 0 0 16px rgba(var(--ember-rgb),.7); }
+.effortChoices { display: grid; grid-template-columns: repeat(var(--effort-stops), minmax(0, 1fr)); padding: 0 12px 14px; }
+.effortChoices button { min-width: 0; min-height: 92px; display: grid; align-content: center; gap: 8px; padding: 12px 9px; color: var(--muted); border-left: 1px solid rgba(255,255,255,.045); background: transparent; text-align: center; transition: color 160ms ease, background 160ms ease, transform 160ms ease; }
+.effortChoices button:first-child { border-left: 0; }
+.effortChoices button:hover { color: var(--text); background: rgba(var(--accent-rgb),.055); transform: translateY(-2px); }
+.effortChoices button[data-on="1"] { color: var(--ember-hi); background: linear-gradient(180deg, rgba(var(--ember-rgb),.12), rgba(var(--accent-rgb),.025)); }
+.effortChoices span { font: 700 10px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase; }
+.effortChoices small { font: 450 10.5px/1.35 var(--body); color: var(--faint); }
+.effortChoices button[data-on="1"] small { color: var(--muted); }
+.effortWire { display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 10px 18px; border-top: 1px solid var(--line); background: rgba(0,0,0,.19); color: var(--faint); font: 550 10px/1.35 var(--mono); }
+.effortWire i { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--steel); box-shadow: 0 0 8px rgba(127,166,163,.55); }
+.effortWire[data-warning="1"] { color: var(--bronze-hi); }
+.effortWire[data-warning="1"] i { background: var(--bronze-hi); box-shadow: 0 0 8px rgba(var(--accent-rgb),.6); }
+.effortStatus span { color: var(--accent-hi); }
+@media (max-width: 620px) {
+  .effortChoices { grid-template-columns: repeat(2, 1fr); }
+  .effortChoices button { min-height: 72px; border-top: 1px solid rgba(255,255,255,.045); }
+}
 
-/* ── the effort slider — low → max → ULTRA ──────────────────────────────── */
+/* â”€â”€ the effort slider â€” low â†’ max â†’ ULTRA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .effortSlider { padding: 8px 16px 4px; display: grid; gap: 12px; }
 .effortTrack { position: relative; height: 26px; display: flex; align-items: center; }
 .effortTrack::before {
@@ -2169,7 +2944,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 /* the HUD 'mode' chip glows when the fleet posture is armed */
 .statusSeg[data-ultra="1"] span { color: var(--ember-hi); text-shadow: 0 0 8px rgba(var(--ember-rgb), 0.6); }
 
-/* ── the live fleet board — Conductor agents, grouped by phase ───────────── */
+/* â”€â”€ the live fleet board â€” Conductor agents, grouped by phase â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .fleetPanel {
   margin: 0 0 8px; border: 1px solid var(--line-strong); border-radius: var(--r-md);
   background: linear-gradient(180deg, var(--bg-raised), var(--panel));
@@ -2214,7 +2989,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .fleetRole { font: 600 11px/1.2 var(--mono); color: var(--text); flex: none; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fleetAct { font: 400 10.5px/1.3 var(--mono); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: auto; }
 
-/* ── Delegation cut-scene: Ares beaming a job to Claude Code / Codex ────────── */
+/* â”€â”€ Delegation cut-scene: Ares beaming a job to Claude Code / Codex â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .cbScene {
   --cb-accent: #d9935a;
   margin: 0 0 8px; padding: 14px 14px 11px; border-radius: var(--r-md);
@@ -2242,7 +3017,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .cbAres .cbName { color: var(--ember-hi); }
 .cbBackend .cbName { color: var(--cb-accent); }
 
-/* The beam: three chevrons streaming Ares → backend while working. */
+/* The beam: three chevrons streaming Ares â†’ backend while working. */
 .cbBeam { display: inline-flex; gap: 6px; align-items: center; opacity: 0.35; }
 .cbBeam i { width: 8px; height: 8px; border-top: 2px solid var(--cb-accent); border-right: 2px solid var(--cb-accent); transform: rotate(45deg); border-radius: 1px; }
 .cbScene[data-phase="running"] .cbBeam { opacity: 1; }
@@ -2264,7 +3039,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .cbStep { display: inline-flex; align-items: center; gap: 5px; font: 600 9px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); opacity: 0.5; }
 .cbStep[data-state="active"] { opacity: 1; color: var(--ember-hi); }
 .cbStep[data-state="done"] { opacity: 0.85; color: var(--steel); }
-.cbStep:not(:last-child)::after { content: "→"; margin-left: 4px; color: var(--faint); opacity: 0.5; }
+.cbStep:not(:last-child)::after { content: "â†’"; margin-left: 4px; color: var(--faint); opacity: 0.5; }
 .cbStepDot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .cbStep[data-state="active"] .cbStepDot { box-shadow: 0 0 7px var(--ember-hi); animation: micPulse 1.2s ease-in-out infinite; }
 
@@ -2291,7 +3066,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .popRow span { font: 600 13px/1 var(--mono); }
 .popRow em { font-style: normal; font-size: 11.5px; color: var(--faint); margin-left: auto; }
 
-/* ══ THE WAR TABLE — routing assignments, spacious and un-squished ══ */
+/* â•â• THE WAR TABLE â€” routing assignments, spacious and un-squished â•â• */
 .palette.routingPop { width: min(720px, 95vw); max-height: 86vh; display: flex; flex-direction: column; }
 .routingHead {
   display: flex; align-items: flex-start; gap: 16px;
@@ -2301,9 +3076,15 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .routingHead strong { font: 700 14px/1 var(--mono); letter-spacing: 0.04em; color: var(--bronze-hi); }
 .routingHead span { font: 400 11.5px/1.5 var(--mono); color: var(--faint); max-width: 540px; }
 .routingHead .popClose { flex: none; padding: 6px 12px; font-size: 11px; }
-/* min-height:0 is REQUIRED for a flex child to actually scroll — without it the
+/* min-height:0 is REQUIRED for a flex child to actually scroll â€” without it the
    body grows to content height and the modal clips it with no scrollbar. */
-.routingPopBody { overflow-y: auto; min-height: 0; flex: 1; padding: 12px 14px; display: grid; gap: 10px; align-content: start; }
+/* grid-auto-rows:min-content is load-bearing. Without it the auto rows get
+   compressed to share the body's definite height, so every EXPANDED lane was
+   squeezed to ~91px while its content needed ~450 — and `.routeLane`'s
+   overflow:hidden silently guillotined the model list mid-row. With rows
+   sized to their content the body simply scrolls, which is what it was
+   already set up to do. */
+.routingPopBody { overflow-y: auto; min-height: 0; flex: 1; padding: 12px 14px; display: grid; gap: 10px; align-content: start; grid-auto-rows: min-content; }
 .routingPopFoot { padding: 14px 18px; border-top: 1px solid var(--line); flex: none; }
 .routingPopFoot .primary { width: 100%; height: 42px; font-size: 13px; letter-spacing: 0.04em; }
 
@@ -2393,7 +3174,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 }
 .modelGroup em { font-style: normal; letter-spacing: 0; color: var(--bronze); }
 .modelRow {
-  /* glyph | identity(flex) | hint | tick — explicit 4 tracks (the tick used to
+  /* glyph | identity(flex) | hint | tick â€” explicit 4 tracks (the tick used to
      wrap under the glyph on a phantom 2nd row); top-aligned so the description
      card can grow downward. */
   display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: start; gap: 4px 12px;
@@ -2402,7 +3183,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   text-align: left;
   position: relative;
   transition: background 130ms ease, box-shadow 130ms ease, transform 130ms ease;
-  /* staggered entrance — each row slides up in sequence as the list opens */
+  /* staggered entrance â€” each row slides up in sequence as the list opens */
   opacity: 0;
   animation: modelRowIn 320ms cubic-bezier(0.2, 0.9, 0.3, 1) forwards;
   animation-delay: calc(var(--i, 0) * 22ms);
@@ -2435,12 +3216,12 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .modelHint { font-size: 10.5px; line-height: 1.35; color: var(--faint); text-align: right; max-width: 200px; }
 /* a check that fades in only on the selected row */
 .modelTick { width: 14px; flex: none; opacity: 0; transition: opacity 130ms ease; }
-.modelTick::before { content: "✓"; color: var(--accent-hi); font: 700 12px/1 var(--mono); }
+.modelTick::before { content: "âœ“"; color: var(--accent-hi); font: 700 12px/1 var(--mono); }
 .modelRow[data-on="1"] .modelTick { opacity: 1; }
 .modelHintEmpty { font-size: 11.5px; color: var(--faint); padding: 14px; text-align: center; }
 @keyframes modelRowIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
-/* The ⓘ details affordance on a card — click opens the big page, without selecting. */
+/* The â“˜ details affordance on a card â€” click opens the big page, without selecting. */
 .modelInfo {
   flex: none; align-self: center; width: 20px; height: 20px; display: grid; place-items: center;
   border-radius: 50%; font: 600 12px/1 var(--mono); color: var(--faint); cursor: pointer;
@@ -2448,7 +3229,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 }
 .modelInfo:hover { color: var(--bronze-hi); border-color: var(--bronze); background: rgba(var(--accent-rgb), 0.12); }
 
-/* ── The model DETAIL page — big, readable, opened from a card ─────────────── */
+/* â”€â”€ The model DETAIL page â€” big, readable, opened from a card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .modelDetail {
   border: 1px solid var(--line-strong); border-radius: var(--r-md);
   background: radial-gradient(120% 80% at 0% -10%, rgba(var(--ember-rgb), 0.08), transparent 55%), var(--panel);
@@ -2502,40 +3283,50 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .routing { display: grid; gap: 8px; }
 .routingHint { margin: 0; font-size: 11.5px; color: var(--faint); line-height: 1.5; }
 .routeLane {
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(0, 0, 0, 0.18);
-  overflow: hidden;
+  background: color-mix(in srgb, var(--panel) 45%, transparent);
+  overflow: hidden; margin-bottom: 8px;
   transition: border-color 160ms ease, background 160ms ease;
 }
-.routeLane[data-on="1"] { border-color: rgba(var(--accent-rgb), 0.4); background: rgba(var(--accent-rgb), 0.05); }
+.routeLane[data-on="1"] { border-color: color-mix(in srgb, var(--accent) 42%, var(--line)); background: rgba(var(--accent-rgb), 0.05); }
 .laneToggle {
-  display: flex; align-items: center; gap: 11px;
-  width: 100%; padding: 13px 15px;
-  color: var(--muted); font: 600 13px/1 var(--mono); letter-spacing: 0.04em;
+  display: flex; align-items: center; gap: 12px;
+  width: 100%; padding: 12px 14px;
+  color: var(--text); font: inherit; text-align: left;
   transition: color 140ms ease;
 }
-.laneName { text-transform: capitalize; flex: none; }
-.laneHint { font-style: normal; font: 400 11px/1.3 var(--mono); color: var(--faint); letter-spacing: 0.01em; }
-/* the assigned model (or the fallback note) as a chip on the right */
-.laneModel, .laneFallback {
-  margin-left: auto; flex: none;
-  font: 600 10.5px/1 var(--mono); letter-spacing: 0.01em;
-  padding: 5px 10px; border-radius: 999px;
-  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.laneIcon {
+  flex: none; width: 34px; height: 34px; border-radius: 10px;
+  display: grid; place-items: center; font-size: 16px;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  border: 1px solid var(--line);
 }
-.laneModel { color: var(--bronze-hi); background: rgba(var(--accent-rgb), 0.12); border: 1px solid rgba(var(--accent-rgb), 0.3); }
-.laneFallback { color: var(--faint); border: 1px solid var(--line); }
-.laneToggle:hover { color: var(--text); }
-.laneToggle i { flex: none; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--faint); transition: all 160ms ease; }
-.routeLane[data-on="1"] .laneToggle i { background: var(--bronze); border-color: var(--bronze); box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.6); }
-.routeLane[data-on="1"] .laneToggle { color: var(--bronze-hi); }
-.laneBody { display: grid; gap: 9px; padding: 4px 15px 14px; animation: fadeUp 180ms ease both; }
+.routeLane[data-on="1"] .laneIcon { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); background: rgba(var(--accent-rgb), 0.1); }
+.laneName { flex: 1; min-width: 0; }
+.laneName strong { display: block; font-size: 13px; font-weight: 650; text-transform: capitalize; }
+.laneName em { display: block; font-style: normal; font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.laneAssign {
+  flex: none; max-width: min(380px, 52%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 600 10.5px/1 var(--mono); padding: 5px 10px; border-radius: 999px;
+  color: var(--faint); border: 1px solid var(--line);
+}
+.routeLane[data-on="1"] .laneAssign { color: var(--bronze-hi); background: rgba(var(--accent-rgb), 0.12); border-color: rgba(var(--accent-rgb), 0.3); }
+.laneSwitch {
+  flex: none; width: 34px; height: 19px; padding: 2px; border-radius: 999px;
+  border: 1px solid var(--line-strong); background: color-mix(in srgb, var(--panel) 70%, transparent);
+  transition: background 160ms ease, border-color 160ms ease;
+}
+.laneSwitch[data-on="1"] { background: color-mix(in srgb, var(--accent) 45%, transparent); border-color: var(--accent); }
+.laneSwitch i { display: block; width: 13px; height: 13px; border-radius: 50%; background: var(--text); transform: translateX(0); transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+.laneSwitch[data-on="1"] i { transform: translateX(15px); }
+.laneToggle:hover .laneName strong { color: var(--bronze-hi); }
+.laneBody { display: grid; gap: 9px; padding: 4px 14px 14px; animation: fadeUp 180ms ease both; }
 .laneBody input { width: 100%; }
-/* give the per-lane model list real room — no more squished 150px scroller */
+/* give the per-lane model list real room â€” no more squished 150px scroller */
 .laneBody .modelPicker.compact .modelList { max-height: 230px; }
 
-/* ── the Forge: the right-side panel ────────────────────────────────── */
+/* â”€â”€ the Forge: the right-side panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 .forge {
   grid-area: forge;
@@ -2571,6 +3362,19 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 }
 .forgeTabs button:hover { color: var(--text); }
 .forgeTabs button[data-on="1"] { color: var(--bronze-hi); border-color: var(--line-strong); background: rgba(var(--accent-rgb), 0.08); }
+.forgeSurfaceState {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 600 9.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--faint);
+}
+.forgeSurfaceState[data-live="1"] { color: var(--ember-hi); }
+
+.modelNativeReasoning {
+  display: grid; gap: 5px; padding: 12px 14px; border: 1px solid var(--line);
+  border-radius: var(--r-md); background: rgba(var(--accent-rgb), .045);
+}
+.modelNativeReasoning strong { color: var(--bronze-hi); font-size: 13px; }
+.modelNativeReasoning span { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.statusReadOnly { cursor: default; }
 
 .forgeBody { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; background: #0b0a0b; }
 .forgeBody iframe {
@@ -2587,19 +3391,45 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   background: var(--bg-raised);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.forgeMeta::before { content: "◆"; font-size: 8px; color: var(--bronze-hi); }
+.forgeMeta::before { content: "â—†"; font-size: 8px; color: var(--bronze-hi); }
 .forgeBody:has(.forgeMeta) { grid-template-rows: auto minmax(0, 1fr); }
+.forgeToolbar, .liveToolbar {
+  display: flex; align-items: center; gap: 7px;
+  min-width: 0; border-bottom: 1px solid var(--line); background: var(--bg-raised);
+}
+.forgeToolbar .forgeMeta { flex: 1; min-width: 0; border-bottom: 0; background: transparent; }
+.forgeToolbar button, .liveToolbar button, .forgeActions button {
+  flex: none; padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: 7px;
+  color: var(--bronze-hi); background: rgba(var(--accent-rgb), .06); font: 600 9px/1 var(--mono);
+  letter-spacing: .06em; text-transform: uppercase; transition: 140ms ease;
+}
+.forgeToolbar button:hover, .liveToolbar button:hover, .forgeActions button:hover { background: rgba(var(--accent-rgb), .16); transform: translateY(-1px); }
+.liveToolbar { padding: 7px 9px; }
+.liveToolbar input {
+  min-width: 0; flex: 1; border: 1px solid var(--line-strong); border-radius: 7px; outline: none;
+  padding: 7px 9px; background: #090809; color: var(--text); font: 10.5px/1 var(--mono);
+}
+.liveToolbar input:focus { border-color: rgba(var(--accent-rgb), .65); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .08); }
+.idleDot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 
 .forgeEmpty { display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); text-align: center; padding: 20px; }
 .forgeEmpty p { margin: 0; font-size: 12.5px; max-width: 260px; line-height: 1.6; }
 
-/* ── embedded live browser — Ares driving its own browser, streamed in ── */
+/* â”€â”€ embedded live browser â€” Ares driving its own browser, streamed in â”€â”€ */
 .forgeTabs button[data-live="1"] { color: var(--ember-hi); border-color: rgba(var(--ember-rgb), 0.5); background: rgba(var(--ember-rgb), 0.1); animation: livePulse 1.4s ease-in-out infinite; }
 @keyframes livePulse { 50% { background: rgba(var(--ember-rgb), 0.22); } }
 .liveBrowser .liveStage { display: grid; place-items: center; min-height: 0; padding: 10px; background: #0a0809; overflow: auto; }
 .liveBrowser .liveStage img { max-width: 100%; max-height: 100%; border-radius: 6px; border: 1px solid var(--line-strong); box-shadow: 0 0 30px rgba(var(--accent-rgb), 0.18); object-fit: contain; }
 .liveBrowser .liveStage.embed { padding: 0; place-items: stretch; }
 .liveBrowser .liveStage.embed[data-on="0"] { position: absolute; left: -99999px; width: 1px; height: 1px; overflow: hidden; }
+.forgeBody.liveBrowser { grid-template-rows: auto auto minmax(0, 1fr); }
+.liveBrowser .liveStage.interactive { position: relative; padding: 0; place-items: stretch; overflow: hidden; }
+.liveBrowser .liveStage.interactive iframe { width: 100%; height: 100%; border: 0; background: #fff; color-scheme: light; }
+.liveTelemetry {
+  position: absolute; right: 10px; bottom: 10px; width: 112px; max-height: 72px; object-fit: cover;
+  opacity: .34; border: 1px solid var(--line-strong); border-radius: 5px; transition: 160ms ease;
+}
+.liveTelemetry:hover { width: 220px; max-height: 140px; opacity: 1; }
 .embeddedBrowserFrame { width: 100%; height: 100%; border: none; background: #fff; color-scheme: light; border-radius: 0; }
 .liveDot { width: 8px; height: 8px; border-radius: 50%; background: var(--ember); box-shadow: 0 0 8px var(--ember); animation: livePulse 1s ease-in-out infinite; }
 
@@ -2610,6 +3440,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   border-bottom: 1px solid var(--line);
   font: 500 10.5px/1 var(--mono); color: var(--faint); letter-spacing: 0.06em;
 }
+.forgeActions { display: flex; align-items: center; gap: 6px; }
 .sandboxCode {
   width: 100%; height: 100%;
   background: var(--bg);
@@ -2643,7 +3474,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .artifact em { font-style: normal; font-size: 11px; color: var(--muted); }
 .artifactGo { margin-left: auto; font: 700 10px/1 var(--mono); letter-spacing: 0.16em; color: var(--bronze-hi); }
 
-/* ── animation primitives ───────────────────────────────────────────── */
+/* â”€â”€ animation primitives â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 @keyframes pulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
 @keyframes drawOn { to { stroke-dashoffset: 0; } }
@@ -2724,11 +3555,11 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   opacity: 0.35;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   HELM — "The Scrying Basin of Ares"
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+   HELM â€” "The Scrying Basin of Ares"
    Drivers: --heat (0..1 molten temp), --draft (0..1 daemon ambient),
    --tilt-x/--tilt-y (pointer parallax). Everything reads these.
-   ═══════════════════════════════════════════════════════════════════════════ */
+   â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 .helm-root {
   --heat: 0.3; --draft: 1; --tilt-x: 0deg; --tilt-y: 0deg;
   position: relative;
@@ -2787,7 +3618,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .helm-refresh { flex: none; width: 26px; height: 26px; border-radius: 6px; color: var(--faint); font-size: 13px; border: 1px solid var(--line); transition: color 140ms, background 140ms, transform 300ms; }
 .helm-refresh:hover { color: var(--bronze-hi); background: rgba(var(--accent-rgb), 0.1); transform: rotate(180deg); }
 
-/* CENTER GRID — three slates | basin | three slates */
+/* CENTER GRID â€” three slates | basin | three slates */
 .helm-content {
   position: relative; z-index: 1;
   display: grid;
@@ -2804,7 +3635,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .slate-auguries { grid-column: 3; grid-row: 2; }
 .slate-favor { grid-column: 3; grid-row: 3; }
 
-/* THE OMPHALOS — basin */
+/* THE OMPHALOS â€” basin */
 .helm-basin {
   position: relative; z-index: 1;
   align-self: center; justify-self: center;
@@ -2931,7 +3762,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .helm-ledger-scroll { display: flex; gap: 10px; overflow: hidden; flex: 1; }
 .helm-tablet { flex: none; font: 600 10.5px/1 var(--mono); color: var(--steel); padding: 5px 10px; border-radius: 5px; border: 1px solid rgba(127, 166, 163, 0.3); background: rgba(127, 166, 163, 0.06); white-space: nowrap; animation: forgeIn 500ms ease both; }
 
-/* narrow widths — collapse to a single column: basin first, slates stacked */
+/* narrow widths â€” collapse to a single column: basin first, slates stacked */
 @media (max-width: 920px) {
   .helm-content { grid-template-columns: 1fr; grid-template-rows: none; grid-auto-rows: min-content; }
   .helm-basin { grid-column: 1; grid-row: auto; order: -1; width: min(100%, 320px); margin: 0 auto; }
@@ -2939,7 +3770,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   .helm-content { overflow-y: auto; }
 }
 
-/* daemon dying — cold crust inversion */
+/* daemon dying â€” cold crust inversion */
 .helm-root[data-daemon="stopped"], .helm-root[data-daemon="error"] {
   filter: saturate(0.5) brightness(0.82);
 }
@@ -2949,7 +3780,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   .helm-embers, .helm-pool, .helm-pool-glow, .helm-ring-outer, .helm-ring-mid, .helm-shock, .helm-ticker span[data-on="1"] { animation: none !important; }
 }
 
-/* ─── Auto-update banner ─────────────────────────────────────────────────── */
+/* â”€â”€â”€ Auto-update banner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .updateBanner {
   position: fixed;
   top: 14px;
@@ -2995,7 +3826,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .updateBanner__bar { width: 120px; height: 5px; border-radius: 3px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
 .updateBanner__barFill { height: 100%; background: linear-gradient(90deg, var(--ember), var(--ember-hi)); transition: width 0.2s ease; }
 
-/* ─── Consciousness settings pane ────────────────────────────────────────── */
+/* â”€â”€â”€ Consciousness settings pane â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .consciousHead { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 14px 0 18px; }
 .consciousPhase {
   font-weight: 600;
@@ -3040,7 +3871,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   margin-bottom: 4px;
 }
 
-/* ─── What's New reveal ──────────────────────────────────────────────────── */
+/* â”€â”€â”€ What's New reveal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 /* Fires once after an update. Obsidian card, one bronze accent, motion small. */
 .wnScrim {
   z-index: 80; /* above settings (60) */
@@ -3068,7 +3899,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .wnCard:focus { outline: none; }
 .wnClosing .wnCard { animation: wnSink 200ms ease forwards; }
 
-/* First-run key gate — a tighter card than the changelog reveal it borrows. */
+/* First-run key gate â€” a tighter card than the changelog reveal it borrows. */
 .frgCard { width: min(460px, calc(100vw - 40px)); }
 
 .wnGlow {
@@ -3189,7 +4020,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   .wnItem { opacity: 1; transform: none; }
 }
 
-/* ─── Custom (OpenAI-compatible) provider block ──────────────────────────── */
+/* â”€â”€â”€ Custom (OpenAI-compatible) provider block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .customProv {
   margin: 10px 0 4px;
   padding: 12px 13px;
@@ -3213,18 +4044,18 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .customProv .keyHint[data-ok="1"] { color: var(--steel); }
 .customProv .keyHint[data-ok="0"] { color: var(--crimson); }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   NEW-STYLE SKIN — "Forged". The GPU/spring/glass leap.
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+   NEW-STYLE SKIN â€” "Forged". The GPU/spring/glass leap.
    EVERY rule below is scoped under .ares[data-style="new"] so legacy mode
    (data-style="legacy") stays pixel-identical to the pre-skin app. The global
    prefers-reduced-motion rule above (animation/transition: none !important)
    already nukes all of this for reduced-motion users.
-   ═══════════════════════════════════════════════════════════════════════════ */
+   â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
-/* ── forge-in turn entrance — metal set from the fire: a white-hot flash that
+/* â”€â”€ forge-in turn entrance â€” metal set from the fire: a white-hot flash that
    cools to the resting tone while the item rises with a springy overshoot.
    Replaces transcriptIn under the new skin. Staggered on load via nth-child
-   (streamed items mount one at a time — natural stagger). */
+   (streamed items mount one at a time â€” natural stagger). */
 .ares[data-style="new"] .chat > * {
   animation: forgeTurnIn 560ms cubic-bezier(0.22, 1.16, 0.32, 1) both;
 }
@@ -3239,7 +4070,26 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   100% { opacity: 1; transform: none; filter: none; }
 }
 
-/* ── the working glow + rage veil ride --heat smoothly instead of snapping
+/* Conversation choreography: requests enter from the owner's side, replies
+   settle from Ares's side, and telemetry fades instead of competing with both. */
+.ares[data-style="new"] .chat { gap: 13px; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; }
+.ares[data-style="new"] .chat > .turn.user { animation: ownerTurnIn 420ms cubic-bezier(.18,.92,.28,1.08) both; }
+.ares[data-style="new"] .chat > .turn.assistant { animation: aresTurnIn 500ms cubic-bezier(.18,.9,.28,1) both; }
+.ares[data-style="new"] .chat > .usage { animation: telemetryIn 280ms ease both; }
+@keyframes ownerTurnIn { from { opacity: 0; transform: translate3d(18px,8px,0) scale(.985); filter: blur(1px); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes aresTurnIn { from { opacity: 0; transform: translate3d(-14px,10px,0); filter: blur(1.4px); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes telemetryIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.ares[data-style="new"] .turn.user .bubble { max-width: min(72%, 760px); transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease; }
+.ares[data-style="new"] .turn.user .bubble:hover { transform: translateY(-1px); border-color: rgba(var(--accent-rgb),.4); box-shadow: 0 18px 42px -24px rgba(0,0,0,.95), inset 0 1px 0 rgba(255,255,255,.06); }
+.ares[data-style="new"] .turn.assistant { position: relative; max-width: min(82%, 900px); padding: 2px 0 2px 17px; }
+.ares[data-style="new"] .turn.assistant::before { content: ""; position: absolute; left: 0; top: 7px; bottom: 7px; width: 2px; border-radius: 2px; background: linear-gradient(180deg, rgba(var(--ember-rgb),.58), rgba(var(--accent-rgb),.05)); opacity: .7; transform-origin: top; animation: replyRailIn 520ms cubic-bezier(.2,.9,.3,1) both; }
+@keyframes replyRailIn { from { transform: scaleY(.08); opacity: 0; } to { transform: scaleY(1); opacity: .7; } }
+.ares[data-style="new"] .turn.assistant[data-streaming="1"]::before { background: linear-gradient(180deg, var(--ember-hi), rgba(var(--ember-rgb),.08)); box-shadow: 0 0 12px rgba(var(--ember-rgb),.38); }
+.ares[data-style="new"] .usage { margin-left: 17px; opacity: .72; }
+.ares[data-style="new"] .working { margin-left: 17px; }
+.voiceBar { transform-origin: center; }
+
+/* â”€â”€ the working glow + rage veil ride --heat smoothly instead of snapping
    between two fixed opacities. --heat is written by React on busy/daemon
    flips; the opacity transition turns those discrete writes into a smooth
    swell/cool. */
@@ -3249,7 +4099,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .ares[data-style="new"][data-working="1"]::after { opacity: calc(0.45 + var(--heat, 0.3) * 0.55); }
 .ares[data-style="new"] .embers { transition: opacity 900ms ease; }
 
-/* ── compact ✓ line — what a finished tool card collapses to (SpringHeight
+/* â”€â”€ compact âœ“ line â€” what a finished tool card collapses to (SpringHeight
    animates the box between the full head and this slim row). */
 .ares[data-style="new"] .toolDoneLine {
   display: flex; align-items: center; gap: 8px;
@@ -3272,7 +4122,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .ares[data-style="new"] .toolDoneLine .doneTime { flex: none; margin-left: auto; padding-left: 10px; font-style: normal; color: var(--faint); }
 .ares[data-style="new"] .toolCard[data-compact="1"] { border-color: rgba(255, 255, 255, 0.04); }
 
-/* ── token-flow strip — the slim canvas pulse line under the composer while
+/* â”€â”€ token-flow strip â€” the slim canvas pulse line under the composer while
    streaming (one rAF loop owned by TokenFlowStrip; unmounted when idle). */
 .ares[data-style="new"] .tokenFlow {
   display: block;
@@ -3282,10 +4132,10 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
   pointer-events: none;
 }
 
-/* ── glass + depth — layered translucency over the living backdrop, sharper
+/* â”€â”€ glass + depth â€” layered translucency over the living backdrop, sharper
    depth shadows, and the ember accent. Palette flows from the existing theme
    tokens (color-mix over --panel/--bg keeps every war-band re-tint working).
-   Text colors are untouched — contrast stays AA. */
+   Text colors are untouched â€” contrast stays AA. */
 .ares[data-style="new"] .rail {
   background: color-mix(in srgb, var(--bg-raised) 64%, transparent);
   backdrop-filter: blur(16px) saturate(1.12);
@@ -3349,7 +4199,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
     inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
-/* ── specificity repairs — the forge-in rule above (.ares[data-style="new"]
+/* â”€â”€ specificity repairs â€” the forge-in rule above (.ares[data-style="new"]
    .chat > *) outweighs per-item animation rules that must keep their loops or
    their own entrances. Re-state them at higher specificity for the new skin. */
 .ares[data-style="new"] .chat > .toolCard[data-state="running"] {
@@ -3388,7 +4238,11 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .gwHouse { font-style: normal; font-size: 10px; font-weight: 800; letter-spacing: .12em; color: var(--ember, #e08b2e); border: 1px solid var(--ember, #e08b2e); border-radius: 4px; padding: 1px 5px; margin-right: 6px; }
 .gwFree { font-style: normal; font-size: 10px; font-weight: 700; color: var(--steel, #7fa6a3); }
 
-/* ARES brand dropdown — the account lives one click from the wordmark */
+/* ARES brand dropdown â€” the account lives one click from the wordmark */
+/* `.titlebar .brand` sets pointer-events:none so the wordmark never blocks the
+   window drag — but it out-specifies `.brandBtn` (0,2,0 vs 0,1,0), which left
+   the account button unclickable in EVERY skin. Restore it for the button. */
+.titlebar .brand.brandBtn { pointer-events: auto; }
 .brandBtn { cursor: pointer; background: none; border: none; padding: 0 8px 0 0; border-radius: 8px; transition: background 160ms; position: relative; }
 .brandBtn:hover, .brandBtn[data-open="1"] { background: color-mix(in srgb, var(--ember, #e08b2e) 10%, transparent); }
 .brandCredits { font-style: normal; font-weight: 800; font-size: 12px; color: var(--ember, #e08b2e); margin-left: 8px; padding: 2px 8px; border: 1px solid color-mix(in srgb, var(--ember, #e08b2e) 55%, transparent); border-radius: 999px; }
@@ -3398,7 +4252,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .amHead { display: flex; align-items: center; gap: 10px; padding: 12px 12px 8px; }
 .amWho { display: flex; flex-direction: column; line-height: 1.25; }
 .amWho strong { font-size: 14px; }
-/* wallet — the hero number */
+/* wallet â€” the hero number */
 .amWallet { margin: 2px 8px 8px; padding: 12px 14px; border-radius: 11px; background: linear-gradient(135deg, color-mix(in srgb, var(--ember, #e08b2e) 16%, transparent), color-mix(in srgb, var(--blood, #7a1f12) 14%, transparent)); border: 1px solid color-mix(in srgb, var(--ember, #e08b2e) 30%, var(--line)); }
 .amWalletBig { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; color: var(--ember-hi, #ffd27a); line-height: 1; }
 .amWalletSub { font-size: 11px; color: var(--faint); margin-top: 4px; }
@@ -3419,7 +4273,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .amAction { margin: 4px 10px 12px; background: color-mix(in srgb, var(--ember, #e08b2e) 18%, transparent); border: 1px solid var(--ember, #e08b2e); color: var(--text); border-radius: 9px; padding: 9px 12px; font-size: 12.5px; font-weight: 700; cursor: pointer; transition: background 160ms; }
 .amAction:hover { background: color-mix(in srgb, var(--ember, #e08b2e) 32%, transparent); }
 
-/* gateway account — clickable model rows */
+/* gateway account â€” clickable model rows */
 .gwModelBtn { cursor: pointer; background: color-mix(in srgb, var(--panel) 60%, transparent); color: var(--text); text-align: left; width: 100%; transition: all 140ms; }
 .gwModelBtn:hover { border-color: color-mix(in srgb, var(--ember, #e08b2e) 45%, var(--line)); background: color-mix(in srgb, var(--ember, #e08b2e) 10%, transparent); }
 .gwModelBtn[data-active="1"] { border-color: var(--ember, #e08b2e); background: color-mix(in srgb, var(--ember, #e08b2e) 16%, transparent); }
@@ -3428,7 +4282,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .gwActive { font-style: normal; color: var(--ember, #e08b2e); font-size: 9px; }
 
 /* bug report modal */
-.bugReport { max-width: 540px; gap: 12px; }
+.bugReport { max-width: 540px; gap: 12px; padding: 18px; max-height: 82vh; overflow-y: auto; }
 .bugReportHead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .bugReportHead strong { font-size: 15px; }
 .bugReportHead em { font-style: normal; color: var(--dim, #8a8f98); font-size: 12px; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3454,8 +4308,10 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .presetHint a:hover { text-decoration: underline; }
 
 /* connector directory (/mcp) */
-.directory { max-width: 720px; width: 92vw; max-height: 82vh; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
-.dirHead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+/* the whole panel scrolls as one â€” the gallery-only scroll clipped the
+   registry + custom-URL rows once there was more than a screenful of content */
+.directory { max-width: 720px; width: 92vw; max-height: 82vh; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; overflow-x: hidden; padding: 18px; }
+.dirHead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; position: sticky; top: -18px; margin: -18px -18px 0; padding: 18px 18px 10px; background: var(--bg-raised); z-index: 2; }
 .dirHead strong { font-size: 16px; display: block; }
 .dirHead em { font-style: normal; font-size: 12px; color: var(--dim, #8a8f98); display: block; margin-top: 3px; max-width: 520px; }
 .dirHead .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); padding: 6px 12px; border-radius: 8px; cursor: pointer; }
@@ -3463,12 +4319,56 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .dirSearch:focus { outline: none; border-color: var(--ember, #e08b2e); }
 .dirSectionLabel { font-size: 10.5px; letter-spacing: 0.09em; text-transform: uppercase; color: var(--dim, #8a8f98); font-weight: 700; margin-top: 2px; }
 .dirConnected { display: flex; flex-direction: column; gap: 6px; }
-.dirConnRow { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 9px; border: 1px solid color-mix(in srgb, var(--ember, #e08b2e) 35%, var(--line)); background: color-mix(in srgb, var(--ember, #e08b2e) 8%, transparent); }
-.dirConnName { font-weight: 700; font-size: 13px; }
-.dirConnUrl { font-size: 11px; color: var(--dim, #8a8f98); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dirDisconnect { background: transparent; border: 1px solid var(--line); color: var(--text); font-size: 11px; padding: 5px 10px; border-radius: 7px; cursor: pointer; }
+.dirConn {
+  border-radius: 10px; border: 1px solid color-mix(in srgb, var(--ember, #e08b2e) 35%, var(--line));
+  background: color-mix(in srgb, var(--ember, #e08b2e) 8%, transparent);
+  animation: modelRowIn 300ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation-delay: calc(var(--i, 0) * 35ms);
+  transition: border-color 160ms ease, background 160ms ease, opacity 160ms ease;
+}
+.dirConn[data-on="0"] { opacity: 0.6; border-style: dashed; background: transparent; }
+.dirConn[data-open="1"] { border-color: var(--ember, #e08b2e); }
+.dirConnRow { display: flex; align-items: center; gap: 10px; padding: 8px 10px; }
+.dirConnMain {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+  background: transparent; border: none; color: var(--text); cursor: pointer;
+  font: inherit; text-align: left; padding: 0;
+}
+.dirConnGlyph { font-size: 16px; width: 22px; text-align: center; flex: none; }
+.dirConnName { font-weight: 700; font-size: 13px; white-space: nowrap; }
+.dirConnDot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--steel, #7fa6a3); box-shadow: 0 0 6px var(--steel, #7fa6a3); }
+.dirConnDot[data-on="0"] { background: var(--dim, #8a8f98); box-shadow: none; }
+.dirConnUrl { flex: 1; font-size: 11px; color: var(--dim, #8a8f98); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dirConnChevron { font-size: 11px; color: var(--dim, #8a8f98); transition: transform 180ms ease; flex: none; }
+.dirConnChevron[data-open="1"] { transform: rotate(180deg); }
+.dirSwitch {
+  flex: none; width: 34px; height: 19px; padding: 2px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line-strong); background: color-mix(in srgb, var(--panel) 70%, transparent);
+  transition: background 160ms ease, border-color 160ms ease;
+}
+.dirSwitch[data-on="1"] { background: color-mix(in srgb, var(--steel, #7fa6a3) 45%, transparent); border-color: var(--steel, #7fa6a3); }
+.dirSwitchKnob {
+  display: block; width: 13px; height: 13px; border-radius: 50%; background: var(--text);
+  transform: translateX(0); transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.dirSwitch[data-on="1"] .dirSwitchKnob { transform: translateX(15px); }
+.dirTools {
+  display: flex; flex-wrap: wrap; gap: 5px; padding: 0 10px 10px 40px;
+  animation: paletteIn 180ms ease both;
+}
+.dirTool {
+  font-size: 10.5px; font-family: var(--mono); padding: 3px 8px; border-radius: 999px;
+  border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 60%, transparent);
+  color: var(--text); white-space: nowrap;
+}
+.dirToolsStatus { font-size: 11px; color: var(--dim, #8a8f98); }
+.dirToolsStatus.warn { color: #e0a468; }
+.dirRegistry { display: flex; flex-direction: column; gap: 6px; }
+.dirCard.wide { width: 100%; animation: modelRowIn 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both; animation-delay: calc(var(--i, 0) * 30ms); }
+.dirNeedsKey { font-style: normal; font-size: 10px; font-weight: 600; color: #e0a468; }
+.dirDisconnect { flex: none; background: transparent; border: 1px solid var(--line); color: var(--text); font-size: 11px; padding: 5px 10px; border-radius: 7px; cursor: pointer; }
 .dirDisconnect:hover { border-color: #f87171; color: #f87171; }
-.dirGallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; overflow-y: auto; padding: 2px; min-height: 0; }
+.dirGallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; padding: 2px; }
 .dirCard { display: flex; align-items: center; gap: 10px; text-align: left; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 55%, transparent); color: var(--text); cursor: pointer; transition: all 130ms; }
 .dirCard:hover:not(:disabled) { border-color: color-mix(in srgb, var(--ember, #e08b2e) 50%, var(--line)); transform: translateY(-1px); }
 .dirCard:disabled { cursor: default; opacity: 0.72; }
@@ -3486,7 +4386,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .dirCustom .primary:disabled { opacity: 0.55; cursor: default; }
 .dirFootnote { margin: 0; font-size: 11px; color: var(--dim, #8a8f98); }
 
-/* ── linux perf-lite ─────────────────────────────────────────────────────────
+/* â”€â”€ linux perf-lite â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
    Set at boot (<html data-perf="lite">) on Linux, where WebKitGTK composites
    backdrop-filter and the animated edge-flame on the CPU and the app crawls.
    Strip the expensive layers, keep the look: panels go near-opaque so text
@@ -3504,7 +4404,7 @@ html[data-perf="lite"] .bugReport {
    WebKitGTK; halve their cadence rather than freezing feedback spinners. */
 html[data-perf="lite"] .brandBtn, html[data-perf="lite"] .hudVersion { animation: none; }
 
-/* ── daylight — the one LIGHT war-band. The forge at high noon: warm parchment
+/* â”€â”€ daylight â€” the one LIGHT war-band. The forge at high noon: warm parchment
    and iron ink instead of obsidian. Sets color-scheme:light so native controls,
    the caret, and scrollbars flip. Overrides --line to a readable strength (the
    accent-derived hairline is too faint on a light field) and softens the heavy
@@ -3518,7 +4418,7 @@ html[data-perf="lite"] .brandBtn, html[data-perf="lite"] .hudVersion { animation
   --line: rgba(70, 48, 40, 0.16);
   --line-strong: rgba(70, 48, 40, 0.30);
 }
-/* Light-mode surface fixes — dial back effects tuned for a black room. */
+/* Light-mode surface fixes â€” dial back effects tuned for a black room. */
 .ares[data-theme="daylight"] .screenFlame { opacity: 0.32; mix-blend-mode: multiply; }
 .ares[data-theme="daylight"] ::-webkit-scrollbar-thumb { background: rgba(70, 48, 40, 0.22); }
 .ares[data-theme="daylight"] ::-webkit-scrollbar-thumb:hover { background: rgba(70, 48, 40, 0.36); }
@@ -3534,14 +4434,37 @@ html[data-perf="lite"] .brandBtn, html[data-perf="lite"] .hudVersion { animation
   box-shadow: 0 18px 50px -20px rgba(40, 25, 20, 0.35);
 }
 
-/* model picker — brand glyph makes the list read like a gallery */
+/* model picker â€” brand glyph makes the list read like a gallery */
 .modelRow { display: flex; align-items: center; gap: 10px; }
 .modelGlyph { font-size: 16px; width: 22px; text-align: center; flex-shrink: 0;
   opacity: 0; animation: modelGlyphIn 220ms ease forwards; animation-delay: calc(var(--i, 0) * 18ms); }
 @keyframes modelGlyphIn { from { opacity: 0; transform: translateX(-4px); } to { opacity: 1; transform: none; } }
 
-/* daylight: the stage texture is a dark photo — drop it and keep only the faint
+/* daylight: the stage texture is a dark photo â€” drop it and keep only the faint
    astrolabe line-art so the main area is actually light. */
 .ares[data-theme="daylight"] .backdrop::before { display: none !important; }
 .ares[data-theme="daylight"] .backdrop { opacity: 0.35; }
 .ares[data-theme="daylight"] .astrolabe { opacity: 0.5; }
+
+/* â”€â”€ micro-interaction layer (v0.25) â€” press feedback + staged entrances â”€â”€â”€â”€
+   Small physical touches everywhere: pills compress under the pointer, the
+   send button lifts, empty-stage starters cascade in. All guarded for
+   reduced-motion; transforms only (no layout thrash). */
+.starter:active, .chip:active, .statusSeg:active, .mdlCard:active, .mdlProv:active,
+.dirCard:active, .slashItem:active, .session:active, .skillDockBtn:active {
+  transform: translateY(0) scale(0.985);
+}
+.starters .starter { animation: fadeUp 460ms cubic-bezier(0.2, 0.9, 0.3, 1) both; }
+.starters .starter:nth-child(1) { animation-delay: 240ms; }
+.starters .starter:nth-child(2) { animation-delay: 300ms; }
+.starters .starter:nth-child(3) { animation-delay: 360ms; }
+.starters .starter:nth-child(4) { animation-delay: 420ms; }
+.starters .starter:nth-child(5) { animation-delay: 480ms; }
+.starters .starter:nth-child(n+6) { animation-delay: 540ms; }
+.send { transition: transform 150ms cubic-bezier(0.2, 0.9, 0.3, 1), filter 150ms ease, background 150ms ease; }
+.send:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.12); }
+.send:active:not(:disabled) { transform: scale(0.92); }
+@media (prefers-reduced-motion: reduce) {
+  .starters .starter { animation: none; }
+  .send, .send:hover:not(:disabled), .send:active:not(:disabled) { transform: none; }
+}

@@ -23,6 +23,10 @@ export interface AgentPaths {
   missionsDir: string;
   selfDir: string;
   selfModel: string;
+  /** The persona roster: <home>/roster/<name>/AGENT.md. Deliberately NOT
+   *  ".ares/agents" — that name is already taken, workspace-side, by subagent
+   *  run transcripts (core/subagents.ts writes .ares/agents/<runId>/). */
+  rosterDir: string;
 }
 
 /** Resolve the agent home — delegates to the mind layer's resolution so the
@@ -53,6 +57,7 @@ export function agentPaths(home = aresAgentHome()): AgentPaths {
     missionsDir: path.join(home, "missions"),
     selfDir: path.join(home, "self"),
     selfModel: path.join(home, "self", "model.json"),
+    rosterDir: path.join(home, "roster"),
   };
 }
 

@@ -352,6 +352,26 @@ test("rollout: events persist as JSONL and rehydrate restores id, title, and his
   assert.ok(lines.some((l) => l.event.type === "turn_start"));
   assert.ok(lines.some((l) => l.event.type === "message_done"));
 
+  const telemetryDir = path.join(home, "telemetry");
+  const frictionName = (await fs.readdir(telemetryDir)).find((name) => /^friction-.*\.jsonl$/.test(name));
+  assert.ok(frictionName, "Garrison turn entered the shared friction stream");
+  const friction = JSON.parse((await fs.readFile(path.join(telemetryDir, frictionName), "utf8")).trim());
+  assert.equal(friction.schemaVersion, 2);
+  assert.equal(friction.source, "garrison");
+  assert.equal(friction.sessionId, created.id);
+  assert.equal(friction.provider, "mock-echo");
+  assert.equal(friction.model, "mock");
+  assert.match(friction.workspaceHash, /^[a-f0-9]{64}$/);
+  assert.ok(friction.turnId);
+
+  const registryDir = path.join(telemetryDir, "session-locations");
+  const registryNames = (await fs.readdir(registryDir)).filter((name) => name.endsWith(".json"));
+  assert.equal(registryNames.length, 1);
+  const location = JSON.parse(await fs.readFile(path.join(registryDir, registryNames[0]), "utf8"));
+  assert.equal(location.sessionId, created.id);
+  assert.equal(location.source, "garrison");
+  assert.equal(location.rolloutPath, file);
+
   const prior = await rehydrateSessions(home);
   assert.equal(prior.length, 1);
   assert.equal(prior[0].id, created.id);

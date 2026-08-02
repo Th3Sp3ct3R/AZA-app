@@ -51,7 +51,11 @@ export interface ForkedTurnResult {
 }
 
 export async function runForkedTurn(opts: ForkedTurnOptions): Promise<ForkedTurnResult> {
-  const engine = new QueryEngine({ ...opts.config, fileReadStamps: new Map() }, opts.sessionId);
+  // Child engines survive a permission denial: the denied tool call becomes an
+  // ordinary error result the model routes around, instead of interrupting the
+  // whole fork — one denied out-of-workspace Glob used to kill a 5-agent
+  // researcher fleet with zero output (bug 96ca5473). Callers can override.
+  const engine = new QueryEngine({ permissionDenialInterrupts: false, ...opts.config, fileReadStamps: new Map() }, opts.sessionId);
 
   switch (opts.seed.kind) {
     case "content":

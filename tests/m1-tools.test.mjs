@@ -427,6 +427,28 @@ test("PowerShell: runs Write-Output", async () => {
   assert.match(r.output.stdout, /ok/);
 });
 
+test("PowerShell: abort tears down a spawned process tree promptly", async () => {
+  if (process.platform !== "win32") return;
+  const tmp = await makeTmp();
+  const controller = new AbortController();
+  const c = { ...ctx(tmp), signal: controller.signal };
+  const started = Date.now();
+  const running = PowerShellTool.call(
+    {
+      command: "Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -NoNewWindow -Wait",
+      description: "test process tree abort",
+      timeout: 30000,
+    },
+    c,
+  );
+  setTimeout(() => controller.abort(), 150);
+  await running;
+  // Full-suite Windows CI can take several seconds to schedule taskkill while
+  // hundreds of child-process tests run in parallel. The contract is that Stop
+  // beats the command's 30s timeout by a wide margin, not a brittle 5s wall.
+  assert.ok(Date.now() - started < 15000, "abort must not wait for the command timeout while a grandchild holds inherited pipes");
+});
+
 test("shell permissions: destructive commands require explicit approval", async () => {
   const tmp = await makeTmp();
   const c = ctx(tmp);

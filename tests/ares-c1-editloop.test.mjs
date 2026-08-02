@@ -207,7 +207,9 @@ test("C1 gate honesty: a stuck red gate ends the turn but SURFACES the failure (
     (e) => e.type === "system_reminder_injected" && /UNRESOLVED at turn end/.test(e.text),
   );
   assert.ok(unresolved.length >= 1, "the still-red failure is surfaced as UNRESOLVED, not silently completed");
-  assert.equal(events.find((e) => e.type === "turn_end").status, "completed");
+  const end = events.find((e) => e.type === "turn_end");
+  assert.equal(end.status, "completed");
+  assert.equal(end.workStatus, "blocked", "execution completed, but work truth remains blocked");
   await rm(dir, { recursive: true, force: true });
 });
 

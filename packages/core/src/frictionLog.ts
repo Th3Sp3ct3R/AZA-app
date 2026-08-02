@@ -13,9 +13,58 @@
 import { appendFile, mkdir, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { aresHome } from "./providers/openaiAuth.js";
-import type { TurnEvent } from "@ares/protocol";
+import { redactSecrets, type TurnEvent, type WorkStatus } from "@ares/protocol";
+import { failureDigest, normalizeFailure } from "./codingJournal.js";
+import {
+  hashWorkspaceIdentity,
+  registerSessionLocation,
+  type SessionLocationSource,
+  type SessionRolloutFormat,
+} from "./sessionRegistry.js";
+
+export type FrictionSource = SessionLocationSource | "unknown";
+
+export interface FrictionDiagnostic {
+  kind: "tool_error" | "stream_error" | "verification" | "subagent_error";
+  signature: string;
+  /** Secret-scrubbed, path/id/number-normalized and hard-bounded. */
+  sample: string;
+  count: number;
+  tool?: string;
+  code?: string;
+}
+
+export interface FrictionSessionLocation {
+  rolloutPath: string;
+  metaPath?: string;
+  format: SessionRolloutFormat;
+  /** Explicit isolation controls; also enable registry writes under node:test. */
+  registryDir?: string;
+  registryHome?: string;
+}
+
+export interface FrictionRecorderOptions {
+  /** Explicit telemetry directory. String constructor arg remains supported. */
+  dir?: string;
+  source?: FrictionSource;
+  workspace?: string;
+  provider?: string;
+  model?: string;
+  location?: FrictionSessionLocation;
+}
 
 export interface FrictionTurn {
+  /** Additive v2 envelope. Optional in the reader type for legacy JSONL rows. */
+  schemaVersion?: 2;
+  recordType?: "friction_turn";
+  source?: FrictionSource;
+  workspaceHash?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  workStatus?: WorkStatus | null;
+  turnId?: string | null;
+  diagnostics?: FrictionDiagnostic[];
+  diagnosticsDropped?: number;
   at: string;
   sessionId: string;
   status: "completed" | "interrupted" | "failed" | "unknown";
@@ -39,8 +88,30 @@ export function telemetryDir(home = aresHome()): string {
   return path.join(home, "telemetry");
 }
 
-function emptyTurn(sessionId: string): FrictionTurn {
+interface FrictionContext {
+  source: FrictionSource;
+  /** Kept only in memory so diagnostic samples can replace it before writing. */
+  workspace: string | null;
+  workspaceHash: string | null;
+  provider: string | null;
+  model: string | null;
+}
+
+const MAX_DIAGNOSTICS_PER_TURN = 8;
+const MAX_DIAGNOSTIC_SAMPLE_CHARS = 240;
+
+function emptyTurn(sessionId: string, context: FrictionContext): FrictionTurn {
   return {
+    schemaVersion: 2,
+    recordType: "friction_turn",
+    source: context.source,
+    workspaceHash: context.workspaceHash,
+    provider: context.provider,
+    model: context.model,
+    workStatus: null,
+    turnId: null,
+    diagnostics: [],
+    diagnosticsDropped: 0,
     at: new Date().toISOString(),
     sessionId,
     status: "unknown",
@@ -61,13 +132,62 @@ export class FrictionRecorder {
   private readonly nameById = new Map<string, string>();
   private writeChain: Promise<void> = Promise.resolve();
   private readonly enabled: boolean;
+  private readonly dir: string;
+  private readonly context: FrictionContext;
 
   constructor(
     private readonly sessionId: string,
-    private readonly dir = telemetryDir(),
+    dirOrOptions?: string | FrictionRecorderOptions,
   ) {
-    this.enabled = process.env.ARES_TELEMETRY !== "0";
-    this.turn = emptyTurn(sessionId);
+    const options: FrictionRecorderOptions =
+      typeof dirOrOptions === "string" ? { dir: dirOrOptions } : (dirOrOptions ?? {});
+    this.dir = options.dir ?? telemetryDir();
+    this.context = {
+      source: options.source ?? "unknown",
+      workspace: options.workspace ? path.resolve(options.workspace) : null,
+      workspaceHash: options.workspace ? hashWorkspaceIdentity(options.workspace) : null,
+      provider: options.provider ?? null,
+      model: options.model ?? null,
+    };
+    // `node --test` constructs many real Sessions. Those used to append their
+    // fake tool failures into the owner's ~/.ares telemetry (190/190 Browser
+    // failures in the live dashboard). Explicit test directories still record,
+    // so FrictionRecorder itself remains fully testable.
+    this.enabled = process.env.ARES_TELEMETRY !== "0" && (options.dir !== undefined || !process.env.NODE_TEST_CONTEXT);
+    this.turn = emptyTurn(sessionId, this.context);
+
+    // Registry writes are independent of telemetry opt-out: they contain only a
+    // local source pointer + hash and are needed to find/delete session data.
+    if (options.location && this.context.source !== "unknown" && options.workspace) {
+      this.writeChain = registerSessionLocation(
+        {
+          sessionId,
+          source: this.context.source,
+          format: options.location.format,
+          workspace: options.workspace,
+          rolloutPath: options.location.rolloutPath,
+          metaPath: options.location.metaPath,
+        },
+        { dir: options.location.registryDir, home: options.location.registryHome },
+      ).then(() => undefined).catch(() => undefined);
+    }
+  }
+
+  /** Provider/model can change in-place between turns. */
+  updateContext(update: { workspace?: string; provider?: string; model?: string }): void {
+    if (update.workspace) {
+      this.context.workspace = path.resolve(update.workspace);
+      this.context.workspaceHash = hashWorkspaceIdentity(update.workspace);
+      this.turn.workspaceHash = this.context.workspaceHash;
+    }
+    if (update.provider !== undefined) {
+      this.context.provider = update.provider || null;
+      this.turn.provider = this.context.provider;
+    }
+    if (update.model !== undefined) {
+      this.context.model = update.model || null;
+      this.turn.model = this.context.model;
+    }
   }
 
   /** Fold one TurnEvent. Cheap, synchronous, never throws. */
@@ -75,7 +195,19 @@ export class FrictionRecorder {
     if (!this.enabled) return;
     try {
       switch (ev.type) {
+        case "turn_start": {
+          // Timestamp the actual turn, not the recorder construction/previous
+          // flush. Long-idle sessions otherwise age fresh failures out of the
+          // triage lookback window before they are even written.
+          this.turn.at = new Date().toISOString();
+          this.turn.turnId = ev.turnId;
+          break;
+        }
         case "tool_use_start": {
+          this.nameById.set(ev.id, ev.name);
+          break;
+        }
+        case "tool_start": {
           this.nameById.set(ev.id, ev.name);
           break;
         }
@@ -95,6 +227,7 @@ export class FrictionRecorder {
           t.calls++;
           t.errors++;
           if (name === "Edit") this.turn.editTiers.miss++;
+          this.addDiagnostic("tool_error", ev.error, { tool: name });
           break;
         }
         case "error": {
@@ -104,15 +237,30 @@ export class FrictionRecorder {
             this.turn.stalls++;
             this.turn.reasoningStalls++;
           }
+          this.addDiagnostic("stream_error", ev.error?.message ?? code ?? "stream error", { code });
           break;
         }
         case "system_reminder_injected": {
-          if (ev.source === "verifier") this.turn.verifyReminders++;
+          if (ev.source === "verifier") {
+            this.turn.verifyReminders++;
+            this.addDiagnostic("verification", ev.text, { code: "verifier" });
+          }
           if (ev.source === "compaction") this.turn.compactions++;
+          break;
+        }
+        case "subagent_end": {
+          if (ev.status !== "completed") {
+            this.addDiagnostic("subagent_error", ev.summary || `subagent ${ev.status}`, { code: ev.status });
+          }
           break;
         }
         case "turn_end": {
           this.turn.status = ev.status ?? "unknown";
+          this.turn.workStatus = ev.workStatus ?? null;
+          if (ev.provider) this.context.provider = ev.provider;
+          if (ev.model) this.context.model = ev.model;
+          this.turn.provider = this.context.provider;
+          this.turn.model = this.context.model;
           this.turn.durationMs = ev.durationMs ?? 0;
           const u = ev.usage;
           if (u) {
@@ -142,11 +290,41 @@ export class FrictionRecorder {
     return JSON.parse(JSON.stringify(this.turn)) as FrictionTurn;
   }
 
+  private addDiagnostic(
+    kind: FrictionDiagnostic["kind"],
+    raw: string,
+    context: Pick<FrictionDiagnostic, "tool" | "code"> = {},
+  ): void {
+    let scrubInput = String(raw ?? "");
+    if (this.context.workspace) {
+      for (const candidate of [this.context.workspace, this.context.workspace.replace(/\\/g, "/")]) {
+        scrubInput = scrubInput.replace(new RegExp(escapeRegExp(candidate), "gi"), "<workspace>");
+      }
+    }
+    const normalized = normalizeFailure(redactSecrets(scrubInput)) || `${kind} unavailable`;
+    const sample = normalized.length > MAX_DIAGNOSTIC_SAMPLE_CHARS
+      ? `${normalized.slice(0, MAX_DIAGNOSTIC_SAMPLE_CHARS - 1)}…`
+      : normalized;
+    const scope = `${kind}:${context.tool ?? ""}:${context.code ?? ""}`;
+    const signature = failureDigest(scope, normalized, 16);
+    const diagnostics = (this.turn.diagnostics ??= []);
+    const existing = diagnostics.find((diagnostic) => diagnostic.signature === signature);
+    if (existing) {
+      existing.count++;
+      return;
+    }
+    if (diagnostics.length >= MAX_DIAGNOSTICS_PER_TURN) {
+      this.turn.diagnosticsDropped = (this.turn.diagnosticsDropped ?? 0) + 1;
+      return;
+    }
+    diagnostics.push({ kind, signature, sample, count: 1, ...context });
+  }
+
   /** Append the finished turn as one JSONL line and reset. Best-effort. */
   private flushTurn(): void {
     const line = JSON.stringify(this.turn) + "\n";
     const file = path.join(this.dir, `friction-${this.turn.at.slice(0, 7)}.jsonl`);
-    this.turn = emptyTurn(this.sessionId);
+    this.turn = emptyTurn(this.sessionId, this.context);
     this.nameById.clear();
     this.writeChain = this.writeChain
       .then(async () => {
@@ -160,6 +338,10 @@ export class FrictionRecorder {
   settle(): Promise<void> {
     return this.writeChain;
   }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ─── Aggregation for `ares friction` ─────────────────────────────────────

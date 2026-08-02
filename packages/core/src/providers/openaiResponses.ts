@@ -25,7 +25,7 @@ import type {
   StopReason,
   ContentBlock,
 } from "@ares/protocol";
-import { openAIReasoningEffort, reasoningEnabled } from "@ares/protocol";
+import { openAIReasoningEffort } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { loadAuthToken, type AuthToken } from "./openaiAuth.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
@@ -120,7 +120,7 @@ export class OpenAIResponsesProvider implements Provider {
         error: {
           code: `http_${response.status}`,
           message: `OpenAI Responses returned ${response.status}: ${text.slice(0, 500)}`,
-          retriable: response.status === 429 || response.status >= 500,
+          retriable: response.status === 408 || response.status === 409 || response.status === 425 || response.status === 429 || response.status >= 500,
           retryAfterMs: parseRetryAfterMs(response.headers),
         },
       };
@@ -314,14 +314,23 @@ export class OpenAIResponsesProvider implements Provider {
 
           case "error": {
             guard?.dispose();
-            yield {
-              type: "error",
-              error: {
-                code: evt.error?.code ?? "stream_error",
-                message: evt.error?.message ?? "unknown stream error",
-                retriable: false,
-              },
-            };
+            {
+              // Mirror the Anthropic provider: transient in-stream failures
+              // (rate limits, overload, server errors) are retriable so the
+              // engine's retry ladder gets a shot instead of failing the turn.
+              const code = evt.error?.code ?? "stream_error";
+              const retriable =
+                /rate_limit|overloaded|server_error|api_error|timeout|too_many/i.test(code) ||
+                /rate.?limit|overloaded|try again|timed? ?out/i.test(evt.error?.message ?? "");
+              yield {
+                type: "error",
+                error: {
+                  code,
+                  message: evt.error?.message ?? "unknown stream error",
+                  retriable,
+                },
+              };
+            }
             return;
           }
 
@@ -399,13 +408,11 @@ function buildRequestBody(req: ProviderRequest): Record<string, unknown> {
       description: t.description,
       parameters: t.input_schema,
     })),
+    ...(req.tools.length > 0 ? { tool_choice: req.toolChoice === "any" ? "required" : "auto" } : {}),
     stream: true,
-    // Gate on reasoningEnabled() (not bare truthiness) so "off" sends NO
-    // reasoning field at all. "max" collapsing to "high" is handled inside
-    // openAIReasoningEffort()/reasoning.ts already.
-    ...(reasoningEnabled(level)
-      ? { reasoning: { effort: openAIReasoningEffort(level ?? "off") } }
-      : {}),
+    // Explicitly send `none` for Off: omitting this field lets several current
+    // GPT models fall back to their own default, which made Off look fake.
+    ...(level ? { reasoning: { effort: openAIReasoningEffort(level) } } : {}),
   };
 }
 

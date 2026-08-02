@@ -1,6 +1,6 @@
 // Extracted from entry.ts — garrisonCmd.
 
-import { QueryEngine, installGlobalCrashHandlers } from "@ares/core";
+import { QueryEngine, installGlobalCrashHandlers, runReliabilityTriage, writeCrashLogSync } from "@ares/core";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -153,7 +153,23 @@ export async function garrisonCommand(args: ParsedArgs): Promise<number> {
 
   const scheduler = new Scheduler({
     hooks: {
-      heartbeat: () => runHeartbeatTick({ home: context.home, workspace: context.workspace, config: agent.config }),
+      heartbeat: async () => {
+        const triage = runReliabilityTriage({ home: context.aresHome, workspace: context.workspace }).catch((error: unknown) => {
+          writeCrashLogSync(context.aresHome, {
+            at: new Date().toISOString(),
+            kind: "manual",
+            process: "reliability-triage",
+            message: error instanceof Error ? error.message : String(error),
+          });
+          process.stdout.write(JSON.stringify({ type: "lifecycle", event: { kind: "triage-error" } }) + "\n");
+        });
+        const [heartbeat] = await Promise.allSettled([
+          runHeartbeatTick({ home: context.home, workspace: context.workspace, config: agent.config }),
+          triage,
+        ]);
+        if (heartbeat.status === "rejected") throw heartbeat.reason;
+        return heartbeat.value;
+      },
       // Dreams become the trial: every dream tick runs the Crucible first,
       // then the existing deep-dream consolidation.
       dream: async () => {

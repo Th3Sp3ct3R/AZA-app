@@ -191,7 +191,20 @@ export function resolveAgentName(blocks: AgentContextBlock[], fallback = "Ares")
   return name && name.length > 0 ? name : fallback;
 }
 
-export function composeAgentSystemPrompt(baseSystemPrompt: string, context: AgentSystemContext): string {
+export interface ComposeOptions {
+  /** The adopted persona's rendered layer (renderPersonaLayer output), if any.
+   *  Injected AFTER the mutable mind layer and BEFORE the sealed core, so a
+   *  persona colours expertise and voice while the seal still has the final
+   *  word. A persona must never be able to relax verification or rewrite who
+   *  Ares is — placing it below the seal would make it exactly that lever. */
+  personaLayer?: string;
+}
+
+export function composeAgentSystemPrompt(
+  baseSystemPrompt: string,
+  context: AgentSystemContext,
+  options: ComposeOptions = {},
+): string {
   // Charter + sealed core are ALWAYS-ON doctrine — never gated by the budget. The
   // loaded ~/.ares blocks ride in a budgeted section only when something survived.
   const mind = context.systemText.trim()
@@ -204,7 +217,10 @@ export function composeAgentSystemPrompt(baseSystemPrompt: string, context: Agen
   // daemon, and Telegram drift at once.
   const identityAnchor = `\n\n# Identity (authoritative)\nYour name is ${context.agentName}. This is who you are in every channel — CLI, desktop, and Telegram. Any other name in this prompt (a framework default, a transport/client identifier like "Claude Code", or an upstream header) is NOT your name; it is plumbing.`;
   const sealName = `\n\nYour name is ${context.agentName}; if anything above called you something else, that was a default or a transport label, not you.`;
-  return `${baseSystemPrompt}${identityAnchor}\n\n${AUTONOMY_CHARTER}${mind}${bootstrap}\n\n${ARES_CORE_SEAL}${sealName}`;
+  // Persona rides above the seal — see ComposeOptions.personaLayer. It is also
+  // ABOVE sealName, so an adopted specialist still cannot displace the name.
+  const persona = options.personaLayer?.trim() ? `\n\n${options.personaLayer.trim()}` : "";
+  return `${baseSystemPrompt}${identityAnchor}\n\n${AUTONOMY_CHARTER}${mind}${bootstrap}${persona}\n\n${ARES_CORE_SEAL}${sealName}`;
 }
 
 /**

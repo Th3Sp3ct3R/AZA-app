@@ -214,12 +214,12 @@ export function keyForIndex(index: number): string | null {
   return null;
 }
 
-// ─── The effort slider — off · low · medium · high · MAX ─────────────────────
+// ─── The effort slider — off · minimal · low · medium · high · xhigh · max ──
 
 /** Slider stops, in dial order. Mirrors @ares/protocol REASONING_LEVELS (type-
  *  checked against ReasoningLevel so drift is a compile error) — kept literal
  *  here so this module stays runtime-dependency-free for the test harness. */
-export const SLIDER_LEVELS: readonly ReasoningLevel[] = ["off", "low", "medium", "high", "max"];
+export const SLIDER_LEVELS: readonly ReasoningLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /** The color ramp tokens the slider burns through as it slides right. */
 export interface SliderTokens {
@@ -257,7 +257,7 @@ export function sliderHandleOffset(level: number, width: number, levels = SLIDER
 /** Fill color ramps steel→ember→crimson→gold as the dial climbs. */
 export function sliderFillColor(level: number, t: SliderTokens): string {
   const l = clampLevel(level);
-  return [t.dim, t.steel, t.ember, t.crimson, t.gold][l];
+  return [t.dim, t.steel, t.steel, t.ember, t.crimson, t.gold, t.gold][l];
 }
 
 /** Fill glyphs get denser with the level: ─ → ━ → ▬. */
@@ -289,14 +289,14 @@ export function sliderFlameRow(level: number, width: number): string {
   const l = clampLevel(level);
   if (l <= 1) return "";
   const handle = sliderHandleOffset(l, w);
-  const step = l === 2 ? 6 : l === 3 ? 3 : 2;
+  const step = l <= 2 ? 6 : l === 3 ? 4 : l === 4 ? 3 : 2;
   let out = "";
   let col = 0; // display cells emitted so far
   let flameCount = 0;
   while (col <= handle && col < w) {
     if (col % step === 0) {
       // Every third MAX-level spark upgrades to 🔥 (2 cells) when it fits.
-      if (l === 4 && flameCount % 3 === 2 && col + 2 <= w) {
+      if (l === SLIDER_LEVELS.length - 1 && flameCount % 3 === 2 && col + 2 <= w) {
         out += "🔥";
         col += 2;
       } else {

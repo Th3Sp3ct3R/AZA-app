@@ -10,6 +10,7 @@ import { ReflectionScheduler } from "./reflection/scheduler.js";
 import { emitLifecycle } from "./lifecycle/bus.js";
 import { captureUserMessage } from "./capture.js";
 import { snapshotBrain } from "./persistence.js";
+import { renderPersonaLayer, type PersonaDef } from "./roster.js";
 
 export interface PreparedAgent {
   enabled: boolean;
@@ -18,6 +19,16 @@ export interface PreparedAgent {
   context: AgentSystemContext;
   startupReminders: Array<{ text: string; source: "memory" | "instructions" }>;
   composeSystemPrompt(base: string): string;
+  /** The persona currently worn, or null for plain Ares. */
+  activePersona(): PersonaDef | null;
+  /**
+   * Wear a persona (or null to drop it). Read at compose time rather than
+   * baked into the closure, so adoption takes effect on the very next turn in
+   * every channel — desktop, TUI, and Telegram all go through
+   * composeSystemPrompt, so there is one place to change and no per-channel
+   * plumbing to forget.
+   */
+  setPersona(persona: PersonaDef | null): void;
 }
 
 export async function prepareAresAgent(opts: {
@@ -29,9 +40,17 @@ export async function prepareAresAgent(opts: {
   const enabled = opts.enabled ?? process.env.ARES_AGENT_ENABLED !== "0";
   const home = aresAgentHome(opts.home);
   const config = await loadAgentConfig(home);
+  // Mutable across turns — see PreparedAgent.setPersona.
+  let persona: PersonaDef | null = null;
+  const personaSlot = {
+    activePersona: () => persona,
+    setPersona: (next: PersonaDef | null) => {
+      persona = next;
+    },
+  };
   if (!enabled) {
     const context = await loadAgentSystemContext({ home, workspace: opts.workspace, includeMemory: false });
-    return { enabled: false, home, config, context, startupReminders: [], composeSystemPrompt: (base) => base };
+    return { enabled: false, home, config, context, startupReminders: [], composeSystemPrompt: (base) => base, ...personaSlot };
   }
 
   await ensureAgentScaffold({ home, workspace: opts.workspace });
@@ -47,7 +66,11 @@ export async function prepareAresAgent(opts: {
     config,
     context,
     startupReminders,
-    composeSystemPrompt: (base) => composeAgentSystemPrompt(base, context),
+    composeSystemPrompt: (base) =>
+      composeAgentSystemPrompt(base, context, {
+        personaLayer: persona ? renderPersonaLayer(persona, context.agentName) : undefined,
+      }),
+    ...personaSlot,
   };
 }
 

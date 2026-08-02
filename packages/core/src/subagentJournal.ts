@@ -120,7 +120,7 @@ export class SubagentJournal {
       while (this.errors.length > MAX_ERRORS) this.errors.shift();
       this.flush();
     } else if (ev.type === "error") {
-      if (ev.error.code === "max_turns_exceeded") this.turnLimitHit = true;
+      if (ev.error.code === "max_turns_exceeded" || ev.error.code === "loop_detected") this.turnLimitHit = true;
       else {
         this.errors.push(trim(ev.error.message, ERROR_CHARS));
         while (this.errors.length > MAX_ERRORS) this.errors.shift();

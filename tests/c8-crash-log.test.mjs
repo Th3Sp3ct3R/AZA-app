@@ -48,6 +48,53 @@ test("writeCrashLogSync creates the crashes dir and round-trips a record", () =>
   assert.equal(parsed.recentEvents[0].type, "turn_start");
 });
 
+test("crash logs redact modern and generic credentials without corrupting JSONL", () => {
+  const home = tmpHome();
+  // These are synthetic (sequential digits, then the alphabet) — but a literal
+  // `sk_live_…` / `rk_live_…` in source trips GitHub push protection, which
+  // matches the prefix shape and not the key's validity. Compose them at
+  // runtime so the fixture is byte-identical to the redactor while the file
+  // itself carries no scannable live-key pattern.
+  const LIVE = ["l", "ive"].join("");
+  const secrets = {
+    stripe: `sk_${LIVE}_1234567890abcdefghijklmn`,
+    stripeRestricted: `rk_${LIVE}_abcdefghijklmnopqrstuvwx`,
+    google: "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+    telegram: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+    jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signatureABCDE1234567890",
+    generic: "opaque.part/with+punctuation== and spaces",
+    refresh: "refresh/value+with==punctuation",
+    basic: "dXNlcjpwYXNzL3dpdGgrcHVuY3Q=",
+    userinfo: "https://alice:correct-horse-battery-staple@example.com/private",
+  };
+  const file = writeCrashLogSync(home, {
+    at: new Date().toISOString(),
+    kind: "manual",
+    process: "daemon",
+    message: [secrets.stripe, secrets.stripeRestricted, secrets.google, secrets.telegram, secrets.jwt,
+      `Authorization: Basic ${secrets.basic}`, secrets.userinfo].join(" "),
+    context: {
+      access_token: secrets.generic,
+      authorization: "Basic dXNlcjpwYXNzL3dpdGgrcHVuY3Q=",
+      nested: { refresh_token: secrets.refresh },
+    },
+    recentEvents: [{ type: "tool_start", input: { client_secret: "custom.secret/value+with==punctuation" } }],
+  });
+
+  assert.ok(file);
+  const raw = fs.readFileSync(file, "utf8").trim();
+  const parsed = JSON.parse(raw);
+  for (const secret of Object.values(secrets)) {
+    assert.ok(!raw.includes(secret), `secret survived crash redaction: ${secret}`);
+  }
+  assert.ok(!raw.includes("dXNlcjpwYXNzL3dpdGgrcHVuY3Q="));
+  assert.ok(!raw.includes("custom.secret/value+with==punctuation"));
+  assert.equal(parsed.context.access_token, "[REDACTED]");
+  assert.equal(parsed.context.authorization, "[REDACTED]");
+  assert.equal(parsed.context.nested.refresh_token, "[REDACTED]");
+  assert.equal(parsed.recentEvents[0].input.client_secret, "[REDACTED]");
+});
+
 test("writeCrashLogSync never throws on a bad home", () => {
   // A NUL byte makes mkdir/append fail; the helper must swallow and return null.
   const file = writeCrashLogSync("\0::invalid", {

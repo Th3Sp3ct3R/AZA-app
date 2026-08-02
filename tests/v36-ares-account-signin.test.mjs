@@ -39,11 +39,17 @@ function fakeFetch(routes) {
 // ── URL + normalization ──────────────────────────────────────────────────────
 
 test("buildAresAuthorizeUrl: points at /account/connect with redirect + state", () => {
-  const url = buildAresAuthorizeUrl(BASE, "http://localhost:53691/oauth/callback", "abc123");
+  const url = buildAresAuthorizeUrl(BASE, "http://127.0.0.1:53691/oauth/callback", "abc123", {
+    codeChallenge: "challenge-123",
+    deviceName: "Ares desktop",
+  });
   const u = new URL(url);
   assert.equal(u.origin + u.pathname, "https://www.doingteam.com/account/connect");
-  assert.equal(u.searchParams.get("redirect_uri"), "http://localhost:53691/oauth/callback");
+  assert.equal(u.searchParams.get("redirect_uri"), "http://127.0.0.1:53691/oauth/callback");
   assert.equal(u.searchParams.get("state"), "abc123");
+  assert.equal(u.searchParams.get("code_challenge"), "challenge-123");
+  assert.equal(u.searchParams.get("code_challenge_method"), "S256");
+  assert.equal(u.searchParams.get("device_name"), "Ares desktop");
 });
 
 test("normalizeGatewayBase: apex → www, trailing slash stripped", () => {
@@ -59,10 +65,18 @@ test("exchangeAresCode: POSTs the code and returns the token", async () => {
     seen = { url: String(url), body: JSON.parse(init.body) };
     return { ok: true, status: 200, json: async () => ({ token: "ares_live_tok" }), text: async () => "" };
   };
-  const token = await exchangeAresCode(BASE, "the-code", fetchImpl);
+  const token = await exchangeAresCode(BASE, "the-code", {
+    codeVerifier: "verifier",
+    redirectUri: "http://127.0.0.1:53691/oauth/callback",
+    deviceName: "My Ares",
+    fetchImpl,
+  });
   assert.equal(token, "ares_live_tok");
   assert.match(seen.url, /\/api\/gateway\/v1\/oauth\/exchange$/);
   assert.equal(seen.body.code, "the-code");
+  assert.equal(seen.body.code_verifier, "verifier");
+  assert.equal(seen.body.redirect_uri, "http://127.0.0.1:53691/oauth/callback");
+  assert.equal(seen.body.device_name, "My Ares");
 });
 
 test("exchangeAresCode: a non-2xx exchange throws a clear error", async () => {
@@ -96,7 +110,14 @@ test("runAresAccountSignin: authorize → capture code → exchange → token", 
       capturedArgs = { redirectUri, state, port };
       return "code-xyz";
     },
-    fetchImpl: fakeFetch([{ match: "/oauth/exchange", json: { token: "ares_from_flow" } }]),
+    deviceName: "Studio PC",
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      assert.equal(body.device_name, "Studio PC");
+      assert.equal(body.redirect_uri, "http://127.0.0.1:53691/oauth/callback");
+      assert.ok(body.code_verifier.length >= 43);
+      return { ok: true, status: 200, json: async () => ({ token: "ares_from_flow" }), text: async () => "" };
+    },
   });
 
   assert.equal(token.token, "ares_from_flow");
@@ -104,7 +125,11 @@ test("runAresAccountSignin: authorize → capture code → exchange → token", 
   // The authorize URL carried the SAME state the capture validated against.
   const state = new URL(authorizeUrl).searchParams.get("state");
   assert.equal(capturedArgs.state, state);
-  assert.equal(capturedArgs.redirectUri, "http://localhost:53691/oauth/callback");
+  assert.equal(capturedArgs.redirectUri, "http://127.0.0.1:53691/oauth/callback");
+  const auth = new URL(authorizeUrl);
+  assert.equal(auth.searchParams.get("code_challenge_method"), "S256");
+  assert.equal(auth.searchParams.get("device_name"), "Studio PC");
+  assert.ok(auth.searchParams.get("code_challenge"));
 });
 
 test("runAresAccountSignin: a capture failure (denied/timeout) propagates", async () => {
@@ -120,7 +145,7 @@ test("runAresAccountSignin: a capture failure (denied/timeout) propagates", asyn
 // ── Real loopback server: the security-relevant state check over a socket ─────
 
 const PORT = 53699; // off the default 53691 to avoid clashes
-const REDIRECT = `http://localhost:${PORT}/oauth/callback`;
+const REDIRECT = `http://127.0.0.1:${PORT}/oauth/callback`;
 
 test("captureLoopbackCode: resolves the code when state matches", async () => {
   const p = captureLoopbackCode(REDIRECT, "st8", PORT, 5000);

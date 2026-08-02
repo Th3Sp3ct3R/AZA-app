@@ -1010,6 +1010,10 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
           append("verify", event.text, event.source);
         } else if (event.source === "compaction") {
           append("muted", event.text.split("\n")[0].slice(0, 120), "compaction");
+        } else if (event.source === "instructions" && /retrying|stalled|provider hiccup|switched to/i.test(event.text)) {
+          // Provider retry/stall/failover notes are the only heartbeat the user
+          // gets during dead air — swallowing them read as a frozen turn.
+          append("muted", event.text.split("\n")[0].slice(0, 120), "retry");
         }
         // Everything else (memory weave, identity anchor, foreground framing) is
         // INTERNAL prompt plumbing with zero user value. It is NOT shown — dumping
@@ -1026,6 +1030,14 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         collapseDiffCards();
         finalizeFleet();
         settleOrphanToolLines();
+        if (event.workStatus === "unverified" || event.workStatus === "blocked") {
+          append(
+            "verify",
+            event.workStatus === "blocked"
+              ? "Turn ended BLOCKED — verification checks were still failing when the work stopped."
+              : "Turn ended UNVERIFIED — changes were made without a passing post-change verification.",
+          );
+        }
         // A permission ask can't outlive its turn — deny + drain so no dead
         // card lingers (its awaiter is gone; resolving is a harmless no-op).
         if (permRef.current) {

@@ -200,6 +200,16 @@ export const EditTool = buildTool({
 
     await fs.writeFile(filePath, working, "utf8");
     const newStat = await fs.stat(filePath);
+    // Post-write readback (cloud-sync folders can report success yet persist
+    // an empty/partial file — see safeOverwrite's identical guard).
+    if (newStat.size !== Buffer.byteLength(working, "utf8")) {
+      const readback = await fs.readFile(filePath, "utf8").catch(() => null);
+      if (readback !== working) {
+        throw new Error(
+          `Edit: post-write verification failed for ${filePath} — the file on disk does not match what was written (${newStat.size} bytes vs ${Buffer.byteLength(working, "utf8")} expected). The filesystem (cloud-sync folder?) did not persist the content; retry the edit.`,
+        );
+      }
+    }
     // Stamp the WRITE, not a read: keep the hash/size current so a follow-up Edit
     // in the same turn passes read-before-write + staleness, but mark it
     // writtenNotRead so a whole-file Read still does a REAL read — the model
