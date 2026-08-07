@@ -121,6 +121,13 @@ export {
   type TranscribeResult,
 } from "./telegram/stt.js";
 
+export { TelegramChannelAdapter } from "./telegram/adapter.js";
+export type {
+  ChannelBridgeContract,
+  ChannelParticipant,
+  TelegramChannelAdapterOptions,
+} from "./telegram/adapter.js";
+
 export {
   sendConnectMenu,
   handleConnectCallback,

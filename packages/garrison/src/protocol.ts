@@ -49,7 +49,25 @@ export type GatewayClientFrame =
       requestId: string;
       decision: PermissionPromptDecision;
     }
-  | { type: "approval.respond"; approvalId: string; verb: ApprovalVerb; note?: string };
+  | { type: "approval.respond"; approvalId: string; verb: ApprovalVerb; note?: string }
+  // ── Channel management (Telegram, etc.) → server ─────────────────
+  | {
+      type: "channel.configure";
+      channel: string;
+      config: { token?: string; allowedChats?: number[]; ownerChatIds?: number[] };
+    }
+  | { type: "channel.start"; channel: string }
+  | { type: "channel.stop"; channel: string }
+  | { type: "channel.status" }
+  | {
+      type: "channel.roster.add";
+      channel: string;
+      chatId: number;
+      name?: string;
+      role?: "owner" | "member";
+    }
+  | { type: "channel.roster.remove"; channel: string; chatId: number }
+  | { type: "channel.test"; channel: string; chatId: number; text: string };
 
 // ─── Server → client ────────────────────────────────────────────────────
 
@@ -61,4 +79,40 @@ export type GatewayServerFrame =
   | { type: "sessions"; sessions: SessionSummary[] }
   | { type: "status"; garrison: GarrisonStatus }
   | { type: "approval.pending"; staged: StagedApproval }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  // ── Channel status / roster events → client ─────────────────────
+  | {
+      type: "channel.status";
+      channels: ChannelStatus[];
+    }
+  | {
+      type: "channel.roster";
+      channel: string;
+      participants: ChannelParticipant[];
+    }
+  | {
+      type: "channel.event";
+      channel: string;
+      event: "started" | "stopped" | "connected" | "disconnected" | "message";
+      detail?: string;
+    };
+
+/** Runtime status of a single channel bridge. */
+export interface ChannelStatus {
+  channel: string;
+  running: boolean;
+  connected: boolean;
+  configured: boolean;
+  participantCount: number;
+  lastError?: string;
+  uptimeMs?: number;
+}
+
+/** One participant in a channel roster. */
+export interface ChannelParticipant {
+  chatId: number;
+  name: string;
+  role: "owner" | "member";
+  addedAt: string;
+  lastSeenAt?: string;
+}

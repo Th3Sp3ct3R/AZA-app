@@ -20,6 +20,7 @@ import type { ApprovalVerb, StagedApproval } from "@ares/effects";
 import { constantTimeEqual, ensureToken } from "./token.js";
 import type { SessionManager } from "./sessions.js";
 import type { Scheduler } from "./scheduler.js";
+import { ChannelManager } from "./channels.js";
 import {
   DEFAULT_GARRISON_PORT,
   PROTO_VERSION,
@@ -58,6 +59,8 @@ export interface GarrisonServerOptions {
   sessions: SessionManager;
   scheduler?: Scheduler;
   approvals?: ApprovalBridge;
+  /** Runtime channel manager for Telegram bridge lifecycle. */
+  channels?: ChannelManager;
   host?: string;
   /** Pass 0 to bind an ephemeral port (tests). */
   port?: number;
@@ -131,6 +134,7 @@ export class GarrisonServer {
   async close(): Promise<void> {
     this.unsubscribeApprovals?.();
     this.unsubscribeApprovals = undefined;
+    if (this.opts.channels) await this.opts.channels.stopAll().catch(() => {});
     for (const client of [...this.clients]) this.dropClient(client, true);
     this.clients.clear();
     const wss = this.wss;
@@ -358,6 +362,56 @@ export class GarrisonServer {
         }
         return;
       }
+      // ── Channel lifecycle commands ─────────────────────────────────
+      case "channel.configure": {
+        if (!this.opts.channels) { this.enqueueError(client, "channel manager not wired"); return; }
+        void (async () => {
+          try {
+            await this.opts.channels!.configure(frame.channel, frame.config);
+            this.broadcastChannels();
+          } catch (err) { this.enqueueError(client, errorMessage(err)); }
+        })();
+        return;
+      }
+      case "channel.start": {
+        if (!this.opts.channels) { this.enqueueError(client, "channel manager not wired"); return; }
+        void (async () => {
+          try {
+            await this.opts.channels!.start(frame.channel);
+            this.broadcast({ type: "channel.event", channel: frame.channel, event: "started" });
+            this.broadcastChannels();
+          } catch (err) { this.enqueueError(client, errorMessage(err)); }
+        })();
+        return;
+      }
+      case "channel.stop": {
+        if (!this.opts.channels) { this.enqueueError(client, "channel manager not wired"); return; }
+        void (async () => {
+          try {
+            await this.opts.channels!.stop(frame.channel);
+            this.broadcast({ type: "channel.event", channel: frame.channel, event: "stopped" });
+            this.broadcastChannels();
+          } catch (err) { this.enqueueError(client, errorMessage(err)); }
+        })();
+        return;
+      }
+      case "channel.status": {
+        if (!this.opts.channels) { this.enqueueFrame(client, { type: "channel.status", channels: [] }); return; }
+        this.enqueueFrame(client, { type: "channel.status", channels: this.opts.channels.status() });
+        return;
+      }
+      case "channel.roster.add":
+      case "channel.roster.remove": {
+        if (!this.opts.channels) { this.enqueueError(client, "channel manager not wired"); return; }
+        this.broadcastChannels();
+        return;
+      }
+      case "channel.test": {
+        if (!this.opts.channels) { this.enqueueError(client, "channel manager not wired"); return; }
+        this.broadcast({ type: "channel.event", channel: frame.channel, event: "message",
+          detail: frame.type === "channel.test" ? `test to ${frame.chatId}: ${frame.text.slice(0, 80)}` : undefined });
+        return;
+      }
       default: {
         this.enqueueError(client, `unknown frame type: ${(frame as { type: string }).type}`);
       }
@@ -392,6 +446,22 @@ export class GarrisonServer {
 
   private enqueueError(client: ClientConn, message: string): void {
     this.enqueueFrame(client, { type: "error", message });
+  }
+
+  /** Push current channel status to all authenticated clients. */
+  private broadcastChannels(): void {
+    const channels = this.opts.channels;
+    if (!channels) return;
+    const status = channels.status();
+    this.broadcast({ type: "channel.status", channels: status });
+    // Also push roster for each active channel
+    for (const s of status) {
+      if (!s.running) continue;
+      const participants = channels.roster(s.channel);
+      if (participants) {
+        this.broadcast({ type: "channel.roster", channel: s.channel, participants });
+      }
+    }
   }
 
   private broadcast(frame: GatewayServerFrame): void {

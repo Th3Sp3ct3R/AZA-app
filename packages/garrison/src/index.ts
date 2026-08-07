@@ -44,4 +44,6 @@ export {
   type ApprovalResponse,
 } from "./server.js";
 
+export { ChannelManager, type ChannelBridge, type ChannelManagerOptions } from "./channels.js";
+
 export { ApprovalQueue, type ApprovalQueueOptions } from "./approvals.js";

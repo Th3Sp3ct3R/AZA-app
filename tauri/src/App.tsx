@@ -1734,6 +1734,13 @@ function App() {
   const [directoryOpen, setDirectoryOpen] = useState(false);
   const [mcpConnectors, setMcpConnectors] = useState<McpConnectorVm[]>([]);
   const [mcpConnecting, setMcpConnecting] = useState<string | null>(null);
+  // Channel bridge state (Telegram, etc.) — pushed from garrison via channel.status/channel.roster.
+  const [channelStatus, setChannelStatus] = useState<Array<{ channel: string; running: boolean; connected: boolean; configured: boolean; participantCount: number; lastError?: string }>>([]);
+  const [channelRoster, setChannelRoster] = useState<Record<string, Array<{ chatId: number; name: string; role: string; addedAt: string; lastSeenAt?: string }>>>({});
+  // Channel config form state
+  const [channelToken, setChannelToken] = useState("");
+  const [channelAllowedChats, setChannelAllowedChats] = useState("");
+  const [channelBusy, setChannelBusy] = useState(false);
   // Floating-pill mode: shrink the window to an always-on-top mic bar.
   const [pill, setPill] = useState(false);
   const [pinTop, setPinTop] = useState(true);
@@ -2109,6 +2116,15 @@ function App() {
         case "mcp_connect_result":
           setMcpConnecting(null);
           pushGatewayToast(e.ok ? `🔌 Connected ${e.name ?? "connector"} — its tools are live.` : `Connect failed: ${e.error ? stringify(e.error) : "unknown"}`);
+          return true;
+        case "channel.status":
+          if (Array.isArray((e as any).channels)) setChannelStatus((e as any).channels);
+          return true;
+        case "channel.roster":
+          setChannelRoster((prev: any) => ({ ...prev, [(e as any).channel]: (e as any).participants }));
+          return true;
+        case "channel.event":
+          pushLog(`[${(e as any).channel}] ${(e as any).event}${(e as any).detail ? `: ${(e as any).detail}` : ""}`);
           return true;
         case "oauth_status":
           if (Array.isArray(e.providers)) setOauthProviders(e.providers as OAuthProviderVm[]);
@@ -3482,6 +3498,15 @@ function App() {
           }}
           onAnthropicSignIn={startAnthropicSignIn}
           initialTab={settingsTab}
+          channelStatus={channelStatus}
+          channelRoster={channelRoster}
+          channelToken={channelToken}
+          onChannelToken={setChannelToken}
+          channelAllowedChats={channelAllowedChats}
+          onChannelAllowedChats={setChannelAllowedChats}
+          channelBusy={channelBusy}
+          onChannelBusy={setChannelBusy}
+          onPushLog={pushLog}
         />
       ) : null}
 
@@ -6460,7 +6485,7 @@ function ModelDetail({ model, selected, onUse, onBack }: { model: ModelOption; s
   );
 }
 
-type SettingsTab = "account" | "model" | "appearance" | "skills" | "usage" | "routing" | "keys" | "services" | "consciousness" | "permissions" | "advanced" | "updates" | "about";
+type SettingsTab = "account" | "model" | "appearance" | "skills" | "usage" | "routing" | "keys" | "services" | "consciousness" | "channels" | "permissions" | "advanced" | "updates" | "about";
 
 interface SkillInfo {
   name: string;
@@ -6491,6 +6516,7 @@ const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; glyph: string }> = 
   { id: "keys", label: "API Keys", glyph: "shell" },
   { id: "services", label: "Services", glyph: "web" },
   { id: "consciousness", label: "Consciousness", glyph: "dot" },
+  { id: "channels", label: "Channels", glyph: "web" },
   { id: "permissions", label: "Permissions", glyph: "shell" },
   { id: "advanced", label: "Advanced", glyph: "dot" },
   { id: "updates", label: "What's New", glyph: "dot" },
@@ -6657,6 +6683,15 @@ function Settings({
   onLivePref,
   onAnthropicSignIn,
   initialTab,
+  channelStatus,
+  channelRoster,
+  channelToken,
+  onChannelToken,
+  channelAllowedChats,
+  onChannelAllowedChats,
+  channelBusy,
+  onChannelBusy,
+  onPushLog,
 }: {
   prefs: Prefs;
   onApply: (p: Prefs, keys: Record<string, string>) => void;
@@ -6674,6 +6709,16 @@ function Settings({
   onLivePref: (patch: Partial<Prefs>) => void;
   onAnthropicSignIn: () => void;
   initialTab?: SettingsTab;
+  // Channel bridge state (Telegram, etc.)
+  channelStatus: Array<{ channel: string; running: boolean; connected: boolean; configured: boolean; participantCount: number; lastError?: string }>;
+  channelRoster: Record<string, Array<{ chatId: number; name: string; role: string; addedAt: string; lastSeenAt?: string }>>;
+  channelToken: string;
+  onChannelToken: (v: string) => void;
+  channelAllowedChats: string;
+  onChannelAllowedChats: (v: string) => void;
+  channelBusy: boolean;
+  onChannelBusy: (v: boolean) => void;
+  onPushLog: (line: string) => void;
 }) {
   const [tab, setTab] = useState<SettingsTab>(initialTab ?? "model");
   const [draft, setDraftPrefs] = useState<Prefs>(prefs);
@@ -6686,6 +6731,7 @@ function Settings({
     if (tab === "skills") onDaemonCommand({ type: "skills_list" });
     if (tab === "usage") onDaemonCommand({ type: "usage_stats", days: 30 });
     if (tab === "consciousness") onDaemonCommand({ type: "consciousness_status" });
+    if (tab === "channels") onDaemonCommand({ type: "channel.status" });
   }, [tab, native, onDaemonCommand]);
 
   const setEngine = (patch: Partial<EngineConfig>) => setDraftPrefs({ ...draft, engine: { ...draft.engine, ...patch } });
@@ -6941,6 +6987,78 @@ function Settings({
                 </div>
               </div>
               <p className="keyHint">OpenAI uses ChatGPT OAuth. Local Ollama needs no key; the Ollama key enables direct ollama.com cloud discovery and inference.</p>
+            </div>
+          ) : null}
+
+          {tab === "channels" ? (
+            <div className="settingsPane">
+              <h3 className="paneTitle">Channels</h3>
+              <p className="paneHint">Configure and manage messaging channel bridges (Telegram, etc.). Start a bridge to let Ares chat through your bot.</p>
+
+              {/* ── Telegram bridge ── */}
+              <div className="engineRow" style={{ marginTop: 16 }}>
+                <div className="engineInfo">
+                  <strong>Telegram</strong>
+                  <span>{(() => { const s = channelStatus.find(c => c.channel === "telegram"); return s?.running ? "🟢 Running" : s?.configured ? "🟡 Configured" : "⚪ Not configured"; })()}</span>
+                </div>
+                <div className="engineActions">
+                  {channelStatus.find(c => c.channel === "telegram")?.running ? (
+                    <button className="amAction" onClick={() => { onChannelBusy(true); onDaemonCommand({ type: "channel.stop", channel: "telegram" }); setTimeout(() => onChannelBusy(false), 2000); }} disabled={channelBusy}>Stop</button>
+                  ) : (
+                    <button className="amAction" onClick={() => { onChannelBusy(true); onDaemonCommand({ type: "channel.start", channel: "telegram" }); setTimeout(() => onChannelBusy(false), 2000); }} disabled={channelBusy}>Start</button>
+                  )}
+                </div>
+              </div>
+
+              {/* Bot token */}
+              <label className="fieldLabel" style={{ marginTop: 12 }}>Bot Token</label>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input className="keyInput" type="password" value={channelToken}
+                  onChange={(e) => onChannelToken(e.target.value)}
+                  placeholder="123456:ABC-DEF..." style={{ flex: 1 }} />
+                <button className="amAction"
+                  onClick={() => {
+                    if (!channelToken.trim()) return;
+                    const chats = channelAllowedChats.split(",").map((s: string) => Number(s.trim())).filter((n: number) => !isNaN(n));
+                    onDaemonCommand({ type: "channel.configure", channel: "telegram", config: { token: channelToken.trim(), allowedChats: chats } });
+                    onPushLog("[channels] telegram configured");
+                  }}>Save</button>
+              </div>
+
+              {/* Allowed chats */}
+              <label className="fieldLabel" style={{ marginTop: 12 }}>Allowed Chat IDs</label>
+              <input className="keyInput" value={channelAllowedChats}
+                onChange={(e) => onChannelAllowedChats(e.target.value)}
+                placeholder="123456789, 987654321 (comma-separated Telegram chat IDs)" />
+
+              {/* Status */}
+              {channelStatus.filter(c => c.channel === "telegram").map(c => (
+                <div key={c.channel} className="engineRow" style={{ marginTop: 12 }}>
+                  <div className="engineInfo">
+                    <span>Participants: {c.participantCount}</span>
+                    {c.lastError ? <span style={{ color: "var(--text-error)" }}>{c.lastError}</span> : null}
+                  </div>
+                </div>
+              ))}
+
+              {/* Roster */}
+              {channelRoster["telegram"]?.length ? (
+                <div style={{ marginTop: 12 }}>
+                  <label className="fieldLabel">Roster</label>
+                  <div className="status-table" style={{ marginTop: 4 }}>
+                    <div className="data-row head"><span>Chat ID</span><span>Name</span><span>Role</span></div>
+                    {channelRoster["telegram"].map(p => (
+                      <div className="data-row" key={p.chatId}>
+                        <code>{p.chatId}</code><span>{p.name}</span><span className="aza-badge aza-badge-muted">{p.role}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <p className="paneHint" style={{ marginTop: 16 }}>
+                Create a bot with <b>@BotFather</b> on Telegram, paste the token above, then add your chat ID. Send <b>/start</b> to your bot — the bridge auto-discovers your chat. Start the bridge to go live.
+              </p>
             </div>
           ) : null}
 
