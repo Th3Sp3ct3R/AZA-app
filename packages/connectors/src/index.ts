@@ -41,3 +41,21 @@ export {
   type HumanCheckOutcome,
   type HandoffResult,
 } from "./challenge.js";
+
+export {
+  InstagrowthConnector,
+  getInstagrowth,
+  type IgToolCall,
+  type IgToolResult,
+  type IgAccount,
+  type IgAccountCreateInput,
+} from "./instagrowth.js";
+
+export {
+  VdoxConnector,
+  getVdox,
+  VDOX_MODELS,
+  type VdoxModelId,
+  type VdoxGenerateInput,
+  type VdoxGenerateResult,
+} from "./vdox.js";
