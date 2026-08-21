@@ -54,7 +54,7 @@ function repeatFailingCallProvider(failRounds) {
 
 test("second identical failure triggers recall, and the remembered fix is injected", async () => {
   let recallInput = null;
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: repeatFailingCallProvider(3),
       model: "m",
@@ -86,7 +86,7 @@ test("second identical failure triggers recall, and the remembered fix is inject
 
 test("recall fires at most once per signature per turn (no repeated lookups)", async () => {
   let recallCount = 0;
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: repeatFailingCallProvider(5),
       model: "m",
@@ -104,7 +104,7 @@ test("recall fires at most once per signature per turn (no repeated lookups)", a
 });
 
 test("no recall hook configured → engine still runs fine (feature is optional)", async () => {
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider: repeatFailingCallProvider(2), model: "m", systemPrompt: "s", tools: [alwaysFails], workspace: WS, maxTurns: 6 },
     "sess_recall_none",
   );

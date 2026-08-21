@@ -63,7 +63,7 @@ function batchProvider(calls) {
 }
 
 async function runTurn(provider, tools, workspace) {
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider, model: "mock", systemPrompt: "t", tools, workspace, signal: new AbortController().signal },
     "eng",
   );
@@ -163,11 +163,14 @@ test("task: two Task calls run their subagents in parallel", async () => {
       yield { type: "message_done", message: { id: "s", role: "assistant", content: [{ type: "text", text: "sub done" }], createdAt: new Date().toISOString() }, usage: { inputTokens: 1, outputTokens: 0 }, stopReason: "end_turn" };
     },
   };
-  const registry = new SubagentRegistry([{ name: "worker", description: "does slow work", systemPrompt: "work", toolWhitelist: [], maxTurns: 2 }]);
+  // Use a declared read-only Task type. Unknown/custom personas are treated as
+  // possible writers and serialized unless Conductor gives them isolated file
+  // ownership; known researchers are safe to fan out in one parent batch.
+  const registry = new SubagentRegistry([{ name: "researcher", description: "does slow read-only work", systemPrompt: "work", toolWhitelist: [], maxTurns: 2 }]);
   const runner = new AresSubagentRunner({ registry, provider: slowSubProvider, model: "mock", parentTools: [], baseSystemPrompt: "base" });
   const taskTool = adaptToolForEngine(makeTaskTool(runner), (base) => ({ ...base, permissionMode: "bypass", fileReadStamps: base.fileReadStamps ?? new Map() }));
 
-  const calls = [0, 1].map((i) => ({ id: `task${i}`, name: "Task", input: { subagent_type: "worker", description: `d${i}`, prompt: "work" } }));
+  const calls = [0, 1].map((i) => ({ id: `task${i}`, name: "Task", input: { subagent_type: "researcher", description: `d${i}`, prompt: "work" } }));
   const { history } = await runTurn(batchProvider(calls), [taskTool], tmp);
   assert.equal(peak, 2, `both Task subagents were in-flight at once (peak concurrency ${peak})`);
   assert.equal(toolResultIds(history).length, 2, "both Task calls returned results");

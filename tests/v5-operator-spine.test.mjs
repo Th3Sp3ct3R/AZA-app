@@ -8,11 +8,13 @@
 //      maxNoProgress ticks instead of looping forever.
 //   5. Real wiring: QueryEngineDispatcher drives an ephemeral QueryEngine
 //      (MockEchoProvider) and the loop completes the goal.
-//   6. Scheduler: interval ticks fire, events wake immediately, stop halts.
+//   6. Worker scope: recursive control-plane tools never enter unattended forks.
+//   7. Scheduler: interval ticks fire, events wake immediately, stop halts.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -26,10 +28,11 @@ import {
   tickGoal,
   runGoalToCompletion,
   QueryEngineDispatcher,
+  scopeOperatorWorkerTools,
   Scheduler,
 } from "../packages/operator/dist/index.js";
 
-import { MockEchoProvider } from "../packages/core/dist/index.js";
+import { MockEchoProvider, SessionKernelStore } from "../packages/core/dist/index.js";
 
 async function makeHome() {
   return await fs.mkdtemp(path.join(os.tmpdir(), "ares-operator-"));
@@ -189,7 +192,69 @@ test("dispatcher: QueryEngineDispatcher drives an ephemeral QueryEngine to compl
   assert.ok(final.stepLog[0].moved, "the real QueryEngine turn produced output");
 });
 
-// ── 6. Scheduler ────────────────────────────────────────────────────────────
+test("dispatcher: unattended worker scope strips recursive control planes but keeps bounded Task", () => {
+  const tool = (name) => ({
+    schema: {
+      name,
+      description: name,
+      inputJsonSchema: { type: "object", properties: {} },
+      safety: "read-only",
+      concurrency: "parallel-safe",
+    },
+    async call() { return { output: null }; },
+  });
+  const scoped = scopeOperatorWorkerTools([
+    tool("Read"),
+    tool("Task"),
+    tool("Operator"),
+    tool("Conductor"),
+    tool("StandingOrder"),
+    tool("CodingBackend"),
+    tool("Capability"),
+    tool("EnterPlanMode"),
+    tool("ExitPlanMode"),
+  ]);
+
+  assert.deepEqual(scoped.map((entry) => entry.schema.name), ["Read", "Task"]);
+});
+
+test("dispatcher: durable worker session links to the goal and reuses a consumed step idempotently", async () => {
+  const workspace = await makeHome();
+  const kernel = await SessionKernelStore.open({ filename: path.join(workspace, "operator-kernel.sqlite") });
+  try {
+    const goal = createGoal({ id: "durable-dispatch", statement: "exercise the durable operator worker" });
+    const dispatcher = new QueryEngineDispatcher({
+      provider: new MockEchoProvider(),
+      model: "mock",
+      workspace,
+      sessionKernel: kernel,
+      telemetryDir: path.join(workspace, "telemetry"),
+      sessionRegistryHome: workspace,
+    });
+    const ctx = { signal: new AbortController().signal, now: () => new Date() };
+
+    const first = await dispatcher.runStep(goal, ctx);
+    const recovered = await dispatcher.runStep(goal, ctx);
+    assert.equal(first.moved, true);
+    assert.equal(recovered.moved, true, "retry recovered the durable assistant result");
+    assert.equal(recovered.evidence, first.evidence);
+
+    const key = createHash("sha256").update(goal.id, "utf8").digest("hex").slice(0, 24);
+    const root = kernel.getSession(`operator_goal_${key}`);
+    assert.ok(root);
+    const children = kernel.listChildSessions(root.id);
+    assert.equal(children.length, 1, "same logical step reused one child session");
+    const worker = children[0].session;
+    const inputs = kernel.listInputs(worker.id);
+    assert.equal(inputs.length, 1, "same logical step reused one admitted input");
+    assert.equal(inputs[0].state, "consumed");
+    assert.ok(kernel.listMessages(worker.id).some((message) => message.role === "assistant"));
+  } finally {
+    kernel.close();
+  }
+});
+
+// ── 7. Scheduler ────────────────────────────────────────────────────────────
 
 test("scheduler: interval ticks fire and stop halts them", async () => {
   let ticks = 0;

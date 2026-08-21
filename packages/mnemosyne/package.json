@@ -1,0 +1,27 @@
+{
+  "name": "@ares/mnemosyne",
+  "version": "0.1.0-alpha.1",
+  "type": "module",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "Mnemosyne: the standalone memory server. Single writer over the living memory, binding classes (law/pact/doctrine) with real force, an attestation loop that catches 'recalled it, then did it anyway', and guard compilation that turns owner orders into machine-checkable rules.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@ares/mind": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.12"
+  }
+}

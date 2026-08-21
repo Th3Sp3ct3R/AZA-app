@@ -172,7 +172,7 @@ class TestClient {
 async function bootWithApprovals() {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "ares-approvals-"));
   const factory = ({ sessionId, model, signal, requestPermission }) => ({
-    engine: new QueryEngine(
+    engine: QueryEngine.forTesting(
       { provider: new MockEchoProvider(), model: model ?? "mock", systemPrompt: "t", tools: [], workspace: home, signal, requestPermission },
       sessionId,
     ),

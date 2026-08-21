@@ -14,6 +14,7 @@ export interface OperatorPaths {
   acquisitionsDir: string;
   lessonsDir: string;
   standingDir: string;
+  watchersDir: string;
 }
 
 export function operatorPaths(explicit?: string): OperatorPaths {
@@ -28,5 +29,6 @@ export function operatorPaths(explicit?: string): OperatorPaths {
     acquisitionsDir: path.join(operatorDir, "acquisitions"),
     lessonsDir: path.join(operatorDir, "lessons"),
     standingDir: path.join(operatorDir, "standing-orders"),
+    watchersDir: path.join(operatorDir, "watchers"),
   };
 }

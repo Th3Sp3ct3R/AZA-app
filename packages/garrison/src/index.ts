@@ -17,7 +17,9 @@ export {
   type GarrisonStatus,
 } from "./protocol.js";
 
-export { ensureToken, constantTimeEqual, garrisonDir, tokenPath } from "./token.js";
+export { ensureToken, ensureReadToken, constantTimeEqual, garrisonDir, tokenPath, readTokenPath } from "./token.js";
+
+export { viewerHtml } from "./viewer.js";
 
 export {
   SessionManager,
@@ -32,6 +34,7 @@ export {
   type SessionFactoryRequest,
   type SessionFactoryResult,
   type SessionSubscriber,
+  type SessionSendOptions,
   type RehydratedSession,
 } from "./sessions.js";
 

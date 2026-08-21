@@ -12,13 +12,17 @@ import type { TelegramApiLike } from "./bridge.js";
 /** Mirror of @ares/operator's OperatorBackgroundEvent (decoupled — channels must
  *  not depend on operator). Only the fields a report needs. */
 export interface OperatorEventLike {
-  type: "operator_started" | "operator_tick" | "operator_idle" | "operator_error" | "operator_stopped";
+  // operator_woken has no formatter on purpose: a wake is bookkeeping, and the
+  // work it leads to reports itself. It falls through to null.
+  type: "operator_started" | "operator_tick" | "operator_idle" | "operator_error" | "operator_stopped" | "operator_woken" | "watcher_fired";
   everyMs?: number;
   goalId?: string;
   status?: string;
   summary?: string;
   suggestions?: string[];
   message?: string;
+  id?: string;
+  label?: string;
 }
 
 export interface WarMapBriefing {
@@ -74,6 +78,9 @@ export function formatOperatorReport(event: OperatorEventLike, opts: OperatorRep
     case "operator_idle":
       if (!opts.debug) return null; // don't spam idle every tick
       return redactForTelegram(`· Idle — next: ${(event.suggestions ?? []).slice(0, 3).join("; ") || "nothing queued"}`);
+    case "watcher_fired":
+      // A condition tripped and Ares queued a PLAN-ONLY proposal — worth the ping.
+      return redactForTelegram(`👁 ${clip(event.label ?? "watcher", 60)} tripped — ${clip(event.summary ?? "", 140)}. Proposal queued for your approval.`);
     default:
       return null;
   }

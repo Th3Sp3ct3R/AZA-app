@@ -1,40 +1,26 @@
 // Bash — execute a shell command with timeout or as a background process.
 
-import { z } from "zod";
 import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import { promises as fs } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import {
   buildTool,
   describeShellActivity,
   destructiveShellDecision,
+  irrecoverableShellRefusal,
   resolveWorkspacePath,
+  shellInputSchema,
+  shellRepositoryInstructionDecision,
 } from "./_shared.js";
 
-const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_TIMEOUT_MS = 600_000;
 const MAX_OUTPUT_CHARS = 30_000;
+// After the shell process exits, how long its stdio pipes may stay open
+// (draining a grandchild's inherited handles) before we force-close them.
+const EXIT_STREAM_GRACE_MS = 1_500;
 
-const inputSchema = z
-  .object({
-    command: z.string().min(1).describe("Bash command line. Quote paths with spaces."),
-    description: z.string().describe("5-10 word active-voice summary, e.g. 'List files in current directory'."),
-    timeout: z
-      .number()
-      .int()
-      .positive()
-      .max(MAX_TIMEOUT_MS)
-      .default(DEFAULT_TIMEOUT_MS)
-      .describe(`Timeout in milliseconds (max ${MAX_TIMEOUT_MS}, foreground only).`),
-    cwd: z.string().optional().describe("Working directory. Defaults to workspace."),
-    run_in_background: z
-      .boolean()
-      .default(false)
-      .describe(
-        "When true, the shell runs in the background and the tool returns a shell_id immediately. Poll output with BashOutput, terminate with KillShell. Use for dev servers, watchers, builds you want to monitor.",
-      ),
-  })
-  .strict();
+const inputSchema = shellInputSchema("Bash command line. Quote paths with spaces.");
 
 export interface BashOutput {
   command: string;
@@ -44,14 +30,20 @@ export interface BashOutput {
   durationMs: number;
   timedOut: boolean;
   truncated: boolean;
+  /** Complete interleaved stdout/stderr when the inline tails were capped. */
+  fullOutputPath?: string;
+  /** Present only when the full-output spool itself failed. Inline tails remain. */
+  captureError?: string;
 }
 
 export interface BashBackgroundOutput {
   shell_id: string;
   command: string;
-  status: "running";
+  status: "running" | "exited" | "killed" | "errored" | "orphaned";
   description: string;
   cwd: string;
+  exitCode?: number | null;
+  outputPath?: string;
 }
 
 export const BashTool = buildTool({
@@ -67,6 +59,8 @@ export const BashTool = buildTool({
   activityDescription: (i) => describeShellActivity(i.command, i.run_in_background === true),
   commandFor: (i) => i.command,
   async checkPermissions(i, ctx) {
+    const instructionDecision = await shellRepositoryInstructionDecision(ctx, i.cwd, i.target_paths);
+    if (instructionDecision) return instructionDecision;
     const configured = ctx.commandPermissions?.decide("Bash", i.command);
     // A configured/stored deny|ask wins as before.
     if (configured && configured.kind !== "allow") return configured;
@@ -80,6 +74,12 @@ export const BashTool = buildTool({
   },
 
   async call(i, ctx): Promise<{ output: unknown; display: string }> {
+    // Enforced HERE, not in checkPermissions: a permission decision is only a
+    // prompt, and bypass/YOLO auto-allows every prompt. An unrecoverable
+    // deletion has to be refused at the point of execution or the mode that
+    // exists to remove friction also removes the last guard.
+    const refusal = irrecoverableShellRefusal(i.command);
+    if (refusal) throw new Error(refusal);
     const cwd = await resolveWorkspacePath(ctx, i.cwd, "cwd", "execute");
     const bash = await resolveBashProgram();
 
@@ -95,13 +95,17 @@ export const BashTool = buildTool({
         args: ["-lc", i.command],
         cwd,
         description: i.description,
+        sessionId: ctx.sessionId,
+        invocationKey: ctx.toolUseId ?? `legacy_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`,
       });
       const output: BashOutput | BashBackgroundOutput = {
         shell_id: snap.id,
         command: snap.command,
-        status: "running",
+        status: snap.status,
         description: snap.description,
         cwd: snap.cwd,
+        exitCode: snap.exitCode,
+        ...(snap.outputPath ? { outputPath: snap.outputPath } : {}),
       };
       return {
         output,
@@ -109,12 +113,21 @@ export const BashTool = buildTool({
       };
     }
 
+    const captureDir = path.join(ctx.workspace, ".ares", "shell-output", ctx.sessionId);
+    await fs.mkdir(captureDir, { recursive: true });
+    const capturePath = path.join(captureDir, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}.log`);
     const result = await runShell(bash, ["-lc", i.command], cwd, i.timeout, ctx.signal, (stream, text) => {
       ctx.emitProgress?.({ kind: "shell_output", stream, text });
-    });
+    }, capturePath);
     const output: BashOutput | BashBackgroundOutput = result;
+    const failure = result.timedOut
+      ? `Bash timed out after ${i.timeout}ms`
+      : result.exitCode === 0
+        ? undefined
+        : `Bash exited with code ${result.exitCode ?? "unknown"}`;
     return {
       output,
+      ...(failure ? { failure } : {}),
       display: result.timedOut
         ? `Bash timed out after ${i.timeout}ms`
         : result.exitCode === 0
@@ -131,15 +144,73 @@ export async function runShell(
   timeoutMs: number,
   signal: AbortSignal,
   onOutput?: (stream: "stdout" | "stderr", text: string) => void,
+  capturePath?: string,
 ): Promise<BashOutput> {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
-    const child = spawn(program, args, { cwd, signal, windowsHide: true });
+    // Own abort handling instead of passing `signal` to spawn. On Windows the
+    // built-in path kills only PowerShell/cmd, leaving grandchildren alive with
+    // inherited stdout handles so the Promise never reaches `close`.
+    const child = spawn(program, args, { cwd, windowsHide: true });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    let stdoutDropped = false;
+    let stderrDropped = false;
     let timedOut = false;
+    let captureFailed = false;
+    let captureFailureMessage: string | undefined;
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const pausedForCapture = new Set<{ pause(): unknown; resume(): unknown }>();
+    let settleCapture: (() => void) | undefined;
+    const captureDone = new Promise<void>((resolve) => { settleCapture = resolve; });
+    const capture = capturePath ? createWriteStream(capturePath, { flags: "w" }) : null;
+    capture?.once("finish", () => settleCapture?.());
+    capture?.once("error", (error) => {
+      captureFailed = true;
+      captureFailureMessage = error instanceof Error ? error.message : String(error);
+      for (const stream of pausedForCapture) stream.resume();
+      pausedForCapture.clear();
+      settleCapture?.();
+    });
+
+    const writeCapture = (
+      stream: "stdout" | "stderr",
+      text: string,
+      source: { pause(): unknown; resume(): unknown },
+    ) => {
+      if (!capture || captureFailed || text.length === 0) return;
+      if (!capture.write(`[${stream}]\n${text}`)) {
+        source.pause();
+        pausedForCapture.add(source);
+        capture.once("drain", () => {
+          if (pausedForCapture.delete(source)) source.resume();
+        });
+      }
+    };
+
+    const killTree = () => {
+      if (process.platform === "win32" && child.pid) {
+        spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => {
+          try {
+            child.kill();
+          } catch {
+            /* ignore */
+          }
+        });
+      } else {
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    const onAbort = () => killTree();
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) queueMicrotask(onAbort);
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -161,39 +232,91 @@ export async function runShell(
     child.stdout.on("data", (chunk: Buffer) => {
       stdoutChunks.push(chunk);
       stdoutBytes += chunk.length;
-      onOutput?.("stdout", decodeOutput(chunk));
+      const text = stdoutDecoder.write(chunk);
+      if (text) onOutput?.("stdout", text);
+      writeCapture("stdout", text, child.stdout);
       while (stdoutBytes > MAX_OUTPUT_CHARS * 4 && stdoutChunks.length > 1) {
         stdoutBytes -= stdoutChunks.shift()?.length ?? 0;
+        stdoutDropped = true;
       }
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderrChunks.push(chunk);
       stderrBytes += chunk.length;
-      onOutput?.("stderr", decodeOutput(chunk));
+      const text = stderrDecoder.write(chunk);
+      if (text) onOutput?.("stderr", text);
+      writeCapture("stderr", text, child.stderr);
       while (stderrBytes > MAX_OUTPUT_CHARS * 4 && stderrChunks.length > 1) {
         stderrBytes -= stderrChunks.shift()?.length ?? 0;
+        stderrDropped = true;
       }
+    });
+    child.stdout.on("end", () => {
+      const text = stdoutDecoder.end();
+      if (text) onOutput?.("stdout", text);
+      writeCapture("stdout", text, child.stdout);
+    });
+    child.stderr.on("end", () => {
+      const text = stderrDecoder.end();
+      if (text) onOutput?.("stderr", text);
+      writeCapture("stderr", text, child.stderr);
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      capture?.destroy();
       reject(err);
     });
+    child.on("exit", () => {
+      // Natural exit only: the shell finished on its own, but a grandchild it
+      // launched (Start-Process dev server, nohup daemon) inherited its pipe
+      // handles on Windows and can hold them open FOREVER — `close` would
+      // never fire and this promise would hang past every timeout, because
+      // the timeout's taskkill targets the already-dead shell pid and reaps
+      // nothing (the 656-second "checking the port" session). Give the pipes
+      // a short grace to flush buffered output, then force-close our read
+      // ends; `close` fires and the tool settles with the output it has.
+      //
+      // On the timeout/abort path we DID kill the tree — `close` arrives when
+      // the tree actually dies, and settling early would race the reap (the
+      // caller must be able to trust that a timed-out tree is gone).
+      if (timedOut || signal.aborted) return;
+      const grace = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, EXIT_STREAM_GRACE_MS);
+      grace.unref();
+      child.once("close", () => clearTimeout(grace));
+    });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      const stdout = decodeOutput(Buffer.concat(stdoutChunks));
-      const stderr = decodeOutput(Buffer.concat(stderrChunks));
-      const truncatedOut = stdout.length > MAX_OUTPUT_CHARS;
-      const truncatedErr = stderr.length > MAX_OUTPUT_CHARS;
-      resolve({
-        command: `${program} ${args.join(" ")}`,
-        exitCode: code,
-        stdout: truncatedOut ? stdout.slice(-MAX_OUTPUT_CHARS) : stdout,
-        stderr: truncatedErr ? stderr.slice(-MAX_OUTPUT_CHARS) : stderr,
-        durationMs: Date.now() - startedAt,
-        timedOut,
-        truncated: truncatedOut || truncatedErr,
-      });
+      void (async () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        if (capture) {
+          capture.end();
+          await captureDone;
+        }
+        const stdout = decodeOutput(Buffer.concat(stdoutChunks));
+        const stderr = decodeOutput(Buffer.concat(stderrChunks));
+        const truncatedOut = stdoutDropped || stdout.length > MAX_OUTPUT_CHARS;
+        const truncatedErr = stderrDropped || stderr.length > MAX_OUTPUT_CHARS;
+        const truncated = truncatedOut || truncatedErr;
+        if (capturePath && (!truncated || captureFailed)) {
+          await fs.rm(capturePath, { force: true }).catch(() => undefined);
+        }
+        resolve({
+          command: `${program} ${args.join(" ")}`,
+          exitCode: code,
+          stdout: truncatedOut ? stdout.slice(-MAX_OUTPUT_CHARS) : stdout,
+          stderr: truncatedErr ? stderr.slice(-MAX_OUTPUT_CHARS) : stderr,
+          durationMs: Date.now() - startedAt,
+          timedOut,
+          truncated,
+          ...(truncated && capturePath && !captureFailed ? { fullOutputPath: capturePath } : {}),
+          ...(captureFailureMessage ? { captureError: captureFailureMessage } : {}),
+        });
+      })();
     });
   });
 }

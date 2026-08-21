@@ -73,6 +73,8 @@ Propose a candidate ONLY when the turn contains:
 - belief: a falsifiable fact about the world/codebase the agent acted on or discovered ("the build uses pnpm", "X breaks when Y")
 - procedure: a reusable multi-step method that just SUCCEEDED (never from a failed attempt)
 
+Never propose a claim whose substance is a tool failure, provider error, exit code, stack trace, or other harness noise ("Bash failed with ENOENT", "the provider timed out"). Failure mechanics belong to friction telemetry, not durable memory. A failure teaches something only when the LESSON is stated without the error text ("this repo's tests need the daemon stopped first").
+
 Each candidate: {"kind": "...", "claim": "<one self-contained sentence, 12-300 chars>", "why": "<why durable>", "check": optional}.
 A check makes the claim testable later: {"type":"command","cmd":"<READ-ONLY command>","expect":"<substring>"} or {"type":"file_exists","path":"<path>"}. Only attach a check when one genuinely verifies the claim; never attach destructive commands.`;
 

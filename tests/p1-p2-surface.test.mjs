@@ -224,11 +224,18 @@ test("Memory: add and search persists project memory", async () => {
   assert.match(await fs.readFile(path.join(tmp, ".ares", "memory.md"), "utf8"), /Use pnpm/);
 });
 
-test("startup context loads CRIX.md as instructions", async () => {
+test("startup context loads ARES.md as instructions", async () => {
+  const tmp = await makeTmp();
+  await fs.writeFile(path.join(tmp, "ARES.md"), "Project rule: use biome.\n", "utf8");
+  const reminders = await loadStartupReminders(tmp);
+  assert.ok(reminders.some((r) => r.source === "instructions" && r.text.includes("use biome")));
+});
+
+test("CRIX.md is no longer a convention file — the old name is fully retired", async () => {
   const tmp = await makeTmp();
   await fs.writeFile(path.join(tmp, "CRIX.md"), "Project rule: use biome.\n", "utf8");
   const reminders = await loadStartupReminders(tmp);
-  assert.ok(reminders.some((r) => r.source === "instructions" && r.text.includes("use biome")));
+  assert.ok(!reminders.some((r) => r.source === "instructions" && r.text.includes("use biome")));
 });
 
 test("prompt cache key is stable for identical system + tool schemas", () => {

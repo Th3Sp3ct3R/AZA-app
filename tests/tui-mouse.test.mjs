@@ -214,18 +214,18 @@ test("keyForIndex is the inverse of indexForKey over the covered range", () => {
 // ─── Effort slider math ───────────────────────────────────────────────────────
 
 test("SLIDER_LEVELS matches the protocol dial order", () => {
-  assert.deepEqual([...SLIDER_LEVELS], ["off", "low", "medium", "high", "max"]);
+  assert.deepEqual([...SLIDER_LEVELS], ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 });
 
 test("sliderIndexAt maps bar columns to nearest stop and clamps", () => {
   const start = 5;
-  const width = 21; // stops at offsets 0,5,10,15,20
+  const width = 25; // seven stops at offsets 0,4,8,12,16,20,24
   assert.equal(sliderIndexAt(start, start, width), 0);
-  assert.equal(sliderIndexAt(start + 5, start, width), 1);
-  assert.equal(sliderIndexAt(start + 10, start, width), 2);
-  assert.equal(sliderIndexAt(start + 20, start, width), 4);
+  assert.equal(sliderIndexAt(start + 4, start, width), 1);
+  assert.equal(sliderIndexAt(start + 12, start, width), 3);
+  assert.equal(sliderIndexAt(start + 24, start, width), 6);
   assert.equal(sliderIndexAt(0, start, width), 0); // left of bar → clamp
-  assert.equal(sliderIndexAt(999, start, width), 4); // right of bar → clamp
+  assert.equal(sliderIndexAt(999, start, width), 6); // right of bar → clamp
 });
 
 test("sliderIndexAt and sliderHandleOffset round-trip every level", () => {
@@ -240,9 +240,11 @@ test("sliderIndexAt and sliderHandleOffset round-trip every level", () => {
 test("slider ramp: colors go steel→ember→crimson→gold, glyphs densify", () => {
   assert.equal(sliderFillColor(0, TOKENS), "DIM");
   assert.equal(sliderFillColor(1, TOKENS), "STEEL");
-  assert.equal(sliderFillColor(2, TOKENS), "EMBER");
-  assert.equal(sliderFillColor(3, TOKENS), "CRIMSON");
-  assert.equal(sliderFillColor(4, TOKENS), "GOLD");
+  assert.equal(sliderFillColor(2, TOKENS), "STEEL");
+  assert.equal(sliderFillColor(3, TOKENS), "EMBER");
+  assert.equal(sliderFillColor(4, TOKENS), "CRIMSON");
+  assert.equal(sliderFillColor(5, TOKENS), "GOLD");
+  assert.equal(sliderFillColor(6, TOKENS), "GOLD");
   assert.equal(sliderGlyph(1), "─");
   assert.equal(sliderGlyph(2), "━");
   assert.equal(sliderGlyph(3), "▬");
@@ -260,7 +262,7 @@ test("sliderSpans always concatenate to exactly the bar width", () => {
 
 test("sliderSpans: level 0 parks the handle at the left, MAX at the right", () => {
   const off = sliderSpans(0, 24, TOKENS).map((s) => s.text).join("");
-  const max = sliderSpans(4, 24, TOKENS).map((s) => s.text).join("");
+  const max = sliderSpans(SLIDER_LEVELS.length - 1, 24, TOKENS).map((s) => s.text).join("");
   assert.equal(off.indexOf("●"), 0);
   assert.equal(max.indexOf("●"), max.length - 1);
 });
@@ -269,14 +271,14 @@ test("sliderFlameRow accumulates flames with the level and never overflows", () 
   const width = 24;
   assert.equal(sliderFlameRow(0, width), "");
   assert.equal(sliderFlameRow(1, width), "");
-  const counts = [2, 3, 4].map((lvl) => {
+  const counts = [2, 4, 6].map((lvl) => {
     const row = sliderFlameRow(lvl, width);
     assert.ok(textWidth(row) <= width, `level ${lvl} row fits`);
     return (row.match(/[ᐟ🔥]/gu) ?? []).length;
   });
   assert.ok(counts[0] < counts[1], "high has more flames than medium");
   assert.ok(counts[1] < counts[2], "MAX has the most flames");
-  assert.ok(sliderFlameRow(4, width).includes("🔥"), "MAX earns real fire");
+  assert.ok(sliderFlameRow(6, width).includes("🔥"), "MAX earns real fire");
 });
 
 // ─── THE ULTRA SURGE ─────────────────────────────────────────────────────────

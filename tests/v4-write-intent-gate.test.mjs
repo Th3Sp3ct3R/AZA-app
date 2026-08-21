@@ -78,7 +78,7 @@ test("self-territory writes are allowed without magic wording", async () => {
   const workspace = await makeTmp("ares-ws-");
   const editState = { calls: 0, lastInput: null };
   const targetFile = path.join(home, "SOUL.md");
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: singleEditProvider(targetFile),
       model: "test",
@@ -106,7 +106,7 @@ test("workspace-write mode allows ordinary workspace files without magic wording
   const home = await makeTmp("ares-self-");
   const workspace = await makeTmp("ares-ws-");
   const editState = { calls: 0, lastInput: null };
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: singleEditProvider(path.join(workspace, "src", "x.ts")),
       model: "test",
@@ -130,7 +130,7 @@ test("workspace-write mode remains open across turns", async () => {
   const workspace = await makeTmp("ares-ws-");
   const editState = { calls: 0, lastInput: null };
   const provider = singleEditProvider(path.join(workspace, "src", "x.ts"));
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider,
       model: "test",

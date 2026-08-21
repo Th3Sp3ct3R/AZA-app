@@ -7,7 +7,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const workspaceRoot = path.join(__dirname, "..");
+// Daemons spawned below persist REAL session rollouts into <cwd>/.ares —
+// a temp workspace keeps them out of the repo's own .ares directory.
+const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), "ares-v4-ws-"));
 const cliEntry = path.join(__dirname, "..", "packages", "cli", "dist", "entry.js");
 
 test("V4 V10: themes command exposes clean graphite and oxide themes", () => {
@@ -22,6 +24,7 @@ test("V4 V10: daemon --json emits ready event for companion UI protocol", () => 
     input: JSON.stringify({ type: "exit" }) + "\n",
     encoding: "utf8",
     windowsHide: true,
+    cwd: workspaceRoot,
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /daemon_ready/);

@@ -38,7 +38,13 @@ export type ClientFrame =
   | { type: "hello"; token: string; client: string; proto: 1 }
   | { type: "session.create"; provider?: string; model?: string; workspace?: string }
   | { type: "session.attach"; sessionId: string }
-  | { type: "session.send"; sessionId: string; text: string }
+  | {
+      type: "session.send";
+      sessionId: string;
+      text: string;
+      inputId?: string;
+      delivery?: "queue" | "steer";
+    }
   | { type: "session.interrupt"; sessionId: string }
   | { type: "sessions.list" }
   | { type: "status" }

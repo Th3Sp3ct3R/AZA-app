@@ -81,7 +81,7 @@ async function runTurn(engine) {
 
 test("C5: work-item first turn forces toolChoice 'any'; routine continuation relaxes + goes routine-phase", async () => {
   const captured = [];
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: makeToolLoopProvider(captured),
       model: "test",
@@ -109,7 +109,7 @@ test("C5: work-item first turn forces toolChoice 'any'; routine continuation rel
 
 test("C5: interactive chat never gets toolChoice forcing", async () => {
   const captured = [];
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: makeToolLoopProvider(captured, { toolRounds: 0 }),
       model: "test",
@@ -127,7 +127,7 @@ test("C5: interactive chat never gets toolChoice forcing", async () => {
 
 test("C5: a failed tool round earns the deep phase (and full effort) back", async () => {
   const captured = [];
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: makeToolLoopProvider(captured),
       model: "test",
@@ -367,7 +367,7 @@ test("C5: home / root / home-parent workspaces are unsnapshotable; project dirs 
 test("C5: a THROWING checkpoint host degrades to no-undo — the tool still runs", async () => {
   const captured = [];
   let toolRan = false;
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider: makeToolLoopProvider(captured),
       model: "test",

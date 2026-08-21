@@ -17,6 +17,7 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
-    "@ares/protocol": "workspace:*"
+    "@ares/protocol": "workspace:*",
+    "better-sqlite3": "^11.8.1"
   }
 }

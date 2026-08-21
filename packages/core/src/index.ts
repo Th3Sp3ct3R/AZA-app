@@ -17,11 +17,17 @@ export {
   adaptiveReasoningLevel,
   guardStreamStalls,
   type QueryEngineConfig,
+  type DurableQueryEngineConfig,
   type Provider,
   type ProviderRequest,
   type ProviderToolDescriptor,
   type EngineTool,
+  type EngineToolEffectPolicy,
   type EngineToolResult,
+  type ToolEffectReconciliationRequest,
+  type ToolEffectReconciliationResult,
+  type ToolEffectRetryPolicy,
+  type ToolSettlementReceipt,
   type ToolCallContext,
   type ToolPermissionRequest,
   type ToolUseBlock,
@@ -46,6 +52,7 @@ export {
   ANTHROPIC_MESSAGES_URL,
   DEFAULT_ANTHROPIC_MODEL,
   fetchAnthropicModels,
+  stripUnpairedWireToolBlocks,
   type AnthropicProviderOptions,
 } from "./providers/anthropic.js";
 
@@ -59,6 +66,28 @@ export {
   type AnthropicOAuthTokens,
   type AnthropicAuthChallenge,
 } from "./providers/anthropicAuth.js";
+
+export {
+  runKimiLoginFlow,
+  requestKimiDeviceAuthorization,
+  pollKimiDeviceToken,
+  refreshKimiTokens,
+  forceRefreshKimiAccessToken,
+  resolveKimiTokens,
+  resolveKimiAccessToken,
+  loadKimiTokens,
+  saveKimiTokens,
+  kimiAuthStatus,
+  kimiAuthFilePath,
+  kimiLogout,
+  fetchKimiModels,
+  KIMI_CODING_BASE_URL,
+  type KimiModel,
+  type KimiTokens,
+  type KimiAuthStatus,
+  type KimiDeviceAuthorization,
+  type KimiLoginOptions,
+} from "./providers/kimiAuth.js";
 
 export {
   sideQuery,
@@ -79,6 +108,7 @@ export {
   type FleetSpec,
   type FleetPhaseSpec,
   type FleetAgentSpec,
+  type FleetPersonaDef,
   type FleetReduce,
   type FleetResult,
   type PhaseResult,
@@ -97,11 +127,15 @@ export {
   SubagentRegistry,
   AresSubagentRunner,
   BUILT_IN_SUBAGENT_TYPES,
+  SUBAGENT_SESSION_TRANSITION_TOOLS,
+  scopeSubagentTools,
   type SubagentRunner,
   type SubagentRunnerOptions,
   type SubagentTypeDef,
   type SubagentRunRequest,
   type SubagentRunResult,
+  type BackgroundSubagentStart,
+  type BackgroundSubagentSnapshot,
 } from "./subagents.js";
 
 export {
@@ -117,11 +151,16 @@ export {
   telemetryDir,
   type FrictionTurn,
   type FrictionSummary,
+  type FrictionSource,
+  type FrictionDiagnostic,
+  type FrictionSessionLocation,
+  type FrictionRecorderOptions,
 } from "./frictionLog.js";
 
 export {
   ContinuousVerifier,
   deriveNarrowVerify,
+  deriveScopedVerify,
   findRelatedTestFiles,
   triageVerifyOutput,
   type VerifierOptions,
@@ -131,12 +170,92 @@ export {
   type WorkspaceSetup,
   type CommandRunner,
   type VerifyCacheStats,
+  type VerificationEvidenceSnapshot,
 } from "./verifier.js";
+
+export {
+  createVerifiedChildSession,
+  confirmChildTurnEnd,
+  loadChildVerificationDebt,
+  type ChildVerificationDebt,
+  type VerifiedChildSession,
+  type VerifiedChildSessionOptions,
+} from "./childSessionVerifier.js";
+
+export {
+  CHILD_SESSION_COMPOSITION_PROFILES,
+  composeVerifiedChildSession,
+  composeVerifiedChildSessionSync,
+  withComposedVerifiedChildSession,
+  type ChildSessionSurface,
+  type ChildSessionCleanupPolicy,
+  type ChildSessionCompositionOptions,
+  type ChildSessionCompositionReceipt,
+  type ComposedVerifiedChildSession,
+} from "./childSessionComposition.js";
+
+export {
+  buildRepositoryMap,
+  renderRepositoryMap,
+  repositoryMapReminder,
+  type RepositoryMap,
+  type RepositoryPackageMap,
+  type RepositoryMapOptions,
+} from "./repoCartography.js";
+
+export {
+  CodingJournal,
+  normalizeFailure,
+  failureDigest,
+  type CodingJournalOptions,
+  type CodingJournalState,
+  type CodingPhase,
+  type CodingCheckRecord,
+  type CodingFailureRecord,
+} from "./codingJournal.js";
+
+export {
+  registerSessionLocation,
+  listRegisteredSessionLocations,
+  readSessionLocation,
+  writeSessionLocationAtomic,
+  sessionLocationRegistryDir,
+  sessionLocationFile,
+  hashWorkspaceIdentity,
+  type SessionLocation,
+  type SessionLocationRecord,
+  type SessionLocationSource,
+  type SessionRolloutFormat,
+  type RegisterSessionLocationInput,
+  type SessionRegistryOptions,
+} from "./sessionRegistry.js";
+
+export {
+  runReliabilityTriage,
+  listReliabilityFindings,
+  loadReliabilityFinding,
+  resolveReliabilitySource,
+  updateReliabilityFindingStatus,
+  reliabilityTriagePaths,
+  type ReliabilityFindingStatus,
+  type ReliabilitySeverity,
+  type ReliabilityCategory,
+  type ReliabilitySignalKind,
+  type ReliabilityEvidence,
+  type ReliabilityFinding,
+  type ReliabilityTriageHealth,
+  type ReliabilityTriageCoverage,
+  type ReliabilityTriageRun,
+  type ReliabilityTriageOptions,
+  type ReliabilityTriagePaths,
+} from "./reliabilityTriage.js";
 
 export {
   HookManager,
   type HookConfigEntry,
   type HookEvent,
+  type HookInvocation,
+  type HookInvocationResult,
   type HookRunInput,
   type HookRunResult,
 } from "./hooks.js";
@@ -156,27 +275,50 @@ export {
 export {
   connectMcpServer,
   disconnectMcpServer,
+  setMcpServerEnabled,
+  setMcpServerToken,
+  probeMcpTools,
   getMcpAccessToken,
+  getMcpCallCredentials,
   loadRemoteMcpServers,
   connectorNameFromUrl,
   type RemoteMcpEntry,
   type ConnectMcpOptions,
   type ConnectMcpResult,
+  type SetMcpTokenResult,
+  type McpProbeResult,
 } from "./mcpConnect.js";
 
 export {
   Session,
+  SessionNotFoundError,
+  DEFAULT_SESSION_LEASE_TTL_MS,
+  MIN_SESSION_LEASE_TTL_MS,
+  MAX_SESSION_LEASE_TTL_MS,
+  MIN_SESSION_LEASE_HEARTBEAT_MS,
+  MAX_SESSION_LEASE_HEARTBEAT_MS,
+  resolveSessionLeaseTiming,
   listSessions,
   loadSessionSnapshot,
+  projectMessagesFromKernel,
   loadSessionRollout,
   deleteSession,
   renameSession,
   type SessionOptions,
+  type SessionLeaseTiming,
   type SessionSummary,
   type SessionSnapshot,
   type SessionRollout,
   type LoadSessionSnapshotOptions,
 } from "./session.js";
+
+export {
+  planArtifactPath,
+  planArtifactRelativePath,
+  renderApprovedPlanBuildHandoff,
+  renderPlanArtifact,
+  writePlanArtifact,
+} from "./planArtifact.js";
 
 export {
   createWorkspaceCheckpoint,
@@ -200,12 +342,17 @@ export {
   authFilePath,
   aresHome,
   deviceCodeLogin,
+  runOpenAILoginFlow,
+  refreshOpenAIToken,
+  fetchCodexModels,
+  type CodexModel,
   type AuthToken,
   type AuthStatus,
   type AuthMode,
   type AuthSource,
   type DeviceCodeChallenge,
   type DeviceCodeLoginOptions,
+  type OpenAILoginOptions,
 } from "./providers/openaiAuth.js";
 
 export {
@@ -213,10 +360,12 @@ export {
   DEFAULT_OLLAMA_SLOTS,
   OLLAMA_CLOUD_MODELS,
   ollamaCloudModelsFor,
+  fetchOllamaLibraryModels,
   type SlotName,
   type SlotConfig,
   type OllamaCloudPoolOptions,
   type OllamaCloudModel,
+  type OllamaLibraryModel,
 } from "./providers/ollamaCloud.js";
 
 export {
@@ -231,6 +380,8 @@ export {
   type OpenRouterProviderOptions,
   type OpenRouterModel,
 } from "./providers/openrouter.js";
+
+export { narrowToolSchema } from "./providers/toolSchema.js";
 
 export { buildPromptCacheKey, type PromptCacheKey } from "./promptCache.js";
 
@@ -322,6 +473,18 @@ export {
 } from "./startupContext.js";
 
 export {
+  RepositoryInstructionResolver,
+  REPOSITORY_INSTRUCTION_FILES,
+  MAX_REPOSITORY_INSTRUCTION_CHARS,
+  renderRepositoryInstructions,
+  repositoryInstructionClaimsFromMessages,
+  isRepositoryInstructionClaim,
+  type RepositoryInstructionContext,
+  type RepositoryInstructionClaim,
+  type ResolvedRepositoryInstruction,
+} from "./repositoryInstructions.js";
+
+export {
   crashDir,
   writeCrashLogSync,
   installGlobalCrashHandlers,
@@ -330,6 +493,15 @@ export {
   type CrashRecord,
   type CrashHandlerOptions,
 } from "./crashLog.js";
+
+export {
+  HeapGuard,
+  readHeapSample,
+  type HeapPressure,
+  type HeapSample,
+  type HeapVerdict,
+  type HeapGuardOptions,
+} from "./memoryGuard.js";
 
 export {
   parsePatch,
@@ -349,3 +521,35 @@ export {
   CHANGE_CONTEXT_MARKER,
   EMPTY_CHANGE_CONTEXT_MARKER,
 } from "./applyPatch/parser.js";
+
+export {
+  WorkspaceMutationService,
+  WorkspaceMutationError,
+  applyWorkspaceMutation,
+  rollbackWorkspaceMutation,
+  reconcileWorkspaceMutation,
+  workspaceContentHash,
+  type WorkspaceMutationOperation,
+  type WorkspaceMutationOptions,
+  type WorkspaceMutationReceiptOperation,
+  type WorkspaceMutationReceipt,
+  type WorkspaceMutationReconciliation,
+  type WorkspaceMutationErrorCode,
+  type ReconciledPathState,
+} from "./workspaceMutation.js";
+
+export {
+  PostMutationFeedbackService,
+  committedFilesFromReceipt,
+  inspectPostMutationFeedback,
+  renderPostMutationFeedback,
+  type PostMutationCommittedFile,
+  type PostMutationFeedback,
+  type PostMutationFeedbackFile,
+  type PostMutationFeedbackCheck,
+  type PostMutationFeedbackKind,
+  type PostMutationFeedbackCheckStatus,
+  type PostMutationFeedbackOptions,
+} from "./postMutationFeedback.js";
+
+export * from "./sessionKernel/index.js";

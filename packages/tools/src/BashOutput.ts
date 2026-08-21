@@ -29,9 +29,9 @@ export function makeBashOutputTool(registry: ShellRegistry) {
     concurrency: "parallel-safe",
     inputZod: inputSchema,
     activityDescription: (i) => `BashOutput ${i.shell_id}`,
-    async call(i): Promise<{ output: BashOutputResult; display: string }> {
+    async call(i, ctx): Promise<{ output: BashOutputResult; display: string }> {
       const filter = i.filter ? new RegExp(i.filter) : undefined;
-      const polled = registry.poll(i.shell_id, "bash-output-tool", filter);
+      const polled = (ctx.shellRegistry ?? registry).poll(i.shell_id, "bash-output-tool", filter, ctx.sessionId);
       if (!polled) {
         throw new Error(`unknown shell: ${i.shell_id}. Use Bash list to see active shells.`);
       }

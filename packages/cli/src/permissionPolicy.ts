@@ -50,6 +50,7 @@ export const SENSITIVE_PERMISSION = new RegExp(
     "computer ?use", "control (the )?(mouse|keyboard|screen|desktop)",
     "\\bdeploy\\b", "\\bstripe\\b", "payment link", "\\bemail\\b",
     "request[_ ]?user[_ ]?action", "hand off", "needs you",
+    "exit ?plan ?mode", "approve this plan", "leave plan mode",
   ].join("|"),
   "i",
 );
@@ -84,6 +85,14 @@ export function decidePermission(
 ): PolicyOutcome {
   const p = { ...DEFAULT_PERMISSIONS, ...(settings ?? {}) };
   const cat = classifyPermissionRequest(request);
+
+  // A WORKFLOW decision is never auto-answered — not even in free/YOLO mode.
+  // YOLO means "stop asking before you write files and run commands"; it does
+  // not mean "decide on my behalf whether this plan is ready to build". A live
+  // session had the plan→build crossing auto-approved 11ms after it was raised,
+  // so the session left plan mode with nobody consulted. A fleet leaf can't
+  // prompt, so for a leaf this is a refusal rather than a silent yes.
+  if (request.ownerDecision) return opts.fleet ? "deny" : "ask";
 
   let outcome: "allow" | "ask";
   if (p.mode === "free") {

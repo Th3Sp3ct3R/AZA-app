@@ -22,6 +22,8 @@ export function createGoal(input: {
   missionIds?: string[];
   maxNoProgress?: number;
   verification?: VerificationSpec;
+  mode?: Goal["mode"];
+  consent?: Goal["consent"];
   now?: Date;
 }): Goal {
   const at = (input.now ?? new Date()).toISOString();
@@ -31,6 +33,8 @@ export function createGoal(input: {
     id: input.id,
     statement,
     status: "active",
+    ...(input.mode ? { mode: input.mode } : {}),
+    ...(input.consent ? { consent: input.consent } : {}),
     missionIds: input.missionIds ?? [],
     progress: 0,
     noProgressStreak: 0,
@@ -97,6 +101,7 @@ export function applyVerdict(goal: Goal, verdict: StepVerdict, now = new Date(),
     moved: verdict.moved,
     goalMet: verdict.goalMet,
     unverified: verdict.unverified || undefined,
+    workStatus: verdict.workStatus,
     evidence: verdict.evidence?.trim() || undefined,
     prediction: verdict.prediction,
   };

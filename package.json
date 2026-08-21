@@ -1,6 +1,6 @@
 {
   "name": "ares",
-  "version": "0.20.1",
+  "version": "0.43.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -13,10 +13,10 @@
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
     "lint": "pnpm check",
-    "test": "pnpm build && node --test tests/*.test.mjs",
+    "test": "pnpm build && node --import ./tests/_isolate-home.mjs --test --test-concurrency=4 tests/*.test.mjs",
     "ares": "node packages/cli/dist/entry.js",
-    "install:cli": "powershell -ExecutionPolicy Bypass -File scripts/install.ps1",
-    "uninstall:cli": "powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1",
+    "install:cli": "node scripts/install-cli.mjs",
+    "uninstall:cli": "node scripts/uninstall-cli.mjs",
     "link:cli": "pnpm build && pnpm link --global",
     "verify": "pnpm lint && pnpm test",
     "clean": "node scripts/clean.mjs",

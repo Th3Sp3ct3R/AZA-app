@@ -83,12 +83,12 @@ test("confirmed knowledge whose check starts failing is demoted — beliefs lose
   const { dir, store } = await makeStore();
   const node = await store.add({
     kind: "semantic",
-    content: "the legacy crix.ps1 launcher exists",
+    content: "the legacy launcher exists",
     status: "confirmed",
-    check: { type: "file_exists", path: "crix.ps1" },
+    check: { type: "file_exists", path: "legacy-launcher.ps1" },
   });
 
-  const report = await runCrucibleTrials({ store, probe: probeReturning({ "crix.ps1": false }) });
+  const report = await runCrucibleTrials({ store, probe: probeReturning({ "legacy-launcher.ps1": false }) });
   assert.equal(report.demoted, 1);
   const demoted = store.get(node.id);
   assert.equal(demoted.status, "candidate");

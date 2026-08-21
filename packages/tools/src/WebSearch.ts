@@ -92,18 +92,33 @@ export function withFallback(backends: SearchBackend[]): SearchBackend {
   return {
     name: backends.map((b) => b.name).join("→"),
     async search(query, signal) {
-      let lastError: unknown = null;
+      // "Not configured" (no key / no instance URL) is a SKIP, not a failure —
+      // it used to be held as lastError and thrown after a legit zero-result
+      // scrape, so a keyless setup surfaced "SearXNG: no instance URL" as a
+      // tool error whenever DuckDuckGo simply found nothing.
+      let lastRealError: unknown = null;
+      const skipped: string[] = [];
+      let anyBackendRan = false;
       for (const backend of backends) {
         try {
           const results = await backend.search(query, signal);
+          anyBackendRan = true;
           if (results.length > 0) return results;
         } catch (err) {
-          lastError = err;
           if (signal.aborted) throw err;
+          if (err instanceof Error && /no API key|no instance URL/i.test(err.message)) {
+            skipped.push(backend.name);
+            continue;
+          }
+          lastRealError = err;
         }
       }
-      if (lastError) throw lastError instanceof Error ? lastError : new Error(String(lastError));
-      return [];
+      // A real backend ran and found nothing — that IS the answer.
+      if (anyBackendRan) return [];
+      if (lastRealError) throw lastRealError instanceof Error ? lastRealError : new Error(String(lastRealError));
+      throw new Error(
+        `No search backend is configured (unconfigured: ${skipped.join(", ") || "all"}). Add a Brave or Tavily API key, or set ARES_SEARXNG_URL to a SearXNG instance.`,
+      );
     },
   };
 }

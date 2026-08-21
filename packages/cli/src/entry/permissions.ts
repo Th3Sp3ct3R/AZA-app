@@ -194,30 +194,40 @@ function autoPermissionDecision(request: ToolPermissionRequest): PermissionPromp
 }
 
 export async function promptPermission(request: ToolPermissionRequest): Promise<PermissionPromptDecision> {
+  if (request.signal?.aborted) return "deny";
   process.stderr.write("\n" + permissionPrompt(request));
-  const key = await readPermissionKey();
+  const key = await readPermissionKey(request.signal);
   process.stderr.write(`${key}\n`);
   if (key === "1") return "allow_once";
   if (key === "2") return "allow_always";
   return "deny";
 }
 
-async function readPermissionKey(): Promise<"1" | "2" | "3"> {
+async function readPermissionKey(signal?: AbortSignal): Promise<"1" | "2" | "3"> {
   const stream = stdin as typeof stdin & {
     setRawMode?: (mode: boolean) => void;
     isRaw?: boolean;
   };
   if (!stdin.isTTY || !stream.setRawMode) {
-    return readPermissionLine();
+    return readPermissionLine(signal);
   }
 
   return new Promise((resolve) => {
     const wasRaw = stream.isRaw === true;
+    let settled = false;
     const cleanup = () => {
       stdin.off("data", onData);
+      signal?.removeEventListener("abort", onAbort);
       if (!wasRaw) stream.setRawMode?.(false);
       stdin.pause();
     };
+    const settle = (key: "1" | "2" | "3") => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(key);
+    };
+    const onAbort = () => settle("3");
     const onData = (chunk: Buffer) => {
       const key = chunk.toString("utf8");
       if (key === "\u0003") {
@@ -226,8 +236,7 @@ async function readPermissionKey(): Promise<"1" | "2" | "3"> {
         process.exit(130);
       }
       if (key === "1" || key === "2" || key === "3") {
-        cleanup();
-        resolve(key);
+        settle(key);
         return;
       }
       process.stderr.write("\x07");
@@ -235,14 +244,22 @@ async function readPermissionKey(): Promise<"1" | "2" | "3"> {
     stream.setRawMode(true);
     stdin.resume();
     stdin.on("data", onData);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-async function readPermissionLine(): Promise<"1" | "2" | "3"> {
+async function readPermissionLine(signal?: AbortSignal): Promise<"1" | "2" | "3"> {
   const rl = createInterface({ input: stdin, output: stderr });
   try {
     while (true) {
-      const answer = (await rl.question("Choose 1, 2, or 3: ")).trim();
+      let answer: string;
+      try {
+        answer = (await rl.question("Choose 1, 2, or 3: ", { signal })).trim();
+      } catch (error) {
+        if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) return "3";
+        throw error;
+      }
       if (answer === "1" || answer === "2" || answer === "3") return answer;
       process.stderr.write("Please enter 1, 2, or 3.\n");
     }

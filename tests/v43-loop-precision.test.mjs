@@ -64,7 +64,7 @@ async function collect(engine) {
 }
 
 function makeEngine(provider, tools, maxTurns = 80) {
-  const engine = new QueryEngine({ provider, model: "test", systemPrompt: "t", tools, workspace: "D:\\Ares", maxTurns }, "sess_lp");
+  const engine = QueryEngine.forTesting({ provider, model: "test", systemPrompt: "t", tools, workspace: "D:\\Ares", maxTurns }, "sess_lp");
   engine.appendUserMessage("go");
   return engine;
 }

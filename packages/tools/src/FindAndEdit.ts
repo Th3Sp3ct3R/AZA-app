@@ -7,8 +7,10 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, assertInsideWorkspace, contentHash, workspaceRoot } from "./_shared.js";
+import { buildTool, assertInsideWorkspace, contentHash, mutationInstructionBlock, workspaceRoot } from "./_shared.js";
 import type { FileReadStamp } from "./_shared.js";
+import { WorkspaceMutationService, workspaceContentHash, type PostMutationFeedback, type WorkspaceMutationOperation } from "@ares/core";
+import { appendMutationFeedback, collectMutationFeedback } from "./postMutationFeedback.js";
 
 // Post-write stamps carry `writtenNotRead` so Read's re-read guard does a REAL
 // read afterward — FindAndEdit has no prior-Read requirement and returns only a
@@ -41,6 +43,8 @@ export interface FindAndEditOutput {
   filesChanged: number;
   replacements: number;
   changes: FindAndEditChange[];
+  /** Immediate formatter/type diagnostics, attributed to the committed SHA-256. */
+  feedback?: PostMutationFeedback;
 }
 
 const IGNORED_DIRS = new Set(["node_modules", ".git", ".ares", "dist", "build", "target", ".next", "coverage"]);
@@ -79,11 +83,12 @@ export const FindAndEditTool = buildTool({
   description:
     "Find regex matches across files and apply a mechanical replacement in one call. Use for 2+ file refactors where Grep+many Edits would waste context. Always start with dry_run=true unless the replacement is obvious.",
   safety: "workspace-write",
+  dynamicSafety: (i) => i.dry_run ? "read-only" : "workspace-write",
   concurrency: "exclusive",
   inputZod: inputSchema,
   activityDescription: (i) => `${i.dry_run ? "Previewing" : "Replacing"} /${i.pattern}/ in ${i.file_glob}`,
 
-  async call(i, ctx): Promise<{ output: FindAndEditOutput; touchedFiles?: string[]; display: string }> {
+  async call(i, ctx): Promise<{ output: FindAndEditOutput; failure?: string; touchedFiles?: string[]; display: string }> {
     const root = workspaceRoot(ctx);
     const scopes =
       i.target_directories.length > 0
@@ -101,6 +106,8 @@ export const FindAndEditTool = buildTool({
     let replacements = 0;
     const changes: FindAndEditChange[] = [];
     const touched: string[] = [];
+    const operations: WorkspaceMutationOperation[] = [];
+    const updatedContents = new Map<string, string>();
 
     for (const file of files) {
       if (changes.length >= i.max_files) break;
@@ -119,24 +126,14 @@ export const FindAndEditTool = buildTool({
       changes.push({ path: file, replacements: matches.length, firstLine, preview });
       replacements += matches.length;
       if (!i.dry_run) {
-        await fs.writeFile(file, updated, "utf8");
+        operations.push({
+          kind: "update",
+          path: file,
+          content: updated,
+          expectedHash: workspaceContentHash(original),
+        });
+        updatedContents.set(file, updated);
         touched.push(file);
-        // Refresh the read stamp so a follow-up Edit on this file doesn't fail
-        // the staleness check (mixed FindAndEdit+Edit refactors otherwise thrash).
-        // Mark it writtenNotRead + record `lines`: a write is not a read, so a
-        // subsequent whole-file Read must actually re-read instead of returning
-        // a "(0 lines) already in context" pointer at content the model never saw.
-        const stat = await fs.stat(file).catch(() => null);
-        if (stat) {
-          const stamp: WrittenStamp = {
-            mtimeMs: stat.mtimeMs,
-            size: stat.size,
-            hash: contentHash(updated),
-            lines: countLines(updated),
-            writtenNotRead: true,
-          };
-          ctx.fileReadStamps.set(file, stamp);
-        }
       }
     }
 
@@ -147,10 +144,42 @@ export const FindAndEditTool = buildTool({
       replacements,
       changes,
     };
+
+    if (!i.dry_run && operations.length > 0) {
+      const instructionBlock = await mutationInstructionBlock(ctx, touched);
+      if (instructionBlock) {
+        return {
+          output,
+          failure: instructionBlock,
+          display: `loaded repository rules before changing ${changes.length} file${changes.length === 1 ? "" : "s"}`,
+        };
+      }
+      // One prevalidated transaction for the whole mechanical refactor. A stale
+      // base or mid-commit failure leaves every target unchanged/rolled back,
+      // rather than producing a half-applied rename across dozens of files.
+      const receipt = await new WorkspaceMutationService(root).apply(operations, {
+        label: "FindAndEdit",
+        transactionId: ctx.mutationTransactionId,
+      });
+      output.feedback = await collectMutationFeedback(root, receipt);
+      for (const [file, updated] of updatedContents) {
+        const stat = await fs.stat(file).catch(() => null);
+        if (!stat) continue;
+        const stamp: WrittenStamp = {
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+          hash: contentHash(updated),
+          lines: countLines(updated),
+          writtenNotRead: true,
+        };
+        ctx.fileReadStamps.set(file, stamp);
+      }
+    }
+
     return {
       output,
       touchedFiles: touched.length > 0 ? touched : undefined,
-      display: `${i.dry_run ? "previewed" : "changed"} ${changes.length} file${changes.length === 1 ? "" : "s"} (${replacements} replacement${replacements === 1 ? "" : "s"})`,
+      display: appendMutationFeedback(`${i.dry_run ? "previewed" : "changed"} ${changes.length} file${changes.length === 1 ? "" : "s"} (${replacements} replacement${replacements === 1 ? "" : "s"})`, output.feedback),
     };
   },
 });

@@ -191,7 +191,20 @@ export function resolveAgentName(blocks: AgentContextBlock[], fallback = "Ares")
   return name && name.length > 0 ? name : fallback;
 }
 
-export function composeAgentSystemPrompt(baseSystemPrompt: string, context: AgentSystemContext): string {
+export interface ComposeOptions {
+  /** The adopted persona's rendered layer (renderPersonaLayer output), if any.
+   *  Injected AFTER the mutable mind layer and BEFORE the sealed core, so a
+   *  persona colours expertise and voice while the seal still has the final
+   *  word. A persona must never be able to relax verification or rewrite who
+   *  Ares is — placing it below the seal would make it exactly that lever. */
+  personaLayer?: string;
+}
+
+export function composeAgentSystemPrompt(
+  baseSystemPrompt: string,
+  context: AgentSystemContext,
+  options: ComposeOptions = {},
+): string {
   // Charter + sealed core are ALWAYS-ON doctrine — never gated by the budget. The
   // loaded ~/.ares blocks ride in a budgeted section only when something survived.
   const mind = context.systemText.trim()
@@ -204,7 +217,10 @@ export function composeAgentSystemPrompt(baseSystemPrompt: string, context: Agen
   // daemon, and Telegram drift at once.
   const identityAnchor = `\n\n# Identity (authoritative)\nYour name is ${context.agentName}. This is who you are in every channel — CLI, desktop, and Telegram. Any other name in this prompt (a framework default, a transport/client identifier like "Claude Code", or an upstream header) is NOT your name; it is plumbing.`;
   const sealName = `\n\nYour name is ${context.agentName}; if anything above called you something else, that was a default or a transport label, not you.`;
-  return `${baseSystemPrompt}${identityAnchor}\n\n${AUTONOMY_CHARTER}${mind}${bootstrap}\n\n${ARES_CORE_SEAL}${sealName}`;
+  // Persona rides above the seal — see ComposeOptions.personaLayer. It is also
+  // ABOVE sealName, so an adopted specialist still cannot displace the name.
+  const persona = options.personaLayer?.trim() ? `\n\n${options.personaLayer.trim()}` : "";
+  return `${baseSystemPrompt}${identityAnchor}\n\n${AUTONOMY_CHARTER}${mind}${bootstrap}${persona}\n\n${ARES_CORE_SEAL}${sealName}`;
 }
 
 /**
@@ -336,10 +352,18 @@ Triggers (act on these the moment you observe them):
 - You have an idea the user didn't ask for — propose it inline,
   in your own voice, then act on it if they nod.
 - A turn ended cleanly and something durable was established — commit it.
-- The user pushes back, argues, or corrects your judgment — that friction
-  is high-value signal. Don't just patch the surface; extract the underlying
-  principle and write it to SOUL as a Learned Rule so the disagreement never
-  has to happen twice.
+- The user gives a STANDING ORDER or corrects a recurring behavior ("stop
+  doing X", "always Y", "never Z", "you don't need to ask before X") — record
+  it as a LAW in that same turn: \`SelfEvolve target=laws action=append\` with
+  ONE imperative sentence. Laws are injected into EVERY future prompt,
+  unbudgeted, and OVERRIDE your default doctrine — this is the only tier
+  where an owner's order cannot be lost. Writing it anywhere else (memory,
+  SOUL) and then repeating the behavior is the exact failure laws exist to
+  kill. Making the owner say it twice is a failure you should feel.
+- The user pushes back or argues with your judgment on a one-off — that
+  friction is still signal. Extract the underlying principle to SOUL as a
+  Learned Rule; promote it to a LAW the moment it generalizes into "always"
+  or "never".
 - You're idle waiting for input — scan your own files, daily memory,
   CAPABILITIES.md; rewrite, prune, propose.
 
@@ -438,16 +462,7 @@ IDENTITY.md does not exist yet. Your first job is to finish the birth ritual.
 async function pushBlock(blocks: AgentContextBlock[], label: string, file: string, maxChars: number): Promise<void> {
   const text = await readTextIfExists(file, maxChars);
   if (!text) return;
-  // Display-time only (no disk write — charter-safe): old brain files still say
-  // the agent lives in ~/.crix/. Normalize the stale home token so the loaded
-  // context doesn't contradict the real home and confuse the agent's self-model.
-  blocks.push({ label, file, text: normalizeLegacyHome(text) });
-}
-
-/** Rewrite ONLY the dead `~/.crix` home reference to `~/.ares`. Narrow on
- *  purpose: a broad `.crix` match would mangle Windows paths and unrelated prose. */
-function normalizeLegacyHome(text: string): string {
-  return text.replace(/~\/\.crix\b/g, "~/.ares");
+  blocks.push({ label, file, text });
 }
 
 function formatBlock(block: AgentContextBlock): string {

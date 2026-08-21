@@ -18,9 +18,13 @@ const INSIGHT_EPISODES = [
   "that shopify checkout flow redesign",
   "with shopify checkout flow redesign",
 ];
+// Three, not two: recurring-failure beliefs now require minMembers = 3 — at 2,
+// the pass amplified stored error noise into "recurring failure" beliefs
+// (field report 2026-08-06).
 const FAILURE_EPISODES = [
   "this kubernetes deploy rollback failed",
   "that kubernetes deploy rollback failed",
+  "with kubernetes deploy rollback failed",
 ];
 
 async function seed() {
@@ -34,8 +38,10 @@ test("synthesis: crystallizes one insight + one belief offline, with provenance"
   const store = await seed();
   const report = await store.synthesize();
 
-  assert.equal(report.insights, 1, "one recurring-pattern insight from the 3 shopify episodes");
-  assert.equal(report.beliefs, 1, "one recurring-failure belief from the 2 kubernetes episodes");
+  // The kubernetes trio crosses BOTH thresholds now that failures need 3
+  // members: it recurs as a pattern (insight) and as a failure (belief).
+  assert.equal(report.insights, 2, "recurring-pattern insights from the shopify AND kubernetes trios");
+  assert.equal(report.beliefs, 1, "one recurring-failure belief from the 3 kubernetes episodes");
 
   const insight = store.all().find((n) => n.tags?.some((t) => t.startsWith("insight:")));
   const belief = store.all().find((n) => n.tags?.some((t) => t.startsWith("belief:")));
@@ -50,7 +56,7 @@ test("synthesis: crystallizes one insight + one belief offline, with provenance"
   // Offline path uses the deterministic template, not an LLM.
   assert.match(insight.content, /^Recurring pattern across 3 episodes/);
 
-  assert.equal(belief.derivedFrom.length, 2, "belief cites its 2 source failures");
+  assert.equal(belief.derivedFrom.length, 3, "belief cites its 3 source failures");
   assert.match(belief.content, /^Recurring failure mode/);
 });
 
@@ -64,7 +70,7 @@ test("synthesis: idempotent by tag — re-running updates, never duplicates", as
 
   assert.equal(second.insights, 0, "no new insight on the second pass");
   assert.equal(second.beliefs, 0, "no new belief on the second pass");
-  assert.equal(second.updated, 2, "both existing synthesis nodes were updated");
+  assert.equal(second.updated, 3, "all existing synthesis nodes were updated");
   assert.equal(after, before, "synthesis node count is unchanged (no duplicates)");
 });
 

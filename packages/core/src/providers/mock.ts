@@ -17,6 +17,9 @@ export class MockEchoProvider implements Provider {
   async *stream(req: ProviderRequest): AsyncGenerator<StreamEvent> {
     const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
     const inputText = lastUser ? messageText(lastUser) : "";
+    if (inputText.includes("__mock_fail_provider__")) {
+      throw new Error("injected mock provider failure");
+    }
     if (inputText.includes("__mock_request_stats__")) {
       const totalChars = req.messages.reduce((sum, message) => sum + messageText(message).length, 0);
       const replyText = [
@@ -60,8 +63,16 @@ export class MockEchoProvider implements Provider {
     }
     const replyText = `echo: ${inputText}`;
 
+    const steeringWindow = inputText.includes("__mock_steer_window__");
+    let chunkIndex = 0;
     for (const chunk of chunkString(replyText, 8)) {
       yield { type: "text_delta", text: chunk };
+      // Deterministic daemon integration seam: let stdin deliver a correction
+      // after the first visible delta without generating thousands of chunks or
+      // depending on host CPU scheduling.
+      if (steeringWindow && chunkIndex++ === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
     }
 
     const message: Message = {

@@ -40,6 +40,33 @@ export async function ensureToken(home: string): Promise<string> {
   return token;
 }
 
+/** The READ-ONLY companion token at <home>/garrison/token-read. A client that
+ *  says hello with this one can list, attach and replay history, but every
+ *  write frame (send/interrupt/permission/approval) is refused — safe to put
+ *  on a phone via the viewer without handing over the keys to the session. */
+export function readTokenPath(home: string): string {
+  return path.join(garrisonDir(home), "token-read");
+}
+
+export async function ensureReadToken(home: string): Promise<string> {
+  const file = readTokenPath(home);
+  try {
+    const existing = (await fs.readFile(file, "utf8")).trim();
+    if (TOKEN_PATTERN.test(existing)) return existing;
+  } catch {
+    // Missing or unreadable — mint a fresh one.
+  }
+  const token = randomBytes(16).toString("hex");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, token + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    await fs.chmod(file, 0o600);
+  } catch {
+    // Best-effort on platforms without POSIX modes.
+  }
+  return token;
+}
+
 /** Timing-safe string comparison for token checks. */
 export function constantTimeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a, "utf8");

@@ -1,5 +1,5 @@
 // Verifies the feedback loop: acting tools write outcomes into the self-model.
-//   1. SkillCraft create registers a capability node.
+//   1. SkillCraft create registers an acquiring capability node.
 //   2. RunSkill success + failure accumulate run stats on that node.
 //   3. SkillCraft remove drops the node.
 //   4. Mission verify(pass/fail) records the aggregate mission outcome.
@@ -39,7 +39,7 @@ test("SkillCraft create registers a capability node in the self-model", async ()
     const cap = getCapability(await loadSelfModel(home), "skill/greeter");
     assert.ok(cap, "capability registered");
     assert.equal(cap.kind, "skill");
-    assert.equal(cap.status, "have");
+    assert.equal(cap.status, "acquiring");
     assert.deepEqual(cap.tags, ["runnable"]);
   });
 });

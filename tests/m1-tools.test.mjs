@@ -29,6 +29,7 @@ async function makeTmp() {
 function ctx(workspace) {
   return {
     workspace,
+    sessionId: "sess_m1_tools",
     signal: new AbortController().signal,
     permissionMode: "workspace-write",
     fileReadStamps: new Map(),
@@ -401,6 +402,85 @@ test("Bash: runs echo and returns stdout", async () => {
   );
   assert.equal(r.output.exitCode, 0, r.output.stderr || r.output.stdout);
   assert.match(r.output.stdout, /hello/);
+  assert.equal(r.failure, undefined);
+});
+
+test("Bash: non-zero exit preserves diagnostics and declares failure", async () => {
+  const tmp = await makeTmp();
+  const adapted = adaptToolForEngine(BashTool, (base) => ({ ...ctx(tmp), ...base }));
+  const r = await adapted.call(
+    {
+      command: "printf 'stdout-marker'; printf 'stderr-marker' >&2; exit 7",
+      description: "test failed command diagnostics",
+      timeout: 30000,
+    },
+    {
+      workspace: tmp,
+      sessionId: "sess_shell_failure",
+      signal: new AbortController().signal,
+    },
+  );
+
+  assert.equal(r.failure, "Bash exited with code 7");
+  assert.equal(r.output.exitCode, 7);
+  assert.equal(r.output.timedOut, false);
+  assert.match(r.output.stdout, /stdout-marker/);
+  assert.match(r.output.stderr, /stderr-marker/);
+});
+
+test("Bash: timeout preserves partial diagnostics and declares failure", async () => {
+  const tmp = await makeTmp();
+  // 4s window, not 1s: `bash -lc` is a login shell, and its cold start under
+  // load routinely exceeds 1s on Windows — the markers then never print before
+  // the kill and this test flakes on empty output. The semantics under test
+  // (partial output survives a timeout) don't care how wide the window is.
+  const r = await BashTool.call(
+    {
+      command: "printf 'timeout-stdout'; printf 'timeout-stderr' >&2; sleep 20",
+      description: "test timeout diagnostics",
+      timeout: 4000,
+    },
+    ctx(tmp),
+  );
+
+  assert.equal(r.failure, "Bash timed out after 4000ms");
+  assert.equal(r.output.timedOut, true);
+  assert.ok(Object.hasOwn(r.output, "exitCode"));
+  assert.match(r.output.stdout, /timeout-stdout/);
+  assert.match(r.output.stderr, /timeout-stderr/);
+});
+
+test("Bash: successful background launch is not declared failed", async () => {
+  const tmp = await makeTmp();
+  const r = await BashTool.call(
+    {
+      command: "sleep 30",
+      description: "test background launch",
+      timeout: 30000,
+      run_in_background: true,
+    },
+    {
+      ...ctx(tmp),
+      shellRegistry: {
+        async spawn(options) {
+          return {
+            id: "sh_contract",
+            description: options.description,
+            command: `${options.program} ${options.args.join(" ")}`,
+            cwd: options.cwd,
+            status: "running",
+            exitCode: null,
+            startedAt: new Date().toISOString(),
+            totalChars: 0,
+          };
+        },
+      },
+    },
+  );
+
+  assert.equal(r.failure, undefined);
+  assert.equal(r.output.status, "running");
+  assert.equal(r.output.shell_id, "sh_contract");
 });
 
 test("PowerShell: rejects cwd outside workspace before spawning", async () => {
@@ -425,6 +505,75 @@ test("PowerShell: runs Write-Output", async () => {
   );
   assert.equal(r.output.exitCode, 0);
   assert.match(r.output.stdout, /ok/);
+  assert.equal(r.failure, undefined);
+});
+
+test("PowerShell: non-zero exit preserves diagnostics and declares failure", async () => {
+  if (process.platform !== "win32") return;
+  const tmp = await makeTmp();
+  const r = await PowerShellTool.call(
+    {
+      command: "Write-Output 'stdout-marker'; [Console]::Error.WriteLine('stderr-marker'); exit 9",
+      description: "test failed command diagnostics",
+      timeout: 30000,
+    },
+    ctx(tmp),
+  );
+
+  assert.equal(r.failure, "PowerShell exited with code 9");
+  assert.equal(r.output.exitCode, 9);
+  assert.equal(r.output.timedOut, false);
+  assert.match(r.output.stdout, /stdout-marker/);
+  assert.match(r.output.stderr, /stderr-marker/);
+});
+
+test("PowerShell: timeout preserves partial diagnostics and declares failure", async () => {
+  if (process.platform !== "win32") return;
+  const tmp = await makeTmp();
+  // The timeout must outlast the interpreter's cold start, or the process is
+  // killed before it reaches Write-Output and the empty stdout this test would
+  // report as a bug is simply correct. Startup is ~1.5s on a normal Windows box
+  // and worse under load, so measure it here instead of guessing a constant.
+  const startupProbe = Date.now();
+  await PowerShellTool.call({ command: "Write-Output 'warm'", description: "measure startup", timeout: 60_000 }, ctx(tmp));
+  const startupMs = Date.now() - startupProbe;
+  const timeout = startupMs + 2000;
+  const r = await PowerShellTool.call(
+    {
+      command: `Write-Output 'timeout-stdout'; [Console]::Error.WriteLine('timeout-stderr'); Start-Sleep -Seconds ${Math.ceil(timeout / 1000) + 20}`,
+      description: "test timeout diagnostics",
+      timeout,
+    },
+    ctx(tmp),
+  );
+
+  assert.equal(r.failure, `PowerShell timed out after ${timeout}ms`);
+  assert.equal(r.output.timedOut, true);
+  assert.ok(Object.hasOwn(r.output, "exitCode"));
+  assert.match(r.output.stdout, /timeout-stdout/);
+  assert.match(r.output.stderr, /timeout-stderr/);
+});
+
+test("PowerShell: abort tears down a spawned process tree promptly", async () => {
+  if (process.platform !== "win32") return;
+  const tmp = await makeTmp();
+  const controller = new AbortController();
+  const c = { ...ctx(tmp), signal: controller.signal };
+  const started = Date.now();
+  const running = PowerShellTool.call(
+    {
+      command: "Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -NoNewWindow -Wait",
+      description: "test process tree abort",
+      timeout: 30000,
+    },
+    c,
+  );
+  setTimeout(() => controller.abort(), 150);
+  await running;
+  // Full-suite Windows CI can take several seconds to schedule taskkill while
+  // hundreds of child-process tests run in parallel. The contract is that Stop
+  // beats the command's 30s timeout by a wide margin, not a brittle 5s wall.
+  assert.ok(Date.now() - started < 15000, "abort must not wait for the command timeout while a grandchild holds inherited pipes");
 });
 
 test("shell permissions: destructive commands require explicit approval", async () => {

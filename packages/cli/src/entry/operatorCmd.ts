@@ -6,9 +6,13 @@ import { notice } from "../terminalUi.js";
 import { QueryEngineDispatcher, acquireCapability, attentionItemsFromCapabilities, attentionItemsFromGoals, capabilityReviewLine, deriveLeash, domainOf, capabilityReviewQueue, createGoal, decideAttention, ensureGoalMissionContract, listGoals, listAcquisitions, listCapabilities, listMissionContracts, loadCapability, loadMissionContract, missionContractCanComplete, missionContractNextVerificationAction, seedAllCapabilities, writeCapabilitiesDoc, newGoalId, novelDeltaCurve, saveCapability, reliabilityOf, runGoalToCompletion, parseEvalReportJson, draftCapability, capabilityEvidence, missionContractSummary, missionContractUnmetRequirements, promoteCapability, rejectCapabilityDraft, verificationSpecSummary, type Goal, type CapabilityEvidence, type MissionContract, type AcquisitionKind, type EvalReport, type VerificationSpec } from "@ares/operator";
 import { KillSwitch, runEffect } from "@ares/effects";
 import { MemoryStore } from "@ares/mind";
+import { openWorkspaceSessionKernel } from "@ares/core";
+import { ShellRegistry, TodoStore } from "@ares/tools";
 import { capGlyph, statusGlyph } from "./mindCmd.js";
-import { selectProvider } from "./providers.js";
-import { ParsedArgs, cliRuntimeContext } from "./runtime.js";
+import { selectProvider, type ProviderSelection } from "./providers.js";
+import { AresCommandPermissionStore, AresPathPermissionStore, promptPermission } from "./permissions.js";
+import { buildCodingTools } from "./engineTools.js";
+import { ParsedArgs, cliRuntimeContext, type CliRuntimeContext } from "./runtime.js";
 
 // ─── operator command (Ares v5 / O1 — the durable autonomy spine) ──────
 export async function operatorCommand(args: ParsedArgs): Promise<number> {
@@ -73,11 +77,7 @@ export async function operatorCommand(args: ParsedArgs): Promise<number> {
     let final: Goal | null = null;
     if (ticks > 0) {
       const selection = await selectProvider(args.flags);
-      const dispatcher = new QueryEngineDispatcher({
-        provider: selection.provider,
-        model: selection.model,
-        workspace: context.workspace,
-      });
+      const dispatcher = await buildOperatorDispatcher(context, selection);
       final = await runGoalToCompletion({ home, dispatcher, workspace: context.workspace }, result.goal.id, { maxTicks: ticks });
     }
     if (args.flags.has("json")) {
@@ -310,11 +310,7 @@ export async function operatorCommand(args: ParsedArgs): Promise<number> {
     }
     const selection = await selectProvider(args.flags);
     const maxTicks = Number(args.flags.get("ticks") ?? "1") || 1;
-    const dispatcher = new QueryEngineDispatcher({
-      provider: selection.provider,
-      model: selection.model,
-      workspace: context.workspace,
-    });
+    const dispatcher = await buildOperatorDispatcher(context, selection);
     const lines: string[] = [`provider ${selection.source} · model ${selection.model} · up to ${maxTicks} tick(s)/goal`];
     for (const g of goals) {
       const final = await runGoalToCompletion({ home, dispatcher, workspace: context.workspace }, g.id, { maxTicks });
@@ -477,6 +473,39 @@ export async function operatorCommand(args: ParsedArgs): Promise<number> {
 
   process.stderr.write(`error: unknown operator subcommand "${subcommand}". Try: add | draft | acquire | promote | reject | review | missions | mission | list | status | run | caps | stats | attention | acquisitions\n`);
   return 2;
+}
+
+async function buildOperatorDispatcher(
+  context: CliRuntimeContext,
+  selection: ProviderSelection,
+): Promise<QueryEngineDispatcher> {
+  const pathPermissions = await AresPathPermissionStore.load(context);
+  const commandPermissions = await AresCommandPermissionStore.load(context);
+  const shellRegistry = new ShellRegistry();
+  const todoStore = new TodoStore();
+  const sessionKernel = await openWorkspaceSessionKernel(context.workspace);
+  const tools = await buildCodingTools(
+    pathPermissions,
+    commandPermissions,
+    selection,
+    { permissionMode: "workspace-write" },
+    context,
+    shellRegistry,
+    todoStore,
+    new Map(),
+    { subagents: true, conductor: false },
+    sessionKernel,
+  );
+  return new QueryEngineDispatcher({
+    provider: selection.provider,
+    model: selection.model,
+    workspace: context.workspace,
+    tools,
+    requestPermission: promptPermission,
+    sessionKernel,
+    telemetryDir: path.join(context.home, "telemetry"),
+    sessionRegistryHome: context.home,
+  });
 }
 
 async function findMissionContract(home: string, id: string): Promise<MissionContract | null> {

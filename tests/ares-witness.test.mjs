@@ -117,10 +117,20 @@ test("witness: unsafe check commands and malformed proposals are rejected", asyn
 
 test("witness: the candidate cap holds even when the model overshoots", async () => {
   const { dir, store } = await makeStore();
-  const flood = Array.from({ length: 9 }, (_, i) => ({
-    kind: "belief",
-    claim: `Distinct durable belief number ${i} about the workspace layout`,
-  }));
+  // Genuinely distinct claims: the witness channel now similarity-dedupes
+  // rewordings, so near-identical fixtures would collapse to one and mask the
+  // cap this test exists to prove.
+  const flood = [
+    "The build system uses pnpm workspaces with one tsc project graph",
+    "Session rollouts persist under .ares/sessions as JSONL event files",
+    "The desktop app talks to the daemon over NDJSON on stdin",
+    "Voice features provision themselves through a python sidecar venv",
+    "Telegram bridging runs through the gateway mirror wiring",
+    "The updater verifies release signatures with the tauri key",
+    "HELM polls cognitive state on a five second cadence",
+    "Provider failover tracks dead providers per session lane",
+    "Memory consolidation runs under a cross-process lock file",
+  ].map((claim) => ({ kind: "belief", claim }));
   const report = await runWitness({
     conversation: { user: "audit everything", assistant: "done, found a lot", status: "completed" },
     store,

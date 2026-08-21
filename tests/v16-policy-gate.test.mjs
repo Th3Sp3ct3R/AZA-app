@@ -129,6 +129,7 @@ test("remote autonomy: the dangerous few ASK on the owner's phone", () => {
   assert.equal(remoteAutonomyDecision(req("Deploy", { reason: "publish to vercel" })), "ask");
   assert.equal(remoteAutonomyDecision(req("Browser", { reason: "submit checkout and pay" })), "ask");
   assert.equal(remoteAutonomyDecision(req("Bash", { input: { command: "rm -rf /" } })), "ask");
+  assert.equal(remoteAutonomyDecision(req("ExitPlanMode", { reason: "approve exact durable plan" })), "ask");
   assert.equal(
     remoteAutonomyDecision(req("Bash", { input: { command: "echo $API_KEY" }, reason: "read api key" })),
     "ask",

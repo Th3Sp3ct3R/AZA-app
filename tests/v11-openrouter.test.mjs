@@ -86,6 +86,70 @@ test("OpenRouter: sends Bearer auth + translates tool_result to role:tool", asyn
   assert.equal(asst.tool_calls[0].function.name, "ls");
 });
 
+test("Kimi-branded instance: 401 triggers one auth refresh and a replay with the new token", async () => {
+  // A subscription token expires mid-session; the provider must exchange the
+  // refresh token once and replay transparently instead of failing the turn.
+  const auths = [];
+  const fetchImpl = async (_url, init) => {
+    auths.push(init.headers.Authorization);
+    if (auths.length === 1) {
+      return new Response('{"error":{"message":"expired"}}', { status: 401 });
+    }
+    return sse([{ choices: [{ delta: { content: "revived" }, finish_reason: "stop" }] }, "[DONE]"]);
+  };
+  let refreshed = 0;
+  const p = new OpenRouterProvider({
+    apiKey: "stale-token",
+    model: "k3",
+    baseUrl: "https://api.kimi.example/coding/v1",
+    providerName: "kimi",
+    fetchImpl,
+    apiKeySupplier: async () => "stale-token",
+    onAuthError: async () => { refreshed += 1; return "fresh-token"; },
+  });
+  const events = [];
+  for await (const e of p.stream({ model: "k3", system: "", messages: [], tools: [] })) events.push(e);
+  assert.equal(refreshed, 1);
+  assert.deepEqual(auths, ["Bearer stale-token", "Bearer fresh-token"]);
+  assert.equal(events.at(-1).type, "message_done");
+  assert.equal(events.at(-1).message.content[0].text, "revived");
+});
+
+test("Kimi-branded instance: a 401 that survives refresh surfaces as a Kimi error, not OpenRouter", async () => {
+  const fetchImpl = async () => new Response('{"error":{"message":"expired"}}', { status: 401 });
+  const p = new OpenRouterProvider({
+    apiKey: "stale-token",
+    model: "k3",
+    baseUrl: "https://api.kimi.example/coding/v1",
+    providerName: "kimi",
+    fetchImpl,
+    onAuthError: async () => null,
+  });
+  const events = [];
+  for await (const e of p.stream({ model: "k3", system: "", messages: [], tools: [] })) events.push(e);
+  const err = events.find((e) => e.type === "error");
+  assert.equal(err.error.code, "http_401");
+  assert.match(err.error.message, /Kimi subscription auth failed/);
+  assert.doesNotMatch(err.error.message, /OpenRouter/);
+});
+
+test("OpenRouter: forwards act-first tool forcing to the wire", async () => {
+  let body;
+  const fetchImpl = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return sse([{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }, "[DONE]"]);
+  };
+  const provider = new OpenRouterProvider({ apiKey: "k", model: "x/y", fetchImpl });
+  for await (const _ of provider.stream({
+    model: "x/y",
+    system: "",
+    messages: [],
+    tools: [{ name: "Read", description: "read", input_schema: { type: "object" } }],
+    toolChoice: "any",
+  })) { /* drain */ }
+  assert.equal(body.tool_choice, "required");
+});
+
 test("OpenRouter: replays reasoning with a valid tool-call chain", async () => {
   let captured;
   const fetchImpl = async (_url, init) => {
@@ -248,4 +312,48 @@ test("fetchDeepSeekModels uses bearer auth and parses the enabled catalog", asyn
   const models = await fetchDeepSeekModels({ apiKey: "ds-key", fetchImpl });
   assert.equal(authorization, "Bearer ds-key");
   assert.deepEqual(models.map((model) => model.id), ["deepseek-v4-flash", "deepseek-v4-pro"]);
+});
+
+// ─── Tool-schema narrowing on the wire ─────────────────────────────────
+//
+// Regression for the 422 that killed every turn on an OpenRouter route:
+//   "auto tool schemas do not support multi-type anyOf/oneOf unions"
+// OpenRouter had failed the request over from Google AI Studio (429) to a
+// stricter upstream, which rejected the WHOLE tool array over one union in
+// Grep's `path`. What matters is the bytes that leave the process, so this
+// asserts on the captured request body rather than on the narrowing helper.
+
+test("OpenRouter: the request body carries no anyOf/oneOf unions", async () => {
+  let sent = null;
+  const fetchImpl = async (_url, init) => {
+    sent = JSON.parse(init.body);
+    return sse([{ choices: [{ delta: { content: "ok" } }] }, "[DONE]"]);
+  };
+  const p = new OpenRouterProvider({ apiKey: "k", model: "x/y", fetchImpl });
+  const tools = [
+    {
+      name: "Grep",
+      description: "search",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }], description: "Where." },
+          limit: { type: ["number", "null"] },
+        },
+        required: ["path"],
+      },
+    },
+  ];
+  for await (const _ of p.stream({ model: "x/y", system: "s", messages: [], tools })) void _;
+
+  const wire = JSON.stringify(sent.tools);
+  assert.ok(!wire.includes("anyOf"), "a union reached the wire");
+  assert.ok(!wire.includes("oneOf"), "a union reached the wire");
+  const params = sent.tools[0].function.parameters;
+  assert.equal(params.properties.path.type, "string");
+  assert.equal(params.properties.limit.type, "number");
+  // Narrowing is lossy, so the lost shape has to survive in prose.
+  assert.match(params.properties.path.description, /array of strings/);
+  // Everything the endpoint DOES understand is left alone.
+  assert.deepEqual(params.required, ["path"]);
 });

@@ -17,10 +17,12 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import type { ApprovalVerb, StagedApproval } from "@ares/effects";
-import { constantTimeEqual, ensureToken } from "./token.js";
+import type { TurnEvent } from "@ares/protocol";
+import { constantTimeEqual, ensureToken, ensureReadToken } from "./token.js";
 import type { SessionManager } from "./sessions.js";
 import type { Scheduler } from "./scheduler.js";
 import { ChannelManager } from "./channels.js";
+import { viewerHtml } from "./viewer.js";
 import {
   DEFAULT_GARRISON_PORT,
   PROTO_VERSION,
@@ -66,11 +68,16 @@ export interface GarrisonServerOptions {
   port?: number;
   version?: string;
   clientBufferCap?: number;
+  /** Recorded-event replay for session.history frames (the viewer's back-scroll).
+   *  Injected by the boot site (workspace rollouts live in @ares/core). */
+  history?: (sessionId: string, opts?: { limit?: number }) => Promise<Array<{ ts?: string; event: TurnEvent }>>;
 }
 
 interface ClientConn {
   ws: WebSocket;
   authed: boolean;
+  /** control = full protocol; read = list/attach/history/status only. */
+  scope: "control" | "read";
   name: string;
   queue: GatewayServerFrame[];
   gapped: boolean;
@@ -86,6 +93,7 @@ export class GarrisonServer {
   private http: HttpServer | undefined;
   private wss: WebSocketServer | undefined;
   private token = "";
+  private readToken = "";
   private startedAt = "";
   private boundHost = "";
   private boundPort = 0;
@@ -99,6 +107,7 @@ export class GarrisonServer {
   async start(): Promise<{ host: string; port: number }> {
     if (this.http) throw new Error("garrison server already started");
     this.token = await ensureToken(this.opts.home);
+    this.readToken = await ensureReadToken(this.opts.home);
     this.startedAt = new Date().toISOString();
     const http = createServer((req, res) => this.handleHttp(req, res));
     const wss = new WebSocketServer({ server: http });
@@ -163,6 +172,13 @@ export class GarrisonServer {
       );
       return;
     }
+    // The read-only viewer: one self-contained page, no assets, no build step.
+    // It speaks the same WS protocol back to this very port (read token).
+    if (req.method === "GET" && (url === "/view" || url.startsWith("/view?"))) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(viewerHtml());
+      return;
+    }
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: false, error: "not found" }));
   }
@@ -173,6 +189,7 @@ export class GarrisonServer {
     const client: ClientConn = {
       ws,
       authed: false,
+      scope: "control",
       name: "",
       queue: [],
       gapped: false,
@@ -226,10 +243,16 @@ export class GarrisonServer {
       this.rejectHandshake(client, `unsupported proto: expected ${PROTO_VERSION}`);
       return;
     }
-    if (typeof frame.token !== "string" || !constantTimeEqual(frame.token, this.token)) {
+    // The control token grants the full protocol; the read token grants a
+    // list/attach/history view and nothing that moves a session. Check BOTH
+    // unconditionally so timing doesn't leak which one almost matched.
+    const isControl = typeof frame.token === "string" && constantTimeEqual(frame.token, this.token);
+    const isRead = typeof frame.token === "string" && constantTimeEqual(frame.token, this.readToken);
+    if (!isControl && !isRead) {
       this.rejectHandshake(client, "unauthorized: bad token");
       return;
     }
+    client.scope = isControl ? "control" : "read";
     if (client.helloTimer) {
       clearTimeout(client.helloTimer);
       client.helloTimer = null;
@@ -247,6 +270,18 @@ export class GarrisonServer {
 
   private route(client: ClientConn, frame: GatewayClientFrame): void {
     const sessions = this.opts.sessions;
+    // The read scope's wall: nothing that creates, drives, or approves.
+    if (
+      client.scope === "read" &&
+      (frame.type === "session.create" ||
+        frame.type === "session.send" ||
+        frame.type === "session.interrupt" ||
+        frame.type === "permission.respond" ||
+        frame.type === "approval.respond")
+    ) {
+      this.enqueueError(client, `read-only client: ${frame.type} is not permitted`);
+      return;
+    }
     switch (frame.type) {
       case "hello": {
         this.enqueueError(client, "already authenticated");
@@ -303,9 +338,23 @@ export class GarrisonServer {
           this.enqueueError(client, "session.send requires sessionId and text");
           return;
         }
+        if (
+          frame.inputId !== undefined &&
+          (typeof frame.inputId !== "string" || !frame.inputId.trim() || frame.inputId.length > 1_024)
+        ) {
+          this.enqueueError(client, "session.send inputId must be a non-empty string of at most 1024 characters");
+          return;
+        }
+        if (frame.delivery !== undefined && frame.delivery !== "queue" && frame.delivery !== "steer") {
+          this.enqueueError(client, "session.send delivery must be queue or steer");
+          return;
+        }
         // Fire-and-forget: the turn streams to subscribers; failures (busy,
         // unknown session, engine throw) come back as one error frame.
-        sessions.send(frame.sessionId, frame.text).catch((err) => this.enqueueError(client, errorMessage(err)));
+        sessions.send(frame.sessionId, frame.text, {
+          inputId: frame.inputId,
+          delivery: frame.delivery,
+        }).catch((err) => this.enqueueError(client, errorMessage(err)));
         return;
       }
       case "session.interrupt": {
@@ -322,6 +371,23 @@ export class GarrisonServer {
       }
       case "sessions.list": {
         this.enqueueFrame(client, { type: "sessions", sessions: sessions.list() });
+        return;
+      }
+      case "session.history": {
+        if (typeof frame.sessionId !== "string") {
+          this.enqueueError(client, "session.history requires sessionId");
+          return;
+        }
+        const history = this.opts.history;
+        if (!history) {
+          this.enqueueError(client, "history is not wired on this garrison");
+          return;
+        }
+        const sessionId = frame.sessionId;
+        const limit = typeof frame.limit === "number" && frame.limit > 0 ? Math.min(Math.floor(frame.limit), 5_000) : 1_000;
+        void history(sessionId, { limit })
+          .then((entries) => this.enqueueFrame(client, { type: "session.history", sessionId, entries: entries.slice(-limit) }))
+          .catch((err) => this.enqueueError(client, errorMessage(err)));
         return;
       }
       case "status": {

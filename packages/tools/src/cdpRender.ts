@@ -92,7 +92,7 @@ interface CdpEvent {
   sessionId?: string;
 }
 
-class CdpClient {
+export class CdpClient {
   private seq = 0;
   private readonly pending = new Map<
     number,

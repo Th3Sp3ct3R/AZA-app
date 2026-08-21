@@ -8,9 +8,11 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, contentHash, pathInputProblem, resolveWorkspacePath, zPath } from "./_shared.js";
+import { buildTool, contentHash, mutationInstructionBlock, mutationWorkspaceForPaths, pathInputProblem, resolveWorkspacePath, zPath } from "./_shared.js";
 import type { FileReadStamp } from "./_shared.js";
-import { safeOverwrite } from "./safeWrite.js";
+import { assertSafeReplacement } from "./safeWrite.js";
+import { WorkspaceMutationService, workspaceContentHash, type PostMutationFeedback } from "@ares/core";
+import { appendMutationFeedback, collectMutationFeedback } from "./postMutationFeedback.js";
 
 // Post-write stamp carries `writtenNotRead` so Read's re-read guard does a real
 // read afterward — the model supplied a sketch, not the materialized file, so it
@@ -45,6 +47,8 @@ export interface ApplyIntentOutput {
   engine: "apply-slot" | "full-file-sketch";
   /** Where the prior contents were saved before this overwrite, if any. */
   backupPath?: string;
+  /** Immediate formatter/type diagnostics, attributed to the committed SHA-256. */
+  feedback?: PostMutationFeedback;
 }
 
 export const ApplyIntentTool = buildTool({
@@ -79,6 +83,8 @@ export const ApplyIntentTool = buildTool({
     if (!ctx.fileReadStamps.has(filePath)) {
       return { kind: "deny", reason: `Read ${filePath} before applying an intent edit.` };
     }
+    const instructionBlock = await mutationInstructionBlock(ctx, [filePath]);
+    if (instructionBlock) return { kind: "deny", reason: instructionBlock };
     return { kind: "allow" };
   },
 
@@ -140,13 +146,26 @@ export const ApplyIntentTool = buildTool({
 
     if (!finalContent.length) throw new Error("ApplyIntent produced empty output; refusing to overwrite file.");
 
-    const written = await safeOverwrite({
-      workspace: ctx.workspace,
-      absPath: filePath,
-      content: finalContent,
+    let written: { bytesWritten: number; backupPath?: string };
+    let feedback: PostMutationFeedback | undefined;
+    assertSafeReplacement({
+      original,
+      next: finalContent,
       label: "ApplyIntent",
+      absPath: filePath,
       allowFullReplace: i.allow_full_replace,
     });
+    const mutationWorkspace = await mutationWorkspaceForPaths(ctx.workspace, [filePath]);
+    const receipt = await new WorkspaceMutationService(mutationWorkspace).apply(
+      [{ kind: "update", path: filePath, content: finalContent, expectedHash: workspaceContentHash(original) }],
+      { label: "ApplyIntent", transactionId: ctx.mutationTransactionId },
+    );
+    const operation = receipt.operations[0];
+    written = {
+      bytesWritten: Buffer.byteLength(finalContent, "utf8"),
+      backupPath: operation && "backupPath" in operation ? operation.backupPath : undefined,
+    };
+    feedback = await collectMutationFeedback(mutationWorkspace, receipt);
     const newStat = await fs.stat(filePath);
     const writtenStamp: WrittenStamp = {
       mtimeMs: newStat.mtimeMs,
@@ -158,9 +177,9 @@ export const ApplyIntentTool = buildTool({
     ctx.fileReadStamps.set(filePath, writtenStamp);
 
     return {
-      output: { path: filePath, bytesWritten: written.bytesWritten, engine, backupPath: written.backupPath },
+      output: { path: filePath, bytesWritten: written.bytesWritten, engine, backupPath: written.backupPath, feedback },
       touchedFiles: [filePath],
-      display: `Applied intent to ${filePath} via ${engine}`,
+      display: appendMutationFeedback(`Applied intent to ${filePath} via ${engine}`, feedback),
     };
   },
 });

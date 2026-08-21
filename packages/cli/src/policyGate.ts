@@ -50,6 +50,10 @@ const REMOTE_GATED: ReadonlySet<ActionCategory> = new Set<ActionCategory>([
  *   deny  → refuse outright
  */
 export function remoteAutonomyDecision(request: ToolPermissionRequest): "allow" | "ask" | "deny" {
+  // Exiting plan mode grants workspace-write authority and approves one exact
+  // durable plan revision. A remote model can propose it, but only the owner
+  // can cross this boundary; never let the autonomy default self-approve it.
+  if (request.toolName === "ExitPlanMode") return "ask";
   const category = classifyToolRequest(request);
   // Benign / unclassified tools (Read, WebFetch, WebSearch, Weather, …) → run.
   if (category === null) return "allow";

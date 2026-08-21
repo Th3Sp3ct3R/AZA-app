@@ -21,6 +21,7 @@ import type {
   StopReason,
 } from "@ares/protocol";
 import { thinkingBudgetTokens, reasoningEnabled } from "@ares/protocol";
+import { narrowToolSchema } from "./toolSchema.js";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { createStallGuard, stallErrorEvent } from "./stallGuard.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
@@ -218,10 +219,18 @@ export class OllamaCloudPool {
         } else {
           yield* self.callOllamaChat(model, req);
         }
-        resolveDone();
       } catch (err) {
+        // A deliberate abort is not a provider failure — the consumer already
+        // knows it stopped the turn; a red retriable banner here is noise.
+        if (req.signal?.aborted) return;
         const message = err instanceof Error ? err.message : String(err);
         yield { type: "error", error: { code: "ollama_throw", message, retriable: true } };
+      } finally {
+        // finally, not tail calls: when the consumer breaks out of its
+        // for-await (Stop, steering supersession) this generator completes
+        // via RETURN, reaching neither branch above — the old shape left
+        // `promise` pending forever and every later call queued on the same
+        // slot deadlocked behind it.
         resolveDone();
       }
     })();
@@ -234,6 +243,21 @@ export class OllamaCloudPool {
     req: ProviderRequest,
   ): AsyncGenerator<StreamEvent> {
     const messages = toOllamaMessages(req.messages);
+    // Same chars/4 heuristic the engine budgets with — num_ctx must cover the
+    // prompt we are about to send plus the output allowance, or the serving
+    // side truncates/rejects a request the engine believed was in budget.
+    // Images are counted at a flat vision-token allowance, NEVER by their
+    // base64 length: a single pasted screenshot stringifies to ~1M chars and
+    // would have demanded a multi-million-token num_ctx.
+    let estPromptChars = JSON.stringify(req.tools).length + (req.system?.length ?? 0);
+    let estImageTokens = 0;
+    for (const msg of req.messages) {
+      for (const block of msg.content) {
+        if (block.type === "image") estImageTokens += 2_000;
+        else estPromptChars += JSON.stringify(block).length;
+      }
+    }
+    const estPromptTokens = Math.ceil(estPromptChars / 4) + estImageTokens;
 
     const body = {
       model,
@@ -245,19 +269,29 @@ export class OllamaCloudPool {
               function: {
                 name: t.name,
                 description: t.description,
-                parameters: t.input_schema,
+                // Narrowed for the OpenAI-shaped wire — see toolSchema.ts.
+                parameters: narrowToolSchema(t.input_schema),
               },
             }))
           : undefined,
       stream: true,
-      options: { num_ctx: ollamaNumCtx(), temperature: 0.2 },
+      options: {
+        num_ctx: ollamaNumCtx(
+          estPromptTokens,
+          req.maxOutputTokens ?? 8_192,
+          /cloud/i.test(model) || /ollama\.com/i.test(this.host),
+        ),
+        temperature: 0.2,
+      },
       // Reasoning dial → native /api/chat "think" field. Ollama's documented think
       // enum is low|medium|high (plus a boolean) — NOT "max" — so clamp max→high
       // (mirrors openAIReasoningEffort) to avoid a 400 on models that validate it,
       // while still letting the owner's dial bite here. Gate on reasoningEnabled so
       // "off"/undefined omit think entirely (a present field re-enables thinking).
-      ...(reasoningEnabled(req.reasoningLevel)
-        ? { think: req.reasoningLevel === "max" ? "high" : req.reasoningLevel }
+      ...(req.reasoningLevel === "off"
+        ? { think: false }
+        : reasoningEnabled(req.reasoningLevel)
+        ? { think: req.reasoningLevel === "xhigh" || req.reasoningLevel === "max" ? "high" : req.reasoningLevel === "minimal" ? "low" : req.reasoningLevel }
         : {}),
       // Inject the system prompt as a leading system message — Ollama
       // doesn't have a separate `system` field at the chat-level API.
@@ -288,24 +322,31 @@ export class OllamaCloudPool {
         yield stallErrorEvent();
         return;
       }
+      if (req.signal?.aborted) return;
       throw err;
     }
     guard.reset();
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
+      guard.dispose();
       yield {
         type: "error",
         error: {
           code: `http_${res.status}`,
+          // 429 was hardcoded fatal here — a rate-limited turn died outright
+          // instead of waiting out the Retry-After window like every other
+          // adapter honors.
           message: `Ollama returned ${res.status}: ${text.slice(0, 500)}`,
-          retriable: res.status >= 500,
+          retriable: res.status >= 500 || res.status === 429,
+          ...(res.status === 429 ? { retryAfterMs: parseRetryAfterMs(res.headers) } : {}),
         },
       };
       return;
     }
 
     if (!res.body) {
+      guard.dispose();
       yield {
         type: "error",
         error: { code: "no_body", message: "Ollama returned no body", retriable: false },
@@ -324,22 +365,31 @@ export class OllamaCloudPool {
     let usage: Usage = { inputTokens: 0, outputTokens: 0 };
     let stopReason: StopReason = "end_turn";
 
+    try {
     while (true) {
       let step: ReadableStreamReadResult<Uint8Array>;
       try {
         step = await reader.read();
       } catch (err) {
-        guard.dispose();
         if (guard.stalled()) {
           yield stallErrorEvent();
           return;
         }
+        if (req.signal?.aborted) return;
         throw err;
       }
       guard.reset();
       const { done, value } = step;
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      if (done) {
+        // Final flush: a stream that closes without a trailing newline still
+        // has its last chunk in the buffer — usually the done:true chunk
+        // carrying usage and done_reason. Dropping it zeroed the turn's usage
+        // and misreported max_tokens truncation as a clean end_turn.
+        buffer += decoder.decode();
+        if (buffer.trim() && !buffer.endsWith("\n")) buffer += "\n";
+      } else {
+        buffer += decoder.decode(value, { stream: true });
+      }
       let nlIdx: number;
       while ((nlIdx = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, nlIdx).trim();
@@ -408,9 +458,15 @@ export class OllamaCloudPool {
           stopReason = chunk.done_reason === "length" ? "max_tokens" : "end_turn";
         }
       }
+      if (done) break;
     }
-
-    guard.dispose();
+    } finally {
+      // Every early return above used to abandon an open HTTP body and leave
+      // the stall guard's timer + abort listener armed — sockets and listeners
+      // accumulated on the turn signal across a flaky session.
+      guard.dispose();
+      void reader.cancel().catch(() => undefined);
+    }
 
     for (const part of flushThinkingState(thinkingState)) {
       if (part.type === "thinking") {
@@ -519,43 +575,38 @@ export class OllamaCloudPool {
           // Continue into the normal streaming parser below with the retried response.
         } else {
           const retryText = await res.text().catch(() => "");
+          guard.dispose();
           yield {
             type: "error",
             error: {
               code: `http_${res.status}`,
               message: `Ollama Anthropic-compat returned ${res.status}: ${retryText.slice(0, 500)}`,
               retriable: res.status >= 500 || res.status === 429,
+              retryAfterMs: parseRetryAfterMs(res.headers),
             },
           };
           return;
         }
       } else {
+        guard.dispose();
         yield {
           type: "error",
           error: {
             code: `http_${res.status}`,
             message: `Ollama Anthropic-compat returned ${res.status}: ${text.slice(0, 500)}`,
             retriable: res.status >= 500 || res.status === 429,
+            // Retry-After only lived in an unreachable duplicate block below
+            // (every !ok path returned before it) — a rate-limited turn never
+            // honored the server's reset window.
+            retryAfterMs: parseRetryAfterMs(res.headers),
           },
         };
         return;
       }
     }
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      yield {
-        type: "error",
-        error: {
-          code: `http_${res.status}`,
-          message: `Ollama Anthropic-compat returned ${res.status}: ${text.slice(0, 500)}`,
-          retriable: res.status >= 500 || res.status === 429,
-          retryAfterMs: parseRetryAfterMs(res.headers),
-        },
-      };
-      return;
-    }
     if (!res.body) {
+      guard.dispose();
       yield { type: "error", error: { code: "no_body", message: "no body", retriable: false } };
       return;
     }
@@ -581,22 +632,29 @@ export class OllamaCloudPool {
     let stopReason: StopReason = "end_turn";
     let messageId = "";
 
+    try {
     while (true) {
       let step: ReadableStreamReadResult<Uint8Array>;
       try {
         step = await reader.read();
       } catch (err) {
-        guard.dispose();
         if (guard.stalled()) {
           yield stallErrorEvent();
           return;
         }
+        if (req.signal?.aborted) return;
         throw err;
       }
       guard.reset();
       const { done, value } = step;
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      if (done) {
+        // Final flush — a residual SSE event without its trailing blank line
+        // (usually message_delta/message_stop with usage) must not be dropped.
+        buffer += decoder.decode();
+        if (buffer.trim() && !buffer.endsWith("\n\n")) buffer += "\n\n";
+      } else {
+        buffer += decoder.decode(value, { stream: true });
+      }
       let sep: number;
       while ((sep = buffer.indexOf("\n\n")) !== -1) {
         const raw = buffer.slice(0, sep);
@@ -620,6 +678,7 @@ export class OllamaCloudPool {
                 cacheWriteTokens,
               };
             }
+            yield { type: "stream_heartbeat" };
             continue;
           }
           case "content_block_start": {
@@ -691,25 +750,37 @@ export class OllamaCloudPool {
             continue;
           }
           case "message_stop":
-          case "ping":
           case undefined:
             continue;
+          case "ping":
+            // Keepalive during prefill → stall-guard liveness (see anthropic.ts).
+            yield { type: "stream_heartbeat" };
+            continue;
           case "error": {
+            // Capacity/limits arriving as SSE frames instead of HTTP statuses
+            // are the SAME retriable conditions — anthropic.ts retries these
+            // deliberately; hardcoding false here failed turns on blips.
+            const kind = evt.error?.type ?? "stream_error";
             yield {
               type: "error",
               error: {
-                code: evt.error?.type ?? "stream_error",
+                code: kind,
                 message: evt.error?.message ?? "anthropic-compat stream error",
-                retriable: false,
+                retriable: kind === "overloaded_error" || kind === "api_error" || kind === "rate_limit_error",
               },
             };
             return;
           }
         }
       }
+      if (done) break;
     }
-
-    guard.dispose();
+    } finally {
+      // Early returns above (SSE error frame, stall, abort) used to abandon
+      // the open HTTP body and leave the stall guard's timer/listener armed.
+      guard.dispose();
+      void reader.cancel().catch(() => undefined);
+    }
 
     // Build final assistant message
     const content: ContentBlock[] = [];
@@ -831,10 +902,31 @@ function buildAnthropicMessagesBody(
   return body;
 }
 
-function ollamaNumCtx(): number {
+/**
+ * Context allocation for the native /api/chat wire. A pinned
+ * ARES_OLLAMA_NUM_CTX still wins outright. Otherwise scale with the request:
+ * the old hardcoded 65,536 silently capped every prompt while the engine was
+ * budgeted far higher (glm-5.1 sessions budget 160k), so ollama-cloud
+ * rejected the 160k AND 80k rungs of the shrink ladder on every iteration —
+ * minutes of guaranteed-failing round trips per tool round before a rung
+ * could physically fit. Ask for what the request actually needs, floored at
+ * the old default; if the serving side can't honor it, the engine's ladder
+ * learns the real ceiling from the rejection.
+ */
+function ollamaNumCtx(estPromptTokens: number, maxOutputTokens: number, cloudServed: boolean): number {
   const raw = Number(process.env.ARES_OLLAMA_NUM_CTX);
   if (Number.isFinite(raw) && raw >= 8_192) return Math.floor(raw);
-  return 65_536;
+  // Only cloud-served models get the dynamic raise. A LOCAL model allocates
+  // its KV cache from num_ctx — asking a local llama.cpp for a 170k context
+  // can OOM the whole machine, where the old 65,536 merely truncated.
+  if (!cloudServed) return 65_536;
+  // Quantized to coarse 32k steps and capped: Ollama reloads/reallocates when
+  // num_ctx changes, so a value that creeps up every tool round would thrash;
+  // the cap keeps a bad estimate from demanding an absurd allocation (the
+  // engine's shrink ladder handles genuine overflow).
+  const needed = estPromptTokens + maxOutputTokens + 2_048;
+  const quantized = Math.ceil(needed / 32_768) * 32_768;
+  return Math.min(262_144, Math.max(65_536, quantized));
 }
 
 function toAnthropicContentBlock(block: ContentBlock): Record<string, unknown> {
@@ -1128,6 +1220,67 @@ export interface OllamaCloudModel {
   role: "reasoner" | "apply" | "summarize" | "general";
   /** Short capability hint shown in the picker. */
   hint: string;
+}
+
+// ─── Ollama LIBRARY catalog (ollama.com/library) ───────────────────────
+//
+// The full public library — every model whether the user pulled it or not,
+// so the discovery panel can show the same browse experience as ollama.com
+// (blurb, capabilities, pull count, updated). Parsed from the library HTML:
+// there is no public JSON API, but the page is server-rendered with stable
+// `x-test-*` markers on every card, which makes it safely regex-parseable.
+
+export interface OllamaLibraryModel {
+  name: string;
+  description?: string;
+  /** Raw ollama capability tags: tools, thinking, vision, embedding. */
+  capabilities: string[];
+  /** Model has a hosted :cloud variant on ollama.com. */
+  cloud: boolean;
+  /** Human pull count, e.g. "225.9K". */
+  pulls?: string;
+  tagCount?: number;
+  /** Relative age, e.g. "3 weeks ago". */
+  updated?: string;
+}
+
+let ollamaLibraryCache: { at: number; models: OllamaLibraryModel[] } | null = null;
+
+/** Fetch + parse the ollama.com library (cached 1h). Returns [] on any failure —
+ *  the catalog must degrade, never break the picker. */
+export async function fetchOllamaLibraryModels(opts: { fetchImpl?: typeof fetch; force?: boolean } = {}): Promise<OllamaLibraryModel[]> {
+  if (!opts.force && ollamaLibraryCache && Date.now() - ollamaLibraryCache.at < 60 * 60 * 1000) {
+    return ollamaLibraryCache.models;
+  }
+  const f = opts.fetchImpl ?? fetch;
+  let html = "";
+  try {
+    const res = await f("https://ollama.com/library?sort=popular", {
+      headers: { Accept: "text/html" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return ollamaLibraryCache?.models ?? [];
+    html = await res.text();
+  } catch {
+    return ollamaLibraryCache?.models ?? [];
+  }
+  const models: OllamaLibraryModel[] = [];
+  // One <li> card per model; anchor href carries the name. Split on the card
+  // anchors so each chunk holds exactly one model's markup.
+  const chunks = html.split(/<a href="\/library\//).slice(1);
+  for (const chunk of chunks) {
+    const name = chunk.match(/^([a-z0-9._-]+)"/i)?.[1];
+    if (!name) continue;
+    const description = chunk.match(/<p class="max-w-lg[^"]*">([\s\S]*?)<\/p>/)?.[1]?.replace(/<[^>]+>/g, "").trim();
+    const capabilities = [...chunk.matchAll(/x-test-capability[^>]*>([a-z]+)</g)].map((m) => m[1]);
+    const cloud = />cloud</.test(chunk);
+    const pulls = chunk.match(/x-test-pull-count>([^<]+)</)?.[1]?.trim();
+    const tagCount = Number(chunk.match(/x-test-tag-count>([^<]+)</)?.[1]) || undefined;
+    const updated = chunk.match(/x-test-updated>([^<]+)</)?.[1]?.trim();
+    models.push({ name, description, capabilities, cloud, pulls, tagCount, updated });
+  }
+  if (models.length > 0) ollamaLibraryCache = { at: Date.now(), models };
+  return models;
 }
 
 export const OLLAMA_CLOUD_MODELS: readonly OllamaCloudModel[] = [

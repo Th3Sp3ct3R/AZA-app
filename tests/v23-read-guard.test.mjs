@@ -1,6 +1,7 @@
 // Verifies Read never hands the model blind content:
 //   - a genuinely empty file says so explicitly (not "" / a lone blank line)
-//   - an already-in-context re-read returns a real explanatory message, never ""
+//   - an unchanged re-read returns the requested bytes again (context may have
+//     been compacted since the first Read)
 //   - a normal read returns the file contents
 //   - read stamps don't cross between independent contexts (no phantom
 //     read-before-write grant from one ctx to another)
@@ -33,9 +34,9 @@ test("read: a genuinely empty file returns an explicit empty-file message", asyn
   assert.notEqual(r.output.content.trim(), "", "content is never blank");
 });
 
-// ── 2. Already-in-context → non-empty explanatory content ─────────────────────
+// ── 2. Unchanged re-read → requested bytes again ──────────────────────────────
 
-test("read: an already-in-context re-read returns a real message, never empty", async () => {
+test("read: an unchanged re-read returns file bytes instead of relying on stale context", async () => {
   const tmp = await makeTmp();
   const file = path.join(tmp, "app.ts");
   await fs.writeFile(file, "const a = 1;\nconst b = 2;\nconst c = 3;\n", "utf8");
@@ -46,11 +47,10 @@ test("read: an already-in-context re-read returns a real message, never empty", 
 
   const again = await ReadTool.call({ file_path: file }, c); // same ctx, unchanged file
   assert.notEqual(again.output.content.trim(), "", "re-read content is NOT empty");
-  assert.match(again.output.content, /already in your context/i, "explains why content was omitted");
-  assert.match(again.output.content, /app\.ts/, "names the file");
-  assert.match(again.output.content, /\b4 lines\b/, "reports the real line count");
-  assert.match(again.output.content, /sha256:/, "cites the tracked read-stamp hash");
-  assert.notEqual(again.output.totalLines, 0, "line count is real, not 0 — won't read as empty");
+  assert.match(again.output.content, /const a = 1;/, "re-read returns the real contents again");
+  assert.match(again.output.content, /const c = 3;/, "re-read is complete within the normal cap");
+  assert.doesNotMatch(again.output.content, /already in your context/i);
+  assert.equal(again.output.totalLines, 4, "line count remains exact");
 });
 
 // ── 3. Normal read is unchanged ───────────────────────────────────────────────

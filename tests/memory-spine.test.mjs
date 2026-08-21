@@ -292,3 +292,76 @@ test("lock: fn errors propagate but the lock is still released", async () => {
   const next = await withConsolidationLock(memoryFile, async () => "ok");
   assert.equal(next, "ok");
 });
+
+// ── 5. The operational-noise gate (field report 2026-08-06: a MEMORY.md index
+//      that was 24 "Tool error observed:" entries against 5 real memories) ────
+
+test("noise: harness failure output is knowledge on NO channel", async () => {
+  const { isOperationalNoise } = await import("../packages/mind/dist/index.js");
+  const noise = [
+    "Tool error observed: Workspace paths must be non-empty and relative.",
+    "<tool_use_error>Read failed</tool_use_error>",
+    "Bash failed: ENOENT no such file or directory D:\\missing",
+    "at handleTurn (src/entry/daemon.ts:2041:13)",
+    "the gateway answered HTTP 413 Request Entity Too Large",
+    "command failed with exit code 1",
+    "provider stalled twice at this prompt size",
+    "no stream events for 90s — cutting the attempt",
+  ];
+  for (const channel of ["conversation", "witness", "dream", "card", "v4-migration", "manual"]) {
+    const store = fakeStore();
+    const report = await new MemoryRouter(store).write(
+      channel,
+      noise.map((content) => ({ kind: "episodic", content, salience: 0.95 })),
+    );
+    assert.equal(report.written.length, 0, `${channel} stored noise: ${JSON.stringify(report.written[0]?.input.content)}`);
+    assert.ok(report.skipped.every((s) => s.reason === "operational-noise"), `${channel} skip reasons: ${report.skipped.map((s) => s.reason).join(",")}`);
+  }
+});
+
+test("noise: real knowledge ABOUT failures still lands — the gate is signature-based, not word-based", async () => {
+  const { isOperationalNoise } = await import("../packages/mind/dist/index.js");
+  const knowledge = [
+    "The test suite breaks when the daemon is still running — stop it first",
+    "Crix prefers failing fast over silent retries in provider code",
+    "This repo's build uses pnpm, and tsc -b is the whole build",
+    "Deploys failed all week until the cache key included the lockfile hash",
+  ];
+  for (const content of knowledge) {
+    assert.equal(isOperationalNoise(content), false, `false positive: ${content}`);
+  }
+  const store = fakeStore();
+  const report = await new MemoryRouter(store).write(
+    "manual",
+    knowledge.map((content) => ({ kind: "semantic", content })),
+  );
+  assert.equal(report.written.length, knowledge.length, "legitimate failure-adjacent knowledge must not be gated");
+});
+
+test("noise: consolidate() durably prunes noise stored before the gate existed", async () => {
+  const dir = await makeDir();
+  const store = await MemoryStore.open(path.join(dir, "memory.jsonl"));
+  await store.add({ kind: "semantic", content: "Tool error observed: <tool_use_error>timeout</tool_use_error>", source: "v4-migration" });
+  await store.add({ kind: "semantic", content: "Crix is allergic to penicillin medication", source: "conversation" });
+  const report = await store.consolidate();
+  assert.ok(report.pruned >= 1, "legacy noise pruned");
+  const contents = store.all().map((n) => n.content);
+  assert.ok(!contents.some((c) => c.includes("Tool error observed")), "the error entry is gone");
+  assert.ok(contents.some((c) => c.includes("penicillin")), "the real memory survives");
+});
+
+test("noise: legacy 'Recurring theme' filler is pruned wholesale", async () => {
+  // Theme promotion is gone (a single token + a count is not knowledge — 47 of
+  // 66 nodes on a real store were themes like "first" and "every"), and
+  // consolidate() now clears the population it left behind.
+  const dir = await makeDir();
+  const store = await MemoryStore.open(path.join(dir, "memory.jsonl"));
+  await store.add({ kind: "semantic", content: 'Recurring theme "first" observed across 3 episodes.', tags: ["theme:first"] });
+  await store.add({ kind: "semantic", content: 'Recurring theme "claude" observed across 4 episodes.' });
+  await store.add({ kind: "semantic", content: "Crix prefers pnpm for every build in this repo" });
+  const report = await store.consolidate();
+  assert.ok(report.pruned >= 2, `both theme nodes pruned, got ${report.pruned}`);
+  const contents = store.all().map((n) => n.content);
+  assert.ok(!contents.some((c) => c.startsWith("Recurring theme")), "theme filler is gone");
+  assert.ok(contents.some((c) => c.includes("pnpm")), "real knowledge survives");
+});

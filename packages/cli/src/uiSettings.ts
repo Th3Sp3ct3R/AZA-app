@@ -1,10 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { aresHome } from "@ares/core";
 import type { ReasoningLevel } from "@ares/protocol";
 import type { RouteAssignments } from "@ares/core";
 import type { ThemeName } from "./terminalUi.js";
 import type { PermissionSettings } from "./permissionPolicy.js";
+import type { PersonaStyle } from "./entry/prompt/persona.js";
 import { encryptSecret, decryptSecret } from "./keyVault.js";
 
 /** Settings fields that hold secrets — encrypted at rest, decrypted on load. */
@@ -14,6 +16,7 @@ const SECRET_FIELDS = [
   "braveKey",
   "tavilyKey",
   "deepSeekKey",
+  "kimiKey",
   "aresGatewayToken",
   "ollamaApiKey",
   "customApiKey",
@@ -38,7 +41,7 @@ async function encryptSecretFields(settings: UiSettings): Promise<UiSettings> {
 
 export interface UiSettings {
   theme?: ThemeName;
-  lastProvider?: "openai" | "ollama" | "mock" | "openrouter" | "anthropic" | "deepseek" | "custom";
+  lastProvider?: "openai" | "ollama" | "mock" | "openrouter" | "anthropic" | "deepseek" | "ares" | "custom" | "moa";
   lastOpenAIModel?: string;
   lastOllamaModel?: string;
   favoriteOllamaModels?: string[];
@@ -46,6 +49,13 @@ export interface UiSettings {
   dangerousBypass?: boolean;
   /** Owner-selected reasoning dial (low→max). Applies across providers. */
   reasoningLevel?: ReasoningLevel;
+  /** Voice layer composed above the shared craft core. "ares" is the default
+   *  swagger; "neutral" is plain and factual; "custom" uses personaCustom
+   *  verbatim (empty string = no persona at all). Personality is a colour on
+   *  top of the engineering doctrine, never a replacement for it. */
+  personaStyle?: PersonaStyle;
+  /** Verbatim persona text when personaStyle is "custom". */
+  personaCustom?: string;
   /** Owner-assigned per-lane model routing (chat/coding/research/tool-use). */
   routing?: RouteAssignments;
   /** Explicit model selection mode. Auto applies routing lanes per turn. */
@@ -70,6 +80,10 @@ export interface UiSettings {
   deepSeekKey?: string;
   /** Last DeepSeek model id the owner selected. */
   lastDeepSeekModel?: string;
+  /** Kimi (Moonshot) API key for the api.kimi.com coding endpoint. */
+  kimiKey?: string;
+  /** Last Kimi model id the owner selected. */
+  lastKimiModel?: string;
   /** Ollama Cloud API key for direct ollama.com catalog and model access. */
   ollamaApiKey?: string;
   /** Custom OpenAI-compatible provider — base URL ending in the API root, e.g.
@@ -82,6 +96,14 @@ export interface UiSettings {
   lastCustomModel?: string;
   /** Last Mixture-of-Agents ensemble picked (e.g. "moa-council"). */
   lastMoaModel?: string;
+  /** Where Ares is allowed to do work.
+   *  "host" (default) — the owner's machine, gated as always, plus the agent
+   *    computer when a Computer* tool is called.
+   *  "sandbox" — the agent computer ONLY: host shells, host GUI control, and
+   *    host file writes are withheld entirely, so nothing can touch the
+   *    owner's machine even by mistake. Host reads stay so Ares can still see
+   *    the project, and ComputerTransfer remains the one sanctioned bridge. */
+  computerMode?: "host" | "sandbox";
   /** Advanced engine knobs surfaced in the desktop Advanced tab. */
   engine?: EngineConfig;
   /** Owner-toggleable permission posture (master + per-category + fleet inherit).
@@ -117,6 +139,9 @@ export interface EngineConfig {
   operatorTickMinutes?: number;
   /** Subagent turn limit (default 50). */
   subagentTurnLimit?: number;
+  /** Let ComputerUse activate/drive REAL browser windows with the physical
+   *  mouse (default false — web content must not reach the desktop input). */
+  computerUseBrowser?: boolean;
 }
 
 export function uiSettingsPath(): string {
@@ -134,6 +159,27 @@ export async function loadUiSettings(): Promise<UiSettings> {
     };
   } catch {
     return { favoriteOllamaModels: [], favoriteOpenAIModels: [] };
+  }
+}
+
+/**
+ * Non-secret settings, read synchronously with an mtime cache. Prompt
+ * composition happens on a hot path that cannot await disk, and a toggle the
+ * owner flips must be in force on the very next turn — so this re-reads only
+ * when ui.json actually changed. Encrypted fields are NOT decrypted here;
+ * callers must only use plain fields (e.g. computerMode).
+ */
+let settingsCache: { mtimeMs: number; value: UiSettings } | null = null;
+export function cachedUiSettings(): UiSettings | null {
+  try {
+    const filePath = uiSettingsPath();
+    const stamp = statSync(filePath).mtimeMs;
+    if (settingsCache?.mtimeMs === stamp) return settingsCache.value;
+    const value = JSON.parse(readFileSync(filePath, "utf8")) as UiSettings;
+    settingsCache = { mtimeMs: stamp, value };
+    return value;
+  } catch {
+    return null;
   }
 }
 

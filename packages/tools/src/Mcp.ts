@@ -10,7 +10,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildTool, toolError } from "./_shared.js";
-import { getMcpAccessToken } from "@ares/core";
+import { getMcpCallCredentials } from "@ares/core";
 
 const listInputSchema = z
   .object({
@@ -45,6 +45,8 @@ interface RemoteServerConfig {
   authToken?: string;
   /** OAuth connector — the bearer lives in the encrypted vault, not here. */
   oauth?: boolean;
+  /** Static vault-token connector (pasted API key) — bearer in the vault too. */
+  vault?: boolean;
   /** Injected at load time (the config-map key) so the vault token resolves. */
   serverName?: string;
 }
@@ -98,6 +100,33 @@ export const McpListToolsTool = buildTool({
     };
   },
 });
+
+/** Tool listing for the desktop `/mcp` explorer: connects to one named server
+ *  (even a paused one — the panel shows what it WOULD provide) and returns its
+ *  tools. Not agent-facing; the daemon calls this on behalf of the panel. */
+export async function listMcpServerTools(
+  workspace: string,
+  server: string,
+  timeoutMs?: number,
+): Promise<{ tools: Array<{ name: string; description?: string }>; error?: string }> {
+  const loaded = await loadMcpConfig(workspace, true);
+  const cfg = loaded.servers[server];
+  if (!cfg) return { tools: [], error: `unknown MCP server: ${server}` };
+  try {
+    const result = await withMcpClient(cfg, timeoutMs ?? 15_000, async (client) => await client.request("tools/list", {}));
+    const raw = (result as { tools?: unknown[] }).tools ?? [];
+    const tools = raw
+      .filter((t): t is Record<string, unknown> => !!t && typeof t === "object")
+      .map((t) => ({
+        name: typeof t.name === "string" ? t.name : "",
+        description: typeof t.description === "string" ? t.description : undefined,
+      }))
+      .filter((t) => t.name);
+    return { tools };
+  } catch (err) {
+    return { tools: [], error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
 export const McpCallTool = buildTool({
   name: "McpCallTool",
@@ -155,7 +184,7 @@ function extractMcpErrorText(result: unknown): string {
   return "tool reported an error";
 }
 
-async function loadMcpConfig(workspace: string): Promise<{ servers: Record<string, McpServerConfig>; configFiles: string[] }> {
+async function loadMcpConfig(workspace: string, includeDisabled = false): Promise<{ servers: Record<string, McpServerConfig>; configFiles: string[] }> {
   const home = process.env.ARES_HOME || path.join(os.homedir(), ".ares");
   // mcp-remote.json is written by the connector gallery (remote HTTP servers);
   // mcp.json is the classic hand-authored (usually stdio) config.
@@ -169,7 +198,13 @@ async function loadMcpConfig(workspace: string): Promise<{ servers: Record<strin
   for (const file of candidates) {
     try {
       const json = JSON.parse(await fs.readFile(file, "utf8")) as McpConfig;
-      Object.assign(servers, json.servers ?? json.mcpServers ?? {});
+      const entries = json.servers ?? json.mcpServers ?? {};
+      for (const [name, cfg] of Object.entries(entries)) {
+        // A paused connector (enabled:false from the /mcp toggle) keeps its
+        // tokens but contributes no tools.
+        if (!includeDisabled && (cfg as { enabled?: boolean }).enabled === false) continue;
+        servers[name] = cfg;
+      }
       configFiles.push(file);
     } catch {
       // absent or invalid; ignore here so the tool still reports what is available
@@ -373,12 +408,20 @@ async function withMcpClient<T>(
 ): Promise<T> {
   if (isRemote(cfg)) {
     const headers: Record<string, string> = { ...(cfg.headers ?? {}) };
-    // OAuth connectors carry no secret on disk — resolve a fresh (auto-refreshed)
-    // access token from the encrypted vault at call-time. A manually pasted
-    // authToken is used as-is. Either way it becomes the bearer.
+    // OAuth AND static vault connectors carry no secret on disk — resolve the
+    // bearer AND any custom headers from the encrypted vault at call-time
+    // (OAuth bundles auto-refresh; static bundles come back as-is). A legacy
+    // plaintext authToken/header set (hand-authored mcp.json) is the fallback;
+    // gallery-managed entries are swept into the vault on load.
     let bearer = cfg.authToken;
-    if (cfg.oauth && cfg.serverName) {
-      bearer = (await getMcpAccessToken(cfg.serverName).catch(() => null)) ?? bearer;
+    if (cfg.serverName) {
+      const vaulted = await getMcpCallCredentials(cfg.serverName).catch(() => null);
+      if (vaulted) {
+        for (const [key, value] of Object.entries(vaulted.headers)) {
+          if (!(key in headers)) headers[key] = value;
+        }
+        bearer = vaulted.bearer ?? bearer;
+      }
     }
     if (bearer && !headers.Authorization && !headers.authorization) {
       headers.Authorization = `Bearer ${bearer}`;

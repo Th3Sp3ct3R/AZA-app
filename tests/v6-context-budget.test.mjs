@@ -21,12 +21,35 @@ function textMsg(role, chars, tag) {
 }
 
 test("budget: oldest messages trim away, the pending message always survives", () => {
-  // 5 messages ~1000 tokens each (4000 chars), budget 2500 tokens, no overhead.
-  const msgs = [0, 1, 2, 3, 4].map((i) => textMsg(i % 2 ? "assistant" : "user", 4000, `${i}`));
+  // 12 messages ~1000 tokens each (4000 chars), budget 2500 tokens, no overhead.
+  const msgs = Array.from({ length: 12 }, (_, i) => textMsg(i % 2 ? "assistant" : "user", 4000, `${i}`));
   const { messages, trimmed } = budgetMessages(msgs, 2500, 0);
-  assert.ok(trimmed >= 3, `expected to trim the bulk, trimmed ${trimmed}`);
-  assert.ok(messages.length <= 2, `kept too many: ${messages.length}`);
-  assert.equal(messages[messages.length - 1].id, "m_4", "the latest (pending) message must be kept");
+  assert.ok(trimmed >= 8, `expected to trim the bulk, trimmed ${trimmed}`);
+  assert.equal(messages[messages.length - 1].id, "m_11", "the latest (pending) message must be kept");
+});
+
+test("budget: trimming stops at the recent-history floor even over budget", () => {
+  // The field failure: a budget below the fixed overhead used to trim history
+  // to ONE message, and the model denied instructions from two turns ago.
+  // Default minKeep must hold the last 4 messages even when the result is
+  // still over budget — a slightly too-big prompt the provider can reject
+  // beats a silently erased conversation.
+  const msgs = Array.from({ length: 8 }, (_, i) => textMsg(i % 2 ? "assistant" : "user", 4000, `${i}`));
+  const { messages, trimmed } = budgetMessages(msgs, 100, 50_000);
+  assert.equal(messages.length, 4, "the recent-history floor must hold");
+  assert.equal(trimmed, 4);
+  assert.deepEqual(messages.map((m) => m.id), ["m_4", "m_5", "m_6", "m_7"], "the newest messages survive");
+});
+
+test("budget: minKeep=1 is the explicit last resort that shrinks to the pending message", () => {
+  // The engine passes 1 only on the FINAL ladder rung, reachable only via a
+  // hard context-limit rejection — a genuinely tiny provider window still gets
+  // a sendable prompt instead of a hard-failed turn.
+  const msgs = Array.from({ length: 8 }, (_, i) => textMsg(i % 2 ? "assistant" : "user", 4000, `${i}`));
+  const { messages, trimmed } = budgetMessages(msgs, 1200, 0, 1);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].id, "m_7");
+  assert.equal(trimmed, 7);
 });
 
 test("budget: an under-budget thread is returned untouched", () => {
@@ -250,4 +273,58 @@ test("chat tuning: tool results are bounded before entering model context", () =
   const result = stringifyModelToolOutput("x".repeat(40_000));
   assert.ok(result.length < 25_000, "model-facing tool result should be clipped");
   assert.match(result, /tool result truncated/);
+});
+
+test("stall descent: a thinking model that stalls repeatedly cannot erase recent history", async () => {
+  // The 2026-08-05 field report: hours into an anthropic/opus chat, the model
+  // denied an instruction given two turns earlier. Mechanism: reasoning stalls
+  // walked the shrink ladder to rungs BELOW the fixed prompt overhead, where
+  // budgetMessages stripped every message but the pending one. The contract
+  // now: stall-driven shrink is capped and floored (history survives), and a
+  // model producing only reasoning trips the unresponsive breaker instead of
+  // descending forever.
+  process.env.ARES_STREAM_IDLE_MS = "1000";
+  process.env.ARES_THINK_CEILING_MS = "1000";
+  try {
+    const perCallCounts = [];
+    const provider = {
+      name: "thinking-staller",
+      async *stream(req) {
+        perCallCounts.push(req.messages.length);
+        yield { type: "thinking_delta", text: "pondering..." };
+        await new Promise((resolve) => {
+          if (req.signal?.aborted) return resolve();
+          req.signal?.addEventListener("abort", resolve, { once: true });
+        });
+      },
+    };
+    const workspace = mkdtempSync(path.join(os.tmpdir(), "ares-stall-amnesia-"));
+    const session = new Session({
+      workspace,
+      provider,
+      model: "m",
+      // A big system prompt puts the fixed overhead ABOVE the old bottom rungs
+      // (8k/4k) — the exact geometry that used to produce the lobotomy.
+      systemPrompt: "s".repeat(60_000),
+      tools: [],
+      initialMessages: Array.from({ length: 10 }, (_, i) => textMsg(i % 2 ? "assistant" : "user", 400, `hist_${i}`)),
+      contextBudgetTokens: 100_000,
+    });
+
+    const events = [];
+    for await (const event of session.send("and now do the thing I asked about")) events.push(event);
+
+    assert.ok(perCallCounts.length >= 2, `expected retries, saw ${perCallCounts.length} call(s)`);
+    for (const count of perCallCounts) {
+      assert.ok(count >= 4, `a provider call saw only ${count} message(s) — recent history was erased (calls: ${perCallCounts.join(", ")})`);
+    }
+    const errors = events.filter((e) => e.type === "error");
+    assert.ok(
+      errors.some((e) => e.error?.code === "provider_unresponsive"),
+      `a thinking-only staller must trip the unresponsive breaker, got: ${errors.map((e) => e.error?.code).join(", ") || "no errors"}`,
+    );
+  } finally {
+    delete process.env.ARES_STREAM_IDLE_MS;
+    delete process.env.ARES_THINK_CEILING_MS;
+  }
 });

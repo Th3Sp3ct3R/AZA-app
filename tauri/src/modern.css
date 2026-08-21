@@ -1,0 +1,2916 @@
+/* ═══ ARES · MODERN ════════════════════════════════════════════════════════
+   Implementation of the "Ares UI mockup revamp" design project (Ares HELM).
+
+   The system in one breath: a near-black obsidian room, gold hairlines instead
+   of borders, and every affordance struck as a MEDALLION — a lit coin with a
+   gold rim and a line-art Spartan glyph carrying one drop of crimson. Cinzel
+   sets the display voice (ARES, section labels), Manrope speaks the UI, and
+   JetBrains Mono handles anything numeric or literal.
+
+   Scoped entirely under .ares[data-style="modern"]; Forged and Legacy render
+   untouched beneath it and the switch in Settings → Appearance is instant.
+
+   Rules this file keeps:
+   - Gold (#c89b5e family) is structure and rest. Ember (#e26634/#ff6a30) is
+     the primary action and live work. Crimson (#a02b1e) only ever appears as
+     the accent inside a glyph. Mint (#5ec27a) means ready/passed. Nothing else
+     is allowed a color opinion.
+   - Hairlines are rgba(200,155,94,.13) at rest, .26 raised, .45 active.
+   - Panels are near-opaque gradients, not blur. Blur is reserved for the two
+     surfaces that actually float over content (composer, overlays). */
+
+@import url("https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+/* ── tokens ──────────────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] {
+  --bg: #080706;
+  --bg-raised: #0d0b0a;
+  --panel: #131110;
+  --panel-2: #0c0a09;
+
+  --text: #efe3cf;
+  --text-hi: #f6ecda;
+  --muted: rgba(239, 227, 207, 0.62);
+  --faint: rgba(239, 227, 207, 0.4);
+
+  /* gold — structure, rest, labels */
+  --gold: #c89b5e;
+  --gold-hi: #e8c893;
+  --gold-glyph: #d9ab6e;
+  --line: rgba(200, 155, 94, 0.13);
+  --line-raised: rgba(200, 155, 94, 0.26);
+  --line-active: rgba(200, 155, 94, 0.45);
+
+  /* ember — action, heat, live work */
+  --ember: #ff6a30;
+  --ember-hi: #ffb24d;
+  --ember-text: #ffb083;
+  --ember-rim: rgba(226, 140, 80, 0.5);
+  --ember-rgb: 255, 106, 48;
+
+  /* crimson — the drop of blood (glyph accents, primary fills) */
+  --blood: #8f1d1d;
+  --accent: #e26634;
+  --accent-hi: #ffcf9a;
+  --accent-rgb: 226, 102, 52;
+
+  /* verdicts */
+  --steel: #5ec27a;
+  --mint-text: #a7d9b4;
+  --crimson: #c9564a;
+
+  /* Softer geometry throughout. The squared-off 9/13/16 set read as "stale
+     dashboard"; frosted glass wants generous, continuous curvature. */
+  --r-sm: 12px;
+  --r-md: 18px;
+  --r-lg: 24px;
+
+  --display: "Cinzel", "Palatino Linotype", Palatino, Georgia, serif;
+  --font: "Manrope", ui-sans-serif, "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+
+  /* the coin — every medallion is struck from these two lines */
+  --coin: radial-gradient(120% 120% at 34% 24%, #1b1817, #0a0908);
+  --coin-ember: radial-gradient(120% 120% at 34% 24%, #241d19, #0b0a09);
+
+  /* ── the glass ────────────────────────────────────────────────────────
+     Panels are lenses, not paint: a warm translucency that lets the room and
+     the helm behind them bleed through, a heavy blur so text stays readable
+     over it, and a bright specular hairline along the top edge where the
+     light catches. The blur is what makes it read as glass rather than a
+     flat tinted card — without it this is just a lighter rectangle. */
+  --glass-fill: linear-gradient(158deg, rgba(255, 246, 236, 0.11) 0%, rgba(255, 240, 226, 0.045) 42%, rgba(255, 236, 220, 0.022) 100%);
+  --glass-edge: rgba(255, 240, 224, 0.16);
+  /* a true frosted edge: bright specular along the top, a faint bounce along
+     the bottom — the pair is what reads as a THICK pane rather than a tint */
+  --glass-spec: inset 0 1px 0 rgba(255, 248, 238, 0.2), inset 0 -1px 0 rgba(255, 210, 170, 0.05);
+  --glass-blur: blur(40px) saturate(165%);
+  --glass-lift: 0 14px 40px -14px rgba(0, 0, 0, 0.62);
+
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* every war-band keeps the room; only the ember hue shifts */
+.ares[data-style="modern"][data-theme="steel"] { --accent: #4f9f9a; --accent-rgb: 79, 159, 154; --ember: #5fb8b0; --ember-rgb: 95, 184, 176; }
+.ares[data-style="modern"][data-theme="nightfall"] { --accent: #7d76d8; --accent-rgb: 125, 118, 216; --ember: #9a8bef; --ember-rgb: 154, 139, 239; }
+.ares[data-style="modern"][data-theme="verdant"] { --accent: #4faa78; --accent-rgb: 79, 170, 120; --ember: #59c08c; --ember-rgb: 89, 192, 140; }
+
+/* ── the sigil set ───────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] .medallion {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  border-radius: 50%;
+  color: var(--gold-glyph);
+  background: var(--coin);
+  border: 1px solid rgba(200, 155, 94, 0.34);
+  transition: color 150ms ease, border-color 150ms ease, box-shadow 150ms ease;
+}
+.ares[data-style="modern"] .medallion[data-tone="ember"] {
+  color: #e8bd83;
+  background: var(--coin-ember);
+  border-color: var(--ember-rim);
+}
+/* mint — the design's cool accent, reserved for ready/analysis states. */
+.ares[data-style="modern"] .medallion[data-tone="mint"] {
+  color: #bfe6c9;
+  background: radial-gradient(120% 120% at 30% 22%, rgba(94, 194, 122, 0.22), rgba(20, 30, 24, 0.9));
+  border-color: rgba(94, 194, 122, 0.42);
+}
+.ares[data-style="modern"] .medallion svg { display: block; }
+/* The sigils are hairline line-art (1.2–1.9px strokes in a 48-box) rendered at
+   16–28px. The default "auto" shape-rendering lets the rasteriser soften those
+   strokes to hit its speed heuristic, which is exactly the "dull and plain"
+   read — geometricPrecision keeps the edges sharp at every coin size. Scoped to
+   our own sprite so no third-party SVG pays for it. */
+.ares[data-style="modern"] svg use[href^="#ares-"],
+.ares[data-style="modern"] .medallion svg,
+.ares[data-style="modern"] .sigil {
+  shape-rendering: geometricPrecision;
+}
+/* hover state is owned by whatever the coin sits inside */
+.ares[data-style="modern"] button:hover > .medallion,
+.ares[data-style="modern"] a:hover > .medallion,
+.ares[data-style="modern"] .sessionRow:hover .medallion,
+.ares[data-style="modern"] .starter:hover .medallion {
+  color: var(--accent-hi);
+  border-color: rgba(255, 160, 90, 0.7);
+}
+
+/* ── shell ───────────────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] { grid-template-rows: 48px minmax(0, 1fr); }
+
+.ares[data-style="modern"] .backdrop::before {
+  background-image: url("/backdrop-helm.png"), url("/backdrop.jpg");
+  background-position: 74% 50%;
+  background-size: cover;
+  opacity: 0.1;
+  filter: none;
+  animation: none;
+}
+.ares[data-style="modern"] .backdrop::after,
+.ares[data-style="modern"] .backdrop .astrolabe,
+.ares[data-style="modern"] .backdrop .depthField { display: none; }
+
+/* THE VEIL IS GONE in Modern. `.ares::after` was a full-screen layer with
+   mix-blend-mode:screen at z-index 40 — i.e. composited ABOVE the titlebar and
+   status bar. Two problems: (1) a screen-blend layer over a backdrop-filtered
+   bar makes Chromium re-composite that bar every frame, which is the titlebar
+   "flicker"; (2) fading a screen blend in and out is luminance modulation of
+   the entire UI, the exact thing the effects overhaul exists to remove.
+   Working state is carried by the header ring and the static rim instead. */
+.ares[data-style="modern"]::after { display: none !important; }
+
+/* ── titlebar ────────────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] .titlebar {
+  height: 48px;
+  padding: 0 14px 0 18px;
+  gap: 14px;
+  background: linear-gradient(180deg, #100e0c, #0a0908);
+  border-bottom: 1px solid var(--line);
+}
+.ares[data-style="modern"] .titlebar .brand {
+  gap: 9px;
+  padding: 5px 12px;
+  border: 1px solid rgba(200, 155, 94, 0.14);
+  border-radius: var(--r-sm);
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.ares[data-style="modern"] .titlebar .brand:hover {
+  border-color: rgba(200, 155, 94, 0.42);
+  background: rgba(200, 155, 94, 0.06);
+}
+/* The rail already crowns the room with ARES, so the titlebar must not repeat
+   it. The account control collapses to a single small coin — present, but no
+   longer a second wordmark competing with the real one. */
+.ares[data-style="modern"] .titlebar h1 { display: none; }
+.ares[data-style="modern"] .titlebar .emblem {
+  display: block;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid rgba(200, 155, 94, 0.34);
+  background: var(--coin) center / 62% no-repeat;
+  background-image: var(--god-uri), var(--coin);
+  background-size: 60%, cover;
+  background-position: center, center;
+  background-repeat: no-repeat, no-repeat;
+  opacity: 0.9;
+}
+.ares[data-style="modern"] .titlebar .brand span { display: none; }
+
+.ares[data-style="modern"] .pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 13px;
+  border-radius: 999px;
+  border: 1px solid rgba(200, 155, 94, 0.2);
+  background: transparent;
+  font: 500 11px/1 var(--font);
+  letter-spacing: 0.06em;
+  text-transform: none;
+  color: var(--muted);
+  animation: none;
+}
+.ares[data-style="modern"] .pill::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--steel);
+  box-shadow: 0 0 8px var(--steel);
+}
+.ares[data-style="modern"] .pill[data-state="error"]::before,
+.ares[data-style="modern"] .pill[data-state="stopped"]::before { background: var(--crimson); box-shadow: 0 0 8px var(--crimson); }
+.ares[data-style="modern"] .pill[data-state="starting"]::before { background: var(--ember-hi); box-shadow: 0 0 8px var(--ember-hi); }
+
+/* the circular tool row at the right of the titlebar (search / forge / settings) */
+/* The window-drag strip is a full-height invisible band across the titlebar.
+   It must stay draggable, but it should never look or behave like a control:
+   no hover/active feedback of its own, and it never paints. (This is the
+   "invisible bar sitting there" — it is intentional, just made inert.) */
+.ares[data-style="modern"] .titleDrag {
+  background: none;
+  border: none;
+  box-shadow: none;
+  cursor: default;
+}
+
+.ares[data-style="modern"] .titleTools { display: flex; align-items: center; gap: 9px; margin-left: 8px; }
+.ares[data-style="modern"] .titleIcon {
+  width: 30px; height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  padding: 0;
+}
+.ares[data-style="modern"] .titleIcon[data-on="1"] > .medallion {
+  color: var(--accent-hi);
+  border-color: rgba(255, 160, 90, 0.7);
+  box-shadow: 0 0 16px -4px rgba(var(--ember-rgb), 0.5);
+}
+
+.ares[data-style="modern"] .winControls button { width: 40px; border-radius: 8px; }
+.ares[data-style="modern"] .winControls .winClose:hover { background: rgba(160, 43, 30, 0.85); }
+
+/* ── rail ────────────────────────────────────────────────────────────────── */
+
+/* ── the floating shell ───────────────────────────────────────────────────
+   Panels float in the room rather than tiling it: the whole grid is inset,
+   the rail is a rounded slab spanning full height (so it sits level with the
+   status pill, exactly like the reference), and the titlebar/status bar stop
+   being bars at all — see below. */
+.ares[data-style="modern"] {
+  padding: 14px 16px 16px;
+  column-gap: 16px;
+  grid-template-columns: 274px minmax(0, 1fr);
+  grid-template-areas:
+    "rail title"
+    "rail stage";
+}
+.ares[data-style="modern"][data-panel="1"] {
+  grid-template-columns: 274px minmax(0, 1fr) minmax(0, var(--forge-w, 480px));
+  grid-template-areas:
+    "rail title title"
+    "rail stage forge";
+}
+/* Collapsed states must be RE-declared: the base sheet's [data-rail="collapsed"]
+   rules tie with the two above on specificity, and this file loads later — so
+   without these, collapsing slid the rail away but left its 274px column as a
+   dead gutter (the "collapse kind of breaks it" bug). */
+.ares[data-style="modern"][data-rail="collapsed"] { grid-template-columns: 0 minmax(0, 1fr); column-gap: 0; }
+.ares[data-style="modern"][data-panel="1"][data-rail="collapsed"] { grid-template-columns: 0 minmax(0, 1fr) minmax(0, var(--forge-w, 480px)); column-gap: 16px; }
+.ares[data-style="modern"][data-rail="collapsed"] .rail { padding: 0; border: 0; }
+
+.ares[data-style="modern"] .rail {
+  grid-area: rail;
+  padding: 16px 12px 0;
+  gap: 0;
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+/* the wordmark crowning the rail */
+.ares[data-style="modern"] .railBrand {
+  display: block;
+  flex: none;
+  pointer-events: none; /* decorative — never steal the collapse click */
+  text-align: center;
+  padding: 8px 0 18px;
+  font: 600 21px/1 var(--display);
+  letter-spacing: 0.36em;
+  text-indent: 0.36em;
+  color: #f3e6cf;
+  text-shadow: 0 0 22px rgba(255, 140, 60, 0.32);
+}
+/* The rail keeps its own collapse chevron, and the stage keeps the reveal
+   chevron that replaces it — both sit top-left, which is where they belong.
+   (An earlier pass added a third toggle to the titlebar; it was redundant.) */
+.ares[data-style="modern"] .railCollapse {
+  order: -1;
+  align-self: flex-end;
+  margin-bottom: -26px; /* float it over the wordmark row */
+  /* The wordmark is pulled up over this button by that negative margin and,
+     being later in the DOM, would paint on top and swallow every click. Lift
+     the button above it; the wordmark takes no pointer events (see .railBrand). */
+  position: relative;
+  z-index: 2;
+  font: 500 9px/1 var(--mono);
+  letter-spacing: 0.1em;
+  color: rgba(232, 200, 147, 0.4);
+}
+.ares[data-style="modern"] .railCollapse span { display: none; }
+.ares[data-style="modern"] .railCollapse:hover { color: var(--gold-hi); }
+
+/* The primary action, wherever it appears: crimson-lit glass, no sheen sweep.
+   Deliberately NOT given a width or display — `.primary` is also the Settings
+   "Apply changes" button and a few inline confirms, and forcing width:100%
+   there collapsed the settings footer. Layout belongs to each host below. */
+.ares[data-style="modern"] .primary {
+  border-radius: var(--r-md);
+  font: 400 14px/1.2 var(--font);
+  color: #f3e6cf;
+  background: linear-gradient(180deg, rgba(143, 29, 29, 0.3), rgba(50, 12, 9, 0.18));
+  border: 1px solid rgba(226, 102, 52, 0.45);
+  box-shadow: inset 0 0 24px rgba(255, 106, 48, 0.13);
+  transition: border-color 150ms ease;
+}
+.ares[data-style="modern"] .primary::after { display: none; } /* kill the legacy sheen sweep */
+.ares[data-style="modern"] .primary:hover { border-color: rgba(255, 150, 80, 0.8); box-shadow: inset 0 0 24px rgba(255, 106, 48, 0.2); }
+
+/* New session — the rail's one crimson-lit action */
+.ares[data-style="modern"] .rail > .primary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 12px;
+  margin-bottom: 14px;
+  text-align: left;
+}
+.ares[data-style="modern"] .rail > .primary .primaryLabel { flex: 1; }
+
+/* nav rows */
+.ares[data-style="modern"] .railNav { display: flex; flex-direction: column; gap: 2px; }
+.ares[data-style="modern"] .railNav button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  font: 400 14px/1.2 var(--font);
+  color: rgba(240, 227, 205, 0.86);
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.ares[data-style="modern"] .railNav button:hover { background: rgba(200, 155, 94, 0.07); }
+.ares[data-style="modern"] .railNav button[data-on="1"] {
+  background: rgba(200, 155, 94, 0.1);
+  border-color: rgba(200, 155, 94, 0.28);
+  color: var(--text-hi);
+  box-shadow: none;
+}
+.ares[data-style="modern"] .railNav button[data-on="1"] > .medallion {
+  color: #e8bd83;
+  border-color: var(--ember-rim);
+  background: var(--coin-ember);
+}
+.ares[data-style="modern"] .railNav button > .glyph { display: none; } /* superseded by the medallion */
+.ares[data-style="modern"] .railNav button em {
+  margin-left: auto;
+  font: 400 10.5px/1 var(--mono);
+  font-style: normal;
+  color: rgba(232, 200, 147, 0.4);
+  background: none;
+  padding: 0;
+}
+
+/* search */
+.ares[data-style="modern"] .railSearch {
+  margin: 14px 0 12px;
+  padding: 9px 13px 9px 34px;
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.012)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='none'%3E%3Ccircle cx='6' cy='6' r='4.6' stroke='%23c89b5e' stroke-opacity='.75'/%3E%3Cpath d='M9.4 9.4 13 13' stroke='%23c89b5e' stroke-opacity='.75' stroke-linecap='round'/%3E%3C/svg%3E")
+    no-repeat 12px center;
+  font-size: 13px;
+}
+.ares[data-style="modern"] .railSearch:focus { border-color: rgba(200, 155, 94, 0.42); outline: none; }
+
+/* section labels — Cinzel small caps with a rule running out to the edge */
+.ares[data-style="modern"] .railLabel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px 7px;
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.5);
+}
+.ares[data-style="modern"] .railLabel::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* Session rows live INSIDE one grouped slab — the reference's card of missions
+   with hairline dividers — rather than floating as loose pills. */
+.ares[data-style="modern"] .sessionList {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-bottom: 14px;
+  border: 1px solid rgba(255, 240, 224, 0.1);
+  border-radius: var(--r-md);
+  background: linear-gradient(158deg, rgba(255, 246, 236, 0.05), rgba(255, 240, 226, 0.015));
+  overflow: hidden;
+}
+.ares[data-style="modern"] .sessionList:empty { display: none; }
+/* the rail is a flex column — without this the mission slab grows to eat all
+   remaining height and reads as a big empty box under the last session */
+.ares[data-style="modern"] .sessionList { flex: none; }
+.ares[data-style="modern"] .sessionList > * {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 11px;
+  border: none;
+  border-radius: 0;
+  transition: background 140ms ease;
+}
+.ares[data-style="modern"] .sessionList > * + * { border-top: 1px solid rgba(200, 155, 94, 0.09); }
+.ares[data-style="modern"] .sessionList > *:hover { background: rgba(200, 155, 94, 0.07); }
+.ares[data-style="modern"] .sessionList > *[data-on="1"] {
+  background: rgba(200, 155, 94, 0.1);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.ares[data-style="modern"] .sessionMain { min-width: 0; flex: 1; }
+/* The row is [busy dot][title] — NOT [title][subtitle], which is what these
+ * rules were written for when keyed on :first-child / :last-child. The result
+ * was exactly inverted: the 13px/92% "title" styling landed on a 6px status
+ * dot with no text in it, and the session title — the primary navigation label
+ * in the whole app, the thing you read to choose a session — inherited the
+ * 10.5px/38% subtitle treatment and rendered at 3.0:1 contrast, under AA.
+ * Target the elements themselves so the styling follows the meaning and cannot
+ * silently swap again if a third child ever appears. */
+.ares[data-style="modern"] .sessionMain > span { font-size: 13px; color: rgba(240, 227, 205, 0.92); }
+.ares[data-style="modern"] .sessionMain > .sessionSub { font-size: 10.5px; color: rgba(239, 227, 207, 0.55); }
+
+/* Forge and Settings live in the titlebar now — the rail must not offer them
+   twice. Undo stays (it has no other home) and the daemon dot closes the rail,
+   matching the design's footer. */
+.ares[data-style="modern"] .railFoot .ghost[data-act="forge"],
+.ares[data-style="modern"] .railFoot .ghost[data-act="settings"] { display: none; }
+
+.ares[data-style="modern"] .railFoot {
+  margin-top: auto;
+  padding: 10px 11px;
+  border-top: 1px solid rgba(200, 155, 94, 0.12);
+  gap: 6px;
+}
+.ares[data-style="modern"] .railFoot .ghost {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+  padding: 7px 10px;
+  text-align: left;
+}
+.ares[data-style="modern"] .railFoot .ghost:hover { background: rgba(200, 155, 94, 0.07); color: var(--text); }
+.ares[data-style="modern"] .daemonDot { font: 400 10.5px/1 var(--mono); color: rgba(239, 227, 207, 0.45); }
+.ares[data-style="modern"] .daemonDot i[data-state="running"] { background: var(--steel); box-shadow: 0 0 8px var(--steel); }
+
+/* ── stage ───────────────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] .stage { background: transparent; }
+.ares[data-style="modern"] .stageHead {
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+}
+/* The reveal chevron is the ONLY way back once the rail is hidden, so it is
+   styled to match the room rather than removed. */
+.ares[data-style="modern"] .railReveal {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1px solid rgba(200, 155, 94, 0.22);
+  background: rgba(255, 255, 255, 0.03);
+  color: rgba(232, 200, 147, 0.6);
+  transition: border-color 140ms ease, color 140ms ease;
+}
+.ares[data-style="modern"] .railReveal:hover { border-color: rgba(255, 160, 90, 0.6); color: var(--accent-hi); }
+
+/* ── the sanctum (empty state) ───────────────────────────────────────────── */
+
+.ares[data-style="modern"] .chat {
+  padding: 28px 0 20px;
+  /* The transcript column is a FIXED measure, centred with auto margins. If a
+     child ever exceeds it, `overflow-x: auto` (which the base sheet's
+     overflow-y:auto implies) turns the whole column into a horizontal
+     scroller — and because the column is centred, the overflow eats into the
+     LEFT margin and the text reads as bled-off/cut. A streaming thought does
+     exactly this transiently: its height animates on every chunk while the
+     text grows. Nothing here legitimately needs the column to scroll
+     sideways — code blocks, diagrams and tables scroll inside themselves —
+     so pin it shut. */
+  overflow-x: hidden;
+}
+/* ONE left edge for the whole transcript.
+ *
+ * Every child was centred with `margin: auto` — correct on its own, but each
+ * KIND carries a different max-width (assistant turns 86%, tool cards 80%, the
+ * approval gate its own fixed width). Centre things of different widths inside
+ * the same column and their left edges fan out into a staircase: measured at
+ * 341 / 367 / 393 / 480, with the answer text at 415 because it also sits past
+ * the avatar. Five edges down one conversation, so nothing lined up with
+ * anything and the agent's output had no column to read down.
+ *
+ * The measures themselves are worth keeping — they exist so a line of prose
+ * does not run 880px wide — so the widths are untouched and only the ANCHOR
+ * changes: every item is pinned to the column's left edge instead of being
+ * centred at its own width. Written as an explicit margin rather than `auto`
+ * so the same expression can be offset by the gutter below. */
+.ares[data-style="modern"] .chat {
+  --chat-col: min(880px, 92%);
+  /* the avatar column an assistant turn hangs in: 34px mark + 14px gap */
+  --turn-gutter: 48px;
+}
+.ares[data-style="modern"] .chat > * {
+  width: var(--chat-col);
+  margin-left: calc((100% - var(--chat-col)) / 2);
+  margin-right: 0;
+  min-width: 0;
+}
+/* The agent's standalone cards belong to the ANSWER, not to the turn's outer
+   frame, so they align with the prose — past the avatar — rather than with the
+   avatar itself. That is the single edge everything the agent emits shares. */
+.ares[data-style="modern"] .chat > .toolCard,
+.ares[data-style="modern"] .chat > .artifact,
+.ares[data-style="modern"] .chat > .gate,
+.ares[data-style="modern"] .chat > .notice,
+.ares[data-style="modern"] .chat > .authPrompt,
+.ares[data-style="modern"] .chat > .permissionCard,
+.ares[data-style="modern"] .chat > .diffCard {
+  margin-left: calc((100% - var(--chat-col)) / 2 + var(--turn-gutter));
+}
+
+/* The sanctum is full-bleed: the helm owns the whole stage, the session header
+   steps aside, and the composer becomes a pill floating in the same frame —
+   exactly the home state of the design. */
+/* Dropping the header removes a grid ITEM, so the stage's four-row template
+   would shift up and hand the composer the flexible row (an ellipse-tall
+   pill). Re-declare the rows for the three that remain. */
+.ares[data-style="modern"] .stage:has(.chat > .empty) > .stageHead { display: none; }
+.ares[data-style="modern"] .stage:has(.chat > .empty) { grid-template-rows: minmax(0, 1fr) auto auto; }
+/* …EXCEPT when the rail is hidden. The reveal chevron lives in that header, so
+   hiding it on the sanctum stranded the rail with no way back — the panel that
+   "disappeared and couldn't be found". Keep the header just for the chevron
+   (its title/model text stays hidden), and restore the four-row template since
+   the header is a grid item again. */
+.ares[data-style="modern"][data-rail="collapsed"] .stage:has(.chat > .empty) > .stageHead {
+  display: flex;
+  border-bottom: none;
+  background: none;
+}
+.ares[data-style="modern"][data-rail="collapsed"] .stage:has(.chat > .empty) > .stageHead > div { display: none; }
+.ares[data-style="modern"][data-rail="collapsed"] .stage:has(.chat > .empty) { grid-template-rows: auto minmax(0, 1fr) auto auto; }
+/* The scroller becomes the frame: it stops scrolling, drops its reading
+   gutters, and carries the helm itself — so the artwork is full-bleed behind
+   the hero instead of boxed inside it. */
+.ares[data-style="modern"] .chat:has(> .empty) {
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  justify-content: center;
+}
+.ares[data-style="modern"] .chat:has(> .empty)::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-image: url("/backdrop-helm.png"), url("/backdrop.jpg");
+  background-size: cover;
+  background-position: 74% 50%;
+  opacity: 0.92;
+  pointer-events: none;
+}
+.ares[data-style="modern"] .chat:has(> .empty)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: radial-gradient(115% 95% at 16% 48%, rgba(8, 7, 6, 0.95) 20%, rgba(8, 7, 6, 0.6) 56%, rgba(8, 7, 6, 0.18) 100%);
+  pointer-events: none;
+}
+
+.ares[data-style="modern"] .empty {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  width: 100%;
+  max-width: none;
+  /* the `.chat > *` one-column rule margins every child left by
+     (100% - chat-col)/2; at width:100% that shoves the whole hero right of
+     the composer axis and clips the excess. The sanctum is full-bleed, so
+     it centres itself — zero the column anchor. */
+  margin-left: 0;
+  margin-right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 20px 40px 34px;
+  animation: riseIn 0.6s ease both;
+}
+
+/* the home composer: a full pill with larger coins */
+.ares[data-style="modern"] .stage:has(.chat > .empty) .composer { padding-bottom: 34px; }
+.ares[data-style="modern"] .stage:has(.chat > .empty) .composerRow {
+  width: min(880px, 86%);
+  align-items: center;
+  padding: 11px 12px 11px 26px;
+  border-radius: 999px;
+  background: rgba(12, 10, 9, 0.84);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+.ares[data-style="modern"] .stage:has(.chat > .empty) .composerRow textarea { font-size: 16px; padding: 8px 0; }
+.ares[data-style="modern"] .stage:has(.chat > .empty) .mic,
+.ares[data-style="modern"] .stage:has(.chat > .empty) .send { width: 44px; height: 44px; }
+/* the hero mark */
+.ares[data-style="modern"] .empty .emptyEmblem {
+  /* the legacy emblem breathes down to ~6% opacity as ambient decoration; here
+     it IS the hero mark, so it holds full strength */
+  opacity: 1;
+  animation: none;
+  width: 116px;
+  height: 116px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #e8bd83;
+  background: var(--coin-ember);
+  border: 1px solid rgba(226, 140, 80, 0.45);
+  box-shadow: 0 0 52px rgba(255, 106, 48, 0.2);
+  mask: none;
+  -webkit-mask: none;
+}
+.ares[data-style="modern"] .empty .emptyEmblem::before,
+.ares[data-style="modern"] .empty .emptyEmblem::after { display: none; }
+
+.ares[data-style="modern"] .empty .wordmark {
+  margin-top: 22px;
+  font: 600 clamp(42px, 5.4vw, 70px)/1 var(--display);
+  letter-spacing: 0.28em;
+  text-indent: 0.28em;
+  color: #f6ecda;
+  text-shadow: 0 0 40px rgba(255, 140, 60, 0.3);
+}
+.ares[data-style="modern"] .empty .wordmarkSub { display: none; }
+.ares[data-style="modern"] .empty .emptyAsk {
+  margin: 4px 0 0;
+  font: 400 17px/1.4 var(--font);
+  color: rgba(239, 227, 207, 0.72);
+}
+
+/* the three invitations */
+.ares[data-style="modern"] .starters {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 16px;
+  margin-top: 34px;
+  max-width: min(820px, 100%);
+}
+.ares[data-style="modern"] .starter .starterLabel { white-space: nowrap; }
+.ares[data-style="modern"] .starter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 22px 8px 8px;
+  border-radius: 999px;
+  font: 400 14.5px/1.2 var(--font);
+  color: #f0e3cd;
+  background: rgba(13, 11, 10, 0.74);
+  border: 1px solid rgba(200, 155, 94, 0.28);
+  transition: border-color 150ms ease, background 150ms ease;
+}
+.ares[data-style="modern"] .starter:hover {
+  border-color: rgba(255, 150, 80, 0.65);
+  background: rgba(26, 19, 16, 0.88);
+  transform: none;
+}
+
+/* ── transcript ──────────────────────────────────────────────────────────── */
+
+/* the user speaks in a crimson-lit card, tucked to the right */
+.ares[data-style="modern"] .turn.user { justify-content: flex-end; }
+.ares[data-style="modern"] .turn.user .bubble {
+  max-width: 76%;
+  padding: 13px 18px;
+  border-radius: 16px 16px 4px 16px;
+  background: linear-gradient(180deg, rgba(143, 29, 29, 0.24), rgba(56, 13, 9, 0.16));
+  border: 1px solid rgba(226, 102, 52, 0.3);
+  font-size: 14.5px;
+  line-height: 1.6;
+  box-shadow: none;
+}
+/* the agent answers from the gutter: helm coin, then the content column */
+.ares[data-style="modern"] .turn.assistant {
+  display: flex;
+  gap: 14px;
+  font-size: 14.5px;
+  line-height: 1.75;
+  color: rgba(240, 229, 210, 0.93);
+}
+.ares[data-style="modern"] .turn.assistant .turnMark { margin-top: 2px; }
+.ares[data-style="modern"] .turn.assistant .turnBody {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Thinking reads as a margin note, not a card.
+   The padding lives on .springInner, NOT here: this element's height is
+   animated to the inner wrapper's offsetHeight, which excludes this element's
+   own padding — putting it here made the note clip its own last lines, and
+   worse the longer the thought got. Border/background stay on the animated
+   box so the frame still springs with it. */
+.ares[data-style="modern"] .thought,
+.ares[data-style="modern"] .thinking {
+  padding: 0;
+  border-radius: 12px;
+  border: 1px dashed rgba(200, 155, 94, 0.22);
+  background: rgba(255, 255, 255, 0.014);
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: rgba(239, 227, 207, 0.5);
+  font-style: italic;
+  min-width: 0;
+  max-width: 100%;
+}
+.ares[data-style="modern"] .thinking > .springInner,
+.ares[data-style="modern"] .thought > .springInner { padding: 11px 15px; min-width: 0; overflow-x: hidden; }
+/* A LIVE thought is the hard case: the tail rewrites on every streamed chunk
+   while SpringHeight re-animates the height, so any chunk that briefly
+   establishes a wide min-content would jolt the column. Force every line to
+   wrap in place — a streaming thought must never be able to size the card. */
+.ares[data-style="modern"] .thinking .thinkText,
+.ares[data-style="modern"] .thought .thinkText {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+/* the legacy (non-animated) path has no inner wrapper — pad it directly */
+.ares[data-style="modern"] .thinking:not(:has(> .springInner)),
+.ares[data-style="modern"] .thought:not(:has(> .springInner)) { padding: 11px 15px; }
+
+/* Nothing inside an assistant turn may force the column wider than its share:
+   a long path, URL or code fragment wraps or scrolls internally instead. */
+.ares[data-style="modern"] .turn.assistant .turnBody > * { min-width: 0; max-width: 100%; }
+.ares[data-style="modern"] .thinkText { overflow-wrap: anywhere; word-break: break-word; }
+
+/* every agent-side card shares one frame */
+.ares[data-style="modern"] .toolCard,
+.ares[data-style="modern"] .notice,
+.ares[data-style="modern"] .authPrompt,
+.ares[data-style="modern"] .artifact,
+.ares[data-style="modern"] .permissionCard,
+.ares[data-style="modern"] .diffCard {
+  border: 1px solid rgba(200, 155, 94, 0.18);
+  border-radius: 14px;
+  background: linear-gradient(180deg, #131110, #0c0a09);
+  box-shadow: none;
+  overflow: hidden;
+}
+.ares[data-style="modern"] .toolCardHead {
+  padding: 11px 15px;
+  gap: 11px;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.13);
+  background: transparent;
+}
+/* the head reads as a Cinzel label + a mono duration, like the design */
+.ares[data-style="modern"] .toolCardTitle {
+  font: 600 10px/1.4 var(--display);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.72);
+}
+.ares[data-style="modern"] .toolCardSub {
+  font: 400 11px/1.4 var(--mono);
+  color: rgba(239, 227, 207, 0.4);
+}
+/* the status light replaces the boxed icon tile */
+.ares[data-style="modern"] .toolCardIcon {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: none;
+  background: var(--steel);
+  box-shadow: 0 0 9px var(--steel);
+  overflow: hidden;
+  text-indent: -999px;
+}
+.ares[data-style="modern"] .toolCard[data-state="running"] .toolCardIcon { background: var(--ember-hi); box-shadow: 0 0 9px var(--ember-hi); animation: emberPulse 1.6s ease-in-out infinite; }
+.ares[data-style="modern"] .toolCard[data-state="error"] .toolCardIcon { background: var(--crimson); box-shadow: 0 0 9px var(--crimson); }
+.ares[data-style="modern"] .toolCard[data-state="error"] { border-color: rgba(201, 86, 74, 0.34); }
+
+/* tool steps — a mono ledger, one line each; the live row is washed in ember */
+.ares[data-style="modern"] .toolStep,
+.ares[data-style="modern"] .toolCardBody .step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 15px;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.07);
+  font: 400 12.5px/1.4 var(--mono);
+}
+.ares[data-style="modern"] .toolStep .name { color: var(--gold-hi); }
+.ares[data-style="modern"] .toolStep[data-state="running"],
+.ares[data-style="modern"] .toolCardBody .step[data-state="running"] { background: rgba(255, 106, 48, 0.05); }
+.ares[data-style="modern"] .toolStep[data-state="running"] .result { animation: emberPulse 1.6s ease-in-out infinite; }
+
+/* the running spinner: a bronze ring with one quadrant cut out */
+.ares[data-style="modern"] .toolSpin,
+.ares[data-style="modern"] .micSpin {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 178, 77, 0.85);
+  border-top-color: transparent;
+  animation: spinSlow 0.8s linear infinite;
+  background: none;
+}
+
+/* verdict chips */
+.ares[data-style="modern"] .chip,
+.ares[data-style="modern"] .verdictChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid rgba(200, 155, 94, 0.24);
+  background: rgba(200, 155, 94, 0.05);
+  font-size: 12px;
+  color: rgba(232, 200, 147, 0.85);
+}
+.ares[data-style="modern"] .chip[data-ok="1"] { border-color: rgba(94, 194, 122, 0.32); background: rgba(94, 194, 122, 0.07); color: var(--mint-text); }
+
+/* per-turn usage is metadata, not a card */
+.ares[data-style="modern"] .usage {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  font: 400 11px/1.4 var(--mono);
+  color: rgba(239, 227, 207, 0.35);
+}
+
+.ares[data-style="modern"] .working .workingLabel { color: var(--ember-text); }
+
+/* ── the artifact card ───────────────────────────────────────────────────
+   Was a thin strip with a bare "PREVIEW ▸". Now it reads as a THING you made:
+   an ember coin, the filename leading, its nature underneath, and a real
+   affordance on the right that lights up on hover. */
+.ares[data-style="modern"] .artifact {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: var(--r-md);
+  text-align: left;
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+.ares[data-style="modern"] .artifact > i { display: none; } /* legacy bullet */
+/* the base sheet flexes every child to 1fr, which stretched the coin into an
+   ellipse and blew the CTA to 300px — pin each child's role explicitly */
+.ares[data-style="modern"] .artifact > .medallion { flex: 0 0 auto; }
+.ares[data-style="modern"] .artifact > .artifactGo { flex: 0 0 auto; }
+.ares[data-style="modern"] .artifact > span { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
+.ares[data-style="modern"] .artifact strong {
+  font: 400 13.5px/1.3 var(--mono);
+  color: var(--gold-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ares[data-style="modern"] .artifact em { font-style: normal; font-size: 11.5px; color: var(--faint); }
+.ares[data-style="modern"] .artifactGo {
+  flex: none;
+  padding: 7px 15px;
+  border-radius: 999px;
+  border: 1px solid rgba(200, 155, 94, 0.28);
+  font: 500 11.5px/1 var(--font);
+  letter-spacing: 0.04em;
+  color: rgba(232, 200, 147, 0.85);
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+}
+.ares[data-style="modern"] .artifact:hover {
+  border-color: rgba(255, 150, 80, 0.45);
+  transform: translateY(-1px);
+}
+.ares[data-style="modern"] .artifact:hover .artifactGo {
+  border-color: rgba(255, 160, 90, 0.7);
+  background: rgba(226, 102, 52, 0.16);
+  color: var(--accent-hi);
+}
+
+/* ── the gate (approval card) ────────────────────────────────────────────
+   Restructured: a shield coin + headline on top, the exact command in mono
+   on its own full-width line (it's the thing being judged, so it gets the
+   most legible slot), and the three verdicts as real buttons underneath.
+   The old one crushed all three into a single row and ellipsised the
+   command — you were approving something you couldn't fully read. */
+.ares[data-style="modern"] .gate {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch; /* base centers children — the command must be full width */
+  gap: 12px;
+  width: auto;
+  max-width: 100%;
+  /* base runs `gateGlow` on an undecided gate: a 2.4s pulsing box-shadow, i.e.
+     exactly the kind of luminance oscillation the effects overhaul removed.
+     Keep the entrance, drop the pulse. */
+  animation: transcriptIn 360ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  padding: 16px 18px;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(226, 102, 52, 0.34);
+  background: linear-gradient(158deg, rgba(255, 246, 236, 0.08), rgba(143, 29, 29, 0.16) 60%, rgba(56, 13, 9, 0.2));
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-spec), var(--glass-lift);
+}
+.ares[data-style="modern"] .gate .gateIcon { display: none; }
+.ares[data-style="modern"] .gateTop { display: flex; align-items: center; gap: 12px; }
+.ares[data-style="modern"] .gateBody { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.ares[data-style="modern"] .gateBody strong {
+  font: 600 10px/1 var(--display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ember-text);
+}
+.ares[data-style="modern"] .gateReason { font-size: 13px; color: rgba(240, 227, 205, 0.86); }
+.ares[data-style="modern"] .gateReason b { font-weight: 500; color: var(--gold-hi); }
+.ares[data-style="modern"] .gateTarget {
+  display: block;
+  padding: 10px 13px;
+  border-radius: 12px;
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  background: rgba(0, 0, 0, 0.34);
+  font: 400 12px/1.6 var(--mono);
+  color: rgba(239, 227, 207, 0.82);
+  word-break: break-word;
+}
+.ares[data-style="modern"] .gateActions { display: flex; gap: 9px; }
+.ares[data-style="modern"] .gateActions button {
+  flex: 1;
+  padding: 9px 12px;
+  border-radius: 12px;
+  font: 500 12.5px/1 var(--font);
+  border: 1px solid rgba(200, 155, 94, 0.22);
+  background: rgba(255, 255, 255, 0.03);
+  color: rgba(239, 227, 207, 0.8);
+  transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
+}
+.ares[data-style="modern"] .gateActions button:hover { border-color: rgba(200, 155, 94, 0.5); color: var(--text); }
+.ares[data-style="modern"] .gateAllow {
+  border-color: rgba(226, 102, 52, 0.5) !important;
+  background: rgba(143, 29, 29, 0.42) !important;
+  color: #f6e6cd !important;
+}
+.ares[data-style="modern"] .gateAllow:hover { background: rgba(180, 45, 32, 0.55) !important; }
+.ares[data-style="modern"] .gateDeny:hover { border-color: rgba(201, 86, 74, 0.55); color: var(--crimson); }
+.ares[data-style="modern"] .gateDecided {
+  font: 400 10.5px/1 var(--mono);
+  font-style: normal;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+/* the YOLO posture segment — unmistakable when armed */
+.ares[data-style="modern"] .permSeg[data-yolo="1"] span {
+  color: var(--ember-text);
+  font-weight: 500;
+  letter-spacing: 0.1em;
+}
+.ares[data-style="modern"] .permSeg[data-yolo="1"],
+.ares[data-style="modern"] .permSeg[data-yolo="1"]:hover {
+  background: linear-gradient(180deg, rgba(143, 29, 29, 0.34), rgba(50, 12, 9, 0.18));
+  box-shadow: inset 0 0 20px rgba(255, 106, 48, 0.12);
+}
+
+/* the per-turn model/lane stamp — a quiet mono tag, not a boxed badge */
+.ares[data-style="modern"] .modelBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 11px;
+  border: 1px solid rgba(200, 155, 94, 0.18);
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  font: 400 10.5px/1.5 var(--mono);
+  color: rgba(232, 200, 147, 0.62);
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+.ares[data-style="modern"] .modelBadge .glyph { display: none; }
+.ares[data-style="modern"] .modelBadge em {
+  font-style: normal;
+  border-left: 1px solid rgba(200, 155, 94, 0.22);
+  margin-left: 2px;
+  padding-left: 8px;
+  color: rgba(239, 227, 207, 0.42);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 9.5px;
+}
+.ares[data-style="modern"] .watchBadge {
+  border: 1px solid rgba(200, 155, 94, 0.18);
+  border-radius: 999px;
+  background: transparent;
+  font: 400 10.5px/1.5 var(--mono);
+  color: rgba(232, 200, 147, 0.62);
+}
+
+/* ── composer ────────────────────────────────────────────────────────────── */
+
+/* The base composer is a grid, so its children stretch to the row box — which
+   inflated the pill into an ellipse. A flex column sizes every child to its
+   own content and centers the stack. */
+.ares[data-style="modern"] .composer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: none;
+  background: transparent;
+  border-top: none;
+  padding: 0 0 18px;
+}
+.ares[data-style="modern"] .composerRow,
+.ares[data-style="modern"] .composer .chips,
+.ares[data-style="modern"] .composer .attachments,
+.ares[data-style="modern"] .composer .slashMenu { width: min(880px, 92%); margin-left: auto; margin-right: auto; }
+
+.ares[data-style="modern"] .composerRow {
+  align-items: flex-end;
+  gap: 12px;
+  padding: 9px 12px 9px 20px;
+  border-radius: 26px;
+  background: rgba(12, 10, 9, 0.9);
+  border: 1px solid rgba(200, 155, 94, 0.26);
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+/* Focus belongs to the PILL, not to the bare textarea inside it.
+ *
+ * The blanket `textarea:focus-visible` ring below outlines the focused element
+ * itself, and an outline follows that element's own border-radius — which on a
+ * bare, square-cornered textarea means a hard 2px rectangle floating inside a
+ * 26px-radius bar. The composer was the one place in the app where that read as
+ * a tacky box rather than a focus ring.
+ *
+ * So the textarea's own outline is suppressed and the whole bar lights instead:
+ * warmer rim plus a soft halo that follows the pill. That is MORE visible than
+ * the rectangle it replaces, not less — the halo is 3px on a 880px-wide bar, so
+ * keyboard focus is if anything easier to spot. It eases in over 160ms and then
+ * holds: a static rim, nothing that pulses or flashes. */
+.ares[data-style="modern"] .composerRow:focus-within {
+  border-color: rgba(255, 150, 80, 0.5);
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5), 0 0 0 3px rgba(255, 150, 80, 0.14);
+}
+.ares[data-style="modern"] .composerRow textarea:focus-visible,
+.composerRow textarea:focus-visible { outline: none; }
+.ares[data-style="modern"] .composerRow textarea {
+  background: transparent;
+  border: none;
+  font-size: 15px;
+  line-height: 1.6;
+  padding: 9px 0;
+}
+.ares[data-style="modern"] .composerRow textarea::placeholder { color: rgba(239, 227, 207, 0.32); }
+
+/* the round controls — same coin, one ember for send */
+.ares[data-style="modern"] .mic,
+.ares[data-style="modern"] .send {
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--gold-glyph);
+  background: var(--coin);
+  border: 1px solid rgba(200, 155, 94, 0.34);
+  box-shadow: none;
+  transition: color 150ms ease, border-color 150ms ease;
+}
+.ares[data-style="modern"] .mic:hover { color: var(--accent-hi); border-color: rgba(255, 160, 90, 0.7); }
+.ares[data-style="modern"] .send {
+  color: #e8bd83;
+  background: var(--coin-ember);
+  border-color: var(--ember-rim);
+}
+.ares[data-style="modern"] .send:hover:not(:disabled) {
+  color: #ffd7a6;
+  border-color: rgba(255, 170, 100, 0.85);
+  transform: none;
+  filter: none;
+}
+.ares[data-style="modern"] .send.stop { color: var(--ember-text); border-color: rgba(226, 102, 52, 0.5); background: rgba(143, 29, 29, 0.42); }
+.ares[data-style="modern"] .send.steer { color: var(--gold-glyph); background: var(--coin); border-color: rgba(200, 155, 94, 0.34); }
+
+/* The ember rail that used to run under the composer is GONE.
+   It was a bar ruled straight across the window under the input — the one
+   element repeatedly reported as "squared off" — and no amount of blurring
+   fixes the underlying shape: a horizontal line has two ends, and ends read
+   as cut. The working state is now carried by light that has no edges at all
+   (the dome rising behind the composer) plus the hairline sweep travelling
+   the window rim, so nothing has to be drawn across the content. */
+.ares[data-style="modern"] .composer::after { content: none; }
+
+.ares[data-style="modern"] .slashMenu {
+  border: 1px solid rgba(200, 155, 94, 0.26);
+  border-radius: 12px;
+  background: linear-gradient(180deg, #171311, #0d0b0a);
+  box-shadow: 0 22px 50px rgba(0, 0, 0, 0.72);
+}
+
+/* ── status bar ──────────────────────────────────────────────────────────── */
+
+/* Grid items refuse to shrink below min-content by default, so a long model
+   id blew the status row past the stage column and pushed the whole
+   transcript out of the window. min-width:0 lets it shrink; the segments
+   ellipsise instead of overflowing. */
+.ares[data-style="modern"] .stage > * { min-width: 0; }
+.ares[data-style="modern"] .statusBar {
+  height: 40px;
+  padding: 0 12px;
+  gap: 0;
+  justify-content: center;
+  overflow: hidden;
+  font-size: 11.5px;
+}
+.ares[data-style="modern"] .statusBar .statusGroup:first-child { min-width: 0; max-width: 100%; overflow: hidden; }
+.ares[data-style="modern"] .statusSeg > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* the readout condenses into ONE floating glass capsule, centred under the
+   composer — the reference's "Garrison ready · model · Effort: High" chip */
+.ares[data-style="modern"] .statusBar .statusGroup:first-child {
+  gap: 0;
+  padding: 0 4px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 999px;
+  background: var(--glass-fill);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-spec), var(--glass-lift);
+}
+.ares[data-style="modern"] .statusBar .statusSeg { height: 32px; border-radius: 999px; }
+/* the base bar's flex spacer still occupied the row and shoved the capsule
+   left of centre even with justify-content:center */
+.ares[data-style="modern"] .statusBar .grow { display: none; }
+/* The capsule must stay CENTRED, so it can never be allowed to outgrow its
+   column — an overflowing capsule reads as "off-centre" even when it is
+   technically centred. Shed the least-useful ink first: the labels, then
+   segments whose state is visible elsewhere.
+
+   Shedding order is by data-seg, most expendable first: effects → perms →
+   effort → route. Route outlives the others because it now NAMES its lanes and
+   is the door to the War Table; persona, model and Garrison are last, because
+   "who and what am I talking to" is the whole point of the readout. Persona is
+   never shed at all — it only renders when one is worn, and the moment it is
+   worn it outranks everything else here. */
+@container (max-width: 940px) {
+  .ares[data-style="modern"] .statusBar .statusSeg b { display: none; }
+}
+@container (max-width: 780px) {
+  .ares[data-style="modern"] .statusBar .statusSeg[data-seg="effects"] { display: none; }
+}
+@container (max-width: 660px) {
+  .ares[data-style="modern"] .statusBar .statusSeg[data-seg="perms"] { display: none; }
+}
+@container (max-width: 560px) {
+  .ares[data-style="modern"] .statusBar .statusSeg[data-seg="effort"] { display: none; }
+}
+@container (max-width: 470px) {
+  .ares[data-style="modern"] .statusBar .statusSeg[data-seg="route"] { display: none; }
+}
+.ares[data-style="modern"] .statusSeg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 0;
+  border: none;
+  font-size: 11.5px;
+  color: rgba(239, 227, 207, 0.65);
+  position: relative;
+}
+.ares[data-style="modern"] .statusSeg + .statusSeg::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 14px;
+  background: rgba(200, 155, 94, 0.14);
+}
+.ares[data-style="modern"] .statusSeg:hover { background: rgba(200, 155, 94, 0.06); }
+/* Worn persona: the one segment that says the answer is coming from a shifted
+   Ares, so it carries the ember accent rather than the neutral gold. Static —
+   nothing here pulses or flashes (see the photosensitivity doctrine). */
+.ares[data-style="modern"] .statusSeg.personaSeg { background: rgba(var(--ember-rgb), 0.1); }
+.ares[data-style="modern"] .statusSeg.personaSeg:hover { background: rgba(var(--ember-rgb), 0.16); }
+.ares[data-style="modern"] .statusSeg.personaSeg > span { color: var(--ember-text); }
+/* the design reads as a sentence, not a telemetry rack: a plain-case label in
+   Manrope followed by its live value in mono gold. The base bar's 8.5px
+   all-caps micro-labels were the "still old" tell. */
+.ares[data-style="modern"] .statusSeg b {
+  font: 400 11.5px/1 var(--font);
+  letter-spacing: 0;
+  text-transform: none;
+  color: rgba(239, 227, 207, 0.65);
+}
+.ares[data-style="modern"] .statusSeg:hover b { color: rgba(239, 227, 207, 0.9); }
+.ares[data-style="modern"] .statusSeg > span {
+  font: 400 11.5px/1 var(--mono);
+  font-weight: 400;
+  color: rgba(232, 200, 147, 0.85);
+}
+.ares[data-style="modern"] .statusGroup .statusSeg + .statusSeg,
+.ares[data-style="modern"] .statusGroup .statusAction + *,
+.ares[data-style="modern"] .statusGroup .statusSeg + .statusAction { box-shadow: none; }
+.ares[data-style="modern"] .statusSeg .dot[data-state="running"] { background: var(--steel); box-shadow: 0 0 8px var(--steel); }
+.ares[data-style="modern"] .effortStatus span { color: var(--ember-text); }
+/* the little "auto" flag on the model chip: this model came from the router,
+   not from a pin — so the chip reads as live state, not a dead label */
+.ares[data-style="modern"] .segAuto {
+  font: 400 8.5px/1 var(--mono);
+  font-style: normal;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ember-text);
+  padding: 2px 5px;
+  border: 1px solid rgba(226, 102, 52, 0.34);
+  border-radius: 999px;
+}
+/* The capsule owns the centre. The token readout, utility icons and version
+   pin to the edges and ghost out, so nothing competes with it for width —
+   they were squeezing it until "effects" fell off the end. */
+.ares[data-style="modern"] .statusBar .hudReadout,
+.ares[data-style="modern"] .statusBar .statusActions,
+.ares[data-style="modern"] .statusBar .hudVersion {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 0.4;
+  transition: opacity 160ms ease;
+}
+.ares[data-style="modern"] .statusBar .hudReadout:hover,
+.ares[data-style="modern"] .statusBar .statusActions:hover,
+.ares[data-style="modern"] .statusBar .hudVersion:hover { opacity: 1; }
+.ares[data-style="modern"] .statusBar .hudReadout { left: 4px; }
+.ares[data-style="modern"] .statusBar .statusActions { right: 44px; }
+.ares[data-style="modern"] .statusBar .hudVersion { right: 4px; }
+@media (max-width: 1400px) { .ares[data-style="modern"] .statusBar .hudReadout { display: none; } }
+@media (max-width: 1150px) {
+  .ares[data-style="modern"] .statusBar .statusActions,
+  .ares[data-style="modern"] .statusBar .hudVersion { display: none; }
+}
+
+.ares[data-style="modern"] .hudReadout { font: 400 11px/1 var(--mono); color: rgba(239, 227, 207, 0.55); padding: 0 12px; }
+.ares[data-style="modern"] .statusActions { border: none; background: transparent; box-shadow: none; }
+.ares[data-style="modern"] .statusIcon { color: rgba(232, 200, 147, 0.55); }
+.ares[data-style="modern"] .statusIcon:hover { color: var(--gold-hi); background: rgba(200, 155, 94, 0.06); }
+.ares[data-style="modern"] .hudVersion { font: 400 10.5px/1 var(--mono); color: rgba(239, 227, 207, 0.3); padding: 0 10px; }
+.ares[data-style="modern"] .statusBar { position: relative; }
+
+/* ── forge + overlays ────────────────────────────────────────────────────── */
+
+/* The Forge is a floating slab too — same frosted material and radius as the
+   rail, not a squared-off panel welded to the right edge. */
+.ares[data-style="modern"] .forge {
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.ares[data-style="modern"] .forge > header {
+  background: transparent;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+/* the drag grip sits on the slab's edge, inside the rounded corner */
+.ares[data-style="modern"] .forgeGrip { border-radius: var(--r-lg) 0 0 var(--r-lg); }
+.ares[data-style="modern"] .forge > header strong {
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.24em;
+  color: rgba(232, 200, 147, 0.5);
+}
+
+/* Every floating overlay is smoked glass: a translucent warm pane that lets
+   the room glow through, blurred so text stays legible over the transcript.
+   This is the "apple glass" material the reference set is built on. */
+.ares[data-style="modern"] .palette,
+.ares[data-style="modern"] .drawer,
+.ares[data-style="modern"] .settingsShell,
+.ares[data-style="modern"] .accountMenu,
+.ares[data-style="modern"] .popover,
+.ares[data-style="modern"] .menu {
+  border: 1px solid rgba(200, 155, 94, 0.26);
+  border-radius: var(--r-lg);
+  background: linear-gradient(180deg, rgba(30, 25, 22, 0.82), rgba(13, 11, 10, 0.88));
+  -webkit-backdrop-filter: blur(26px) saturate(1.25);
+  backdrop-filter: blur(26px) saturate(1.25);
+  box-shadow: 0 22px 50px rgba(0, 0, 0, 0.72), inset 0 1px 0 rgba(255, 236, 214, 0.09);
+}
+.ares[data-style="modern"] .paletteScrim {
+  background: rgba(4, 3, 3, 0.66);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+
+/* the palette: a search rule over a list of struck rows */
+.ares[data-style="modern"] .palette { overflow: hidden; }
+.ares[data-style="modern"] .palette > input {
+  width: 100%;
+  padding: 16px 20px 16px 46px;
+  border: none;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.14);
+  border-radius: 0;
+  background: transparent
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17' viewBox='0 0 48 48' fill='none' stroke='%23d9ab6e' stroke-width='1.7'%3E%3Ccircle cx='20' cy='20' r='13'/%3E%3Ccircle cx='20' cy='20' r='9.2' stroke-opacity='.6' stroke-width='1.1'/%3E%3Ccircle cx='20' cy='20' r='4.2' stroke='%23a02b1e' stroke-width='2.2'/%3E%3Cpath d='M29.6 29.6 41 41' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E")
+    no-repeat 20px center;
+  font-size: 15.5px;
+}
+.ares[data-style="modern"] .palette > input:focus { outline: none; }
+.ares[data-style="modern"] .paletteList { padding: 8px; gap: 1px; }
+.ares[data-style="modern"] .paletteList button {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 11px 13px;
+  border-radius: 11px;
+  border: none;
+  background: transparent;
+  font-size: 13.5px;
+  color: rgba(240, 227, 205, 0.92);
+}
+.ares[data-style="modern"] .paletteList button[data-on="1"],
+.ares[data-style="modern"] .paletteList button:hover { background: rgba(200, 155, 94, 0.09); }
+.ares[data-style="modern"] .paletteList button > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ares[data-style="modern"] .paletteList button em {
+  font-style: normal;
+  margin-left: auto;
+  font: 400 10.5px/1 var(--mono);
+  color: rgba(232, 200, 147, 0.4);
+  white-space: nowrap;
+}
+.ares[data-style="modern"] .paletteEmpty { color: var(--faint); font-size: 13px; padding: 22px; text-align: center; }
+
+/* ── settings: the same room, not a different app ────────────────────────── */
+
+.ares[data-style="modern"] .settingsNav {
+  background: transparent;
+  border-right: 1px solid var(--line);
+}
+.ares[data-style="modern"] .settingsBrand,
+.ares[data-style="modern"] .paneTitle {
+  font: 600 15px/1.2 var(--display);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: #f3e6cf;
+}
+.ares[data-style="modern"] .settingsNav {
+  background: rgba(0, 0, 0, 0.25);
+}
+.ares[data-style="modern"] .settingsNav button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 10px;
+  border: none;
+  border-left: 2px solid transparent;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: rgba(240, 227, 205, 0.78);
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.ares[data-style="modern"] .settingsNav button:hover { background: rgba(200, 155, 94, 0.08); color: var(--text); }
+.ares[data-style="modern"] .settingsNav button[data-on="1"] {
+  background: rgba(200, 155, 94, 0.1);
+  border-left-color: #e2662f;
+  color: var(--gold-hi);
+  box-shadow: none;
+}
+.ares[data-style="modern"] .settingsNav button .glyph { display: none; }
+.ares[data-style="modern"] .settingsMain { background: transparent; }
+.ares[data-style="modern"] .fieldLabel {
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.5);
+}
+.ares[data-style="modern"] .settingsFooter {
+  background: transparent;
+  border-top: 1px solid var(--line);
+}
+.ares[data-style="modern"] .settingsFooterHint { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+
+/* every option tile, card and panel in settings shares the card frame */
+.ares[data-style="modern"] .displayModes button,
+.ares[data-style="modern"] .settingsModelCard,
+.ares[data-style="modern"] .livingLaunchCard,
+.ares[data-style="modern"] .settingsPane .card,
+.ares[data-style="modern"] .usageCard,
+.ares[data-style="modern"] .helmCard,
+.ares[data-style="modern"] .vaultCard {
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: var(--r-md);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012));
+  box-shadow: inset 0 1px 0 rgba(255, 236, 214, 0.06);
+}
+.ares[data-style="modern"] .displayModes button[data-on="1"] {
+  border-color: rgba(226, 102, 52, 0.45);
+  background: linear-gradient(180deg, rgba(143, 29, 29, 0.26), rgba(50, 12, 9, 0.14));
+  box-shadow: inset 0 0 24px rgba(255, 106, 48, 0.1);
+}
+.ares[data-style="modern"] .displayModes button strong { color: var(--gold-hi); font-weight: 600; }
+.ares[data-style="modern"] .displayModes button span { color: var(--faint); }
+
+/* ── the glass, applied ──────────────────────────────────────────────────── */
+
+/* Every panel in the app is one material. Declared in a single place so the
+   card frame, the HELM tiles, the vault tiles and the settings tiles can
+   never drift apart again. */
+.ares[data-style="modern"] .toolCard,
+.ares[data-style="modern"] .notice,
+.ares[data-style="modern"] .authPrompt,
+.ares[data-style="modern"] .artifact,
+.ares[data-style="modern"] .permissionCard,
+.ares[data-style="modern"] .diffCard,
+.ares[data-style="modern"] .hmStat,
+.ares[data-style="modern"] .hmPanel,
+.ares[data-style="modern"] .vaultCard,
+.ares[data-style="modern"] .vaultTable,
+.ares[data-style="modern"] .usageCard,
+.ares[data-style="modern"] .usageTable,
+.ares[data-style="modern"] .usageChart,
+.ares[data-style="modern"] .themeCard,
+.ares[data-style="modern"] .displayModes button,
+.ares[data-style="modern"] .settingsModelCard,
+.ares[data-style="modern"] .livingLaunchCard {
+  background: var(--glass-fill);
+  border: 1px solid var(--glass-edge);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-spec), var(--glass-lift);
+}
+
+/* the two that must stay legible over a scrolling transcript get a touch more
+   body so long code blocks never swim */
+.ares[data-style="modern"] .toolCard,
+.ares[data-style="modern"] .diffCard {
+  background: linear-gradient(158deg, rgba(255, 246, 236, 0.075), rgba(10, 8, 7, 0.52));
+}
+
+/* Every frosted pane carries a faint sheen along its top-left shoulder — the
+   highlight a real slab of glass catches from the room's key light. Painted
+   as a pseudo-element so it never tints the content, and skipped where the
+   surface is a control (buttons keep their own states). */
+.ares[data-style="modern"] .toolCard,
+.ares[data-style="modern"] .diffCard,
+.ares[data-style="modern"] .hmStat,
+.ares[data-style="modern"] .hmPanel,
+.ares[data-style="modern"] .vaultCard,
+.ares[data-style="modern"] .usageCard,
+.ares[data-style="modern"] .gate,
+.ares[data-style="modern"] .palette,
+.ares[data-style="modern"] .settingsShell { position: relative; }
+.ares[data-style="modern"] .toolCard::before,
+.ares[data-style="modern"] .diffCard::before,
+.ares[data-style="modern"] .hmStat::before,
+.ares[data-style="modern"] .hmPanel::before,
+.ares[data-style="modern"] .vaultCard::before,
+.ares[data-style="modern"] .usageCard::before,
+.ares[data-style="modern"] .gate::before,
+.ares[data-style="modern"] .settingsShell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(150deg, rgba(255, 248, 240, 0.055) 0%, rgba(255, 248, 240, 0) 34%);
+}
+
+/* hover: the lens catches more light and the ember rim wakes up */
+.ares[data-style="modern"] .vaultCard:hover,
+.ares[data-style="modern"] .themeCard:hover,
+.ares[data-style="modern"] .toolCard:hover {
+  border-color: rgba(255, 150, 80, 0.45);
+  box-shadow: var(--glass-spec), var(--glass-lift), 0 0 30px rgba(255, 106, 48, 0.08);
+}
+
+/* ── the agent's own traces are READOUTS, not documents ───────────────────
+ *
+ * A tool call and a thought are asides — evidence of work, glanced at and
+ * scrolled past. They were wearing the full glass slab (fill + backdrop blur +
+ * specular sheen + lift shadow + hover glow), the same material as a HELM tile
+ * or a settings pane. At one card that looks rich; at the four-to-eight a real
+ * turn produces it becomes a stack of heavy panels that outweighs the answer
+ * they belong to, and the eye reads chrome before content.
+ *
+ * So the frame goes and the SPINE stays: one hairline down the left edge,
+ * carrying the state colour the border used to carry. It is the margin-rule
+ * idiom — the mark that says "this is an aside" without drawing a box around
+ * it. The panel material is deliberately untouched everywhere else; HELM tiles,
+ * the vault, settings and the diff card are documents and still read as glass.
+ *
+ * The one thing that cannot go is legibility. There is a photographic backdrop
+ * behind the transcript, and mono rows over a picture swim — which is what the
+ * "a touch more body" fill above was defending against. So a faint wash stays,
+ * strongest at the spine and fading out across the card: enough to seat the
+ * text, far too little to read as a panel. */
+.ares[data-style="modern"] .toolCard {
+  border: none;
+  border-left: 1px solid rgba(200, 155, 94, 0.3);
+  border-radius: 0 8px 8px 0;
+  background: linear-gradient(90deg, rgba(10, 8, 7, 0.5), rgba(10, 8, 7, 0.26) 45%, rgba(10, 8, 7, 0.12));
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+  transition: border-left-color 160ms ease, background 160ms ease;
+}
+/* no slab, no shoulder highlight — the sheen only makes sense on glass */
+.ares[data-style="modern"] .toolCard::before { background: none; }
+.ares[data-style="modern"] .toolCard:hover {
+  border-color: transparent;
+  border-left-color: rgba(255, 150, 80, 0.55);
+  box-shadow: none;
+}
+/* state lives on the spine now that there is no rim to carry it */
+.ares[data-style="modern"] .toolCard[data-state="running"] { border-left-color: var(--ember-hi); }
+.ares[data-style="modern"] .toolCard[data-state="error"] { border-left-color: rgba(201, 86, 74, 0.6); }
+/* the head is a label over its rows, not a titlebar over a body */
+.ares[data-style="modern"] .toolCardHead { border-bottom-color: rgba(200, 155, 94, 0.08); }
+.ares[data-style="modern"] .toolStep,
+.ares[data-style="modern"] .toolCardBody .step { border-bottom-color: rgba(200, 155, 94, 0.05); }
+.ares[data-style="modern"] .toolStep:last-child,
+.ares[data-style="modern"] .toolCardBody .step:last-child { border-bottom: none; }
+
+/* A thought was already meant to read as a margin note; the dashed box was
+   still a box. Same spine, no fill — it is short italic text, so it does not
+   need a wash to stay off the backdrop. */
+.ares[data-style="modern"] .thought,
+.ares[data-style="modern"] .thinking {
+  border: none;
+  border-left: 1px solid rgba(200, 155, 94, 0.22);
+  border-radius: 0;
+  background: none;
+}
+
+/* the big floating surfaces are the same lens, thicker */
+.ares[data-style="modern"] .rail,
+.ares[data-style="modern"] .forge {
+  background: linear-gradient(180deg, rgba(255, 244, 232, 0.055), rgba(9, 8, 7, 0.72));
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-spec);
+}
+/* Edge chrome is deliberately NOT backdrop-filtered. A blurred bar re-samples
+   whatever moves behind it every frame (embers, the scrolling transcript), and
+   pinned against the window edge it buys almost no depth for that cost — it
+   just shimmers. Opaque tint, same palette, zero churn. */
+/* Neither the titlebar nor the status bar is a BAR any more. They are strips
+   of empty air whose contents float over the canvas — the "Online" chip and
+   the tool coins up top, one status capsule at the bottom — which is what
+   makes the room read as panels-in-space instead of a tiled dashboard.
+   (Also removes the last two full-width surfaces that could shimmer.) */
+.ares[data-style="modern"] .titlebar,
+.ares[data-style="modern"] .statusBar {
+  background: none;
+  border: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+  transition: none;
+}
+/* the working border-color swap on the titlebar was another luminance blink */
+.ares[data-style="modern"][data-working="1"] .titlebar { border-bottom-color: var(--line); }
+
+/* WebKitGTK composites backdrop-filter on the CPU — strip the blur there and
+   fall back to an opaque tint so Linux does not turn into a slideshow. */
+html[data-perf="lite"] .ares[data-style="modern"] .toolCard,
+html[data-perf="lite"] .ares[data-style="modern"] .notice,
+html[data-perf="lite"] .ares[data-style="modern"] .diffCard,
+html[data-perf="lite"] .ares[data-style="modern"] .hmStat,
+html[data-perf="lite"] .ares[data-style="modern"] .hmPanel,
+html[data-perf="lite"] .ares[data-style="modern"] .vaultCard,
+html[data-perf="lite"] .ares[data-style="modern"] .vaultTable,
+html[data-perf="lite"] .ares[data-style="modern"] .usageCard,
+html[data-perf="lite"] .ares[data-style="modern"] .usageTable,
+html[data-perf="lite"] .ares[data-style="modern"] .usageChart,
+html[data-perf="lite"] .ares[data-style="modern"] .themeCard,
+html[data-perf="lite"] .ares[data-style="modern"] .displayModes button,
+html[data-perf="lite"] .ares[data-style="modern"] .rail,
+html[data-perf="lite"] .ares[data-style="modern"] .forge,
+html[data-perf="lite"] .ares[data-style="modern"] .titlebar,
+html[data-perf="lite"] .ares[data-style="modern"] .statusBar {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: linear-gradient(180deg, #131110, #0b0a09);
+}
+
+/* ── HELM (modern) ───────────────────────────────────────────────────────── */
+
+/* HELM is its own room — the chat session header has no business over it.
+   The view renders no composer, so with the header gone the stage holds two
+   items; re-declare the rows or the status bar would take the flexible one. */
+.ares[data-style="modern"] .stage[data-view="helm"] > .stageHead { display: none; }
+.ares[data-style="modern"] .stage[data-view="helm"] { grid-template-rows: minmax(0, 1fr) auto; }
+
+.ares[data-style="modern"] .hm {
+  position: relative;
+  height: 100%;
+  overflow-y: auto;
+  padding: 32px 40px 40px;
+}
+.ares[data-style="modern"] .hm::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: url("/backdrop-helm.png"), url("/backdrop.jpg");
+  background-size: cover;
+  background-position: center;
+  opacity: 0.07;
+  pointer-events: none;
+}
+.ares[data-style="modern"] .hm > * { position: relative; }
+
+.ares[data-style="modern"] .hmHead { display: flex; align-items: center; gap: 16px; }
+.ares[data-style="modern"] .hmHeadText { flex: 1; min-width: 0; }
+.ares[data-style="modern"] .hmHeadText h2 {
+  margin: 0;
+  font: 600 25px/1.1 var(--display);
+  letter-spacing: 0.16em;
+  color: #f3e6cf;
+}
+.ares[data-style="modern"] .hmHeadText p { margin: 4px 0 0; font-size: 13px; color: var(--faint); }
+.ares[data-style="modern"] .hmDaemon {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(200, 155, 94, 0.2);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmDaemon i { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+.ares[data-style="modern"] .hmDaemon[data-state="running"] i { background: var(--steel); box-shadow: 0 0 8px var(--steel); }
+.ares[data-style="modern"] .hmGhost {
+  padding: 7px 15px;
+  border-radius: 10px;
+  border: 1px solid rgba(200, 155, 94, 0.24);
+  font-size: 12.5px;
+  color: rgba(239, 227, 207, 0.8);
+  transition: border-color 140ms ease;
+}
+.ares[data-style="modern"] .hmGhost:hover { border-color: rgba(200, 155, 94, 0.5); }
+
+.ares[data-style="modern"] .hmStats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin: 24px 0 16px;
+}
+.ares[data-style="modern"] .hmStat,
+.ares[data-style="modern"] .hmPanel {
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: var(--r-lg);
+  background: linear-gradient(180deg, #131110, #0b0a09);
+}
+.ares[data-style="modern"] .hmStat { padding: 18px; }
+.ares[data-style="modern"] .hmStatLabel,
+.ares[data-style="modern"] .hmPanelLabel {
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.5);
+}
+.ares[data-style="modern"] .hmStatValue { font: 600 29px/1.1 var(--display); color: #f6ecda; margin: 10px 0 4px; }
+.ares[data-style="modern"] .hmStatSub { font-size: 12px; color: var(--faint); }
+
+.ares[data-style="modern"] .hmPanels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 16px;
+}
+.ares[data-style="modern"] .hmPanel { padding: 20px; }
+.ares[data-style="modern"] .hmPanelLabel { margin-bottom: 12px; display: block; }
+.ares[data-style="modern"] .hmPanelLabelInner { margin-top: 20px; }
+.ares[data-style="modern"] .hmEmpty { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--faint); }
+
+.ares[data-style="modern"] .hmGoal { padding: 11px 0; border-bottom: 1px solid rgba(200, 155, 94, 0.09); }
+.ares[data-style="modern"] .hmGoalTop { display: flex; align-items: center; gap: 10px; font-size: 13.5px; color: rgba(240, 227, 205, 0.9); }
+.ares[data-style="modern"] .hmDiamond { color: var(--ember-hi); }
+.ares[data-style="modern"] .hmGoalText { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ares[data-style="modern"] .hmGoalPct { font: 400 11px/1 var(--mono); color: var(--faint); }
+.ares[data-style="modern"] .hmBar { display: block; height: 3px; margin-top: 9px; border-radius: 3px; background: rgba(200, 155, 94, 0.13); }
+.ares[data-style="modern"] .hmBar i { display: block; height: 3px; border-radius: 3px; background: linear-gradient(90deg, var(--blood), var(--ember-hi)); }
+
+.ares[data-style="modern"] .hmToggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(226, 102, 52, 0.3);
+  background: rgba(143, 29, 29, 0.12);
+  font-size: 12.5px;
+  color: var(--ember-text);
+}
+.ares[data-style="modern"] .hmToggle span { flex: 1; text-align: left; }
+.ares[data-style="modern"] .hmSwitch {
+  position: relative;
+  width: 42px; height: 23px;
+  flex: none;
+  border-radius: 999px;
+  border: 1px solid rgba(200, 155, 94, 0.28);
+  background: rgba(200, 155, 94, 0.12);
+  transition: background 180ms ease, border-color 180ms ease;
+}
+.ares[data-style="modern"] .hmSwitch::after {
+  content: "";
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 17px; height: 17px;
+  border-radius: 50%;
+  background: #f0e3cd;
+  transition: left 180ms ease;
+}
+.ares[data-style="modern"] .hmSwitch[data-on="1"] { background: rgba(226, 102, 52, 0.45); border-color: rgba(255, 150, 80, 0.7); }
+.ares[data-style="modern"] .hmSwitch[data-on="1"]::after { left: 21px; }
+
+.ares[data-style="modern"] .hmRail,
+.ares[data-style="modern"] .hmSession {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.09);
+  font-size: 13px;
+  text-align: left;
+}
+.ares[data-style="modern"] .hmRailStage { font: 400 11.5px/1 var(--mono); color: rgba(232, 200, 147, 0.7); width: 104px; flex: none; }
+.ares[data-style="modern"] .hmRailPips { display: flex; gap: 4px; flex: 1; }
+.ares[data-style="modern"] .hmRailPips i { width: 14px; height: 3px; border-radius: 2px; background: rgba(200, 155, 94, 0.16); }
+.ares[data-style="modern"] .hmRailPips i[data-lit="1"] { background: var(--ember-hi); }
+.ares[data-style="modern"] .hmRailVerdict { font: 400 11px/1 var(--mono); color: var(--faint); margin-left: auto; }
+.ares[data-style="modern"] .hmSession { border-radius: 10px; padding: 8px 6px; border-bottom: 1px solid rgba(200, 155, 94, 0.09); }
+.ares[data-style="modern"] .hmSession:hover { background: rgba(200, 155, 94, 0.06); }
+.ares[data-style="modern"] .hmSessionTitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: rgba(240, 227, 205, 0.9); }
+
+/* ── the toggle (one spec, used everywhere) ──────────────────────────────── */
+
+.ares[data-style="modern"] .toggle {
+  position: relative;
+  width: 42px;
+  height: 23px;
+  flex: none;
+  border-radius: 999px;
+  border: 1px solid rgba(200, 155, 94, 0.28);
+  background: rgba(200, 155, 94, 0.12);
+  transition: background 180ms ease, border-color 180ms ease;
+}
+.ares[data-style="modern"] .toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #f0e3cd;
+  transition: left 180ms ease;
+}
+.ares[data-style="modern"] .toggle[data-on="1"] { background: rgba(226, 102, 52, 0.45); border-color: rgba(255, 150, 80, 0.7); }
+.ares[data-style="modern"] .toggle[data-on="1"]::after { left: 21px; }
+/* the base control paints its own knob/label — silence it under the new skin */
+.ares[data-style="modern"] .toggle > * { display: none; }
+
+/* ── diff cards ──────────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] .diffHead {
+  padding: 10px 15px;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.13);
+  background: transparent;
+}
+.ares[data-style="modern"] .diffFiles { font: 400 12px/1.4 var(--mono); color: var(--gold-hi); }
+.ares[data-style="modern"] .diffBody { font: 400 12.5px/1.75 var(--mono); padding: 10px 0; }
+.ares[data-style="modern"] .diffBody .ctx,
+.ares[data-style="modern"] .diffBody .diffCtx { color: rgba(239, 227, 207, 0.42); }
+.ares[data-style="modern"] .diffBody .del,
+.ares[data-style="modern"] .diffBody .diffDel { background: rgba(201, 86, 74, 0.12); color: #e2a49c; }
+.ares[data-style="modern"] .diffBody .add,
+.ares[data-style="modern"] .diffBody .diffAdd { background: rgba(94, 194, 122, 0.1); color: var(--mint-text); }
+
+/* ── accent gallery (Appearance) ─────────────────────────────────────────── */
+
+.ares[data-style="modern"] .themeGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 14px;
+}
+.ares[data-style="modern"] .themeCard {
+  border-radius: 14px;
+  padding: 14px;
+  background: linear-gradient(180deg, #151212, #0a0908);
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  transition: border-color 150ms ease;
+}
+.ares[data-style="modern"] .themeCard:hover { border-color: rgba(200, 155, 94, 0.42); }
+.ares[data-style="modern"] .themeCard[data-on="1"] { border-color: rgba(255, 150, 80, 0.7); }
+.ares[data-style="modern"] .themeSwatch { height: 44px; border-radius: 9px; border: none; }
+
+/* ── Usage pane ──────────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] .usageStats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.ares[data-style="modern"] .usageCard { padding: 18px; }
+/* the design leads with a Cinzel micro-label and answers in a big Cinzel
+   numeral — the app's markup is <span>label</span><strong>value</strong>, so
+   order them explicitly rather than relying on source order. */
+.ares[data-style="modern"] .usageCard { display: flex; flex-direction: column; gap: 0; }
+.ares[data-style="modern"] .usageCard > span {
+  order: 1;
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.5);
+}
+.ares[data-style="modern"] .usageCard > strong {
+  order: 2;
+  margin-top: 10px;
+  font: 600 27px/1.1 var(--display);
+  color: #f6ecda;
+}
+
+.ares[data-style="modern"] .usageTable {
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: linear-gradient(180deg, #131110, #0b0a09);
+  padding: 4px 20px;
+}
+.ares[data-style="modern"] .usageRow {
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.09);
+  font-size: 13px;
+  background: transparent;
+}
+.ares[data-style="modern"] .usageModel { font: 400 12px/1.3 var(--mono); color: var(--gold-hi); }
+.ares[data-style="modern"] .usageProv,
+.ares[data-style="modern"] .usageCalls,
+.ares[data-style="modern"] .usageTok { font: 400 11.5px/1 var(--mono); color: rgba(239, 227, 207, 0.55); }
+.ares[data-style="modern"] .usageCost { font: 400 11.5px/1 var(--mono); color: rgba(232, 200, 147, 0.8); }
+
+/* the daily bar chart — ember out, banked coals in */
+.ares[data-style="modern"] .usageChart {
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: var(--r-lg);
+  background: linear-gradient(180deg, #131110, #0b0a09);
+  padding: 22px;
+  gap: 10px;
+}
+.ares[data-style="modern"] .usageBar i,
+.ares[data-style="modern"] .usageBar span { border-radius: 4px 4px 0 0; }
+.ares[data-style="modern"] .usageBar > :first-child { background: linear-gradient(180deg, var(--ember-hi), var(--ember)); }
+.ares[data-style="modern"] .usageBar > :nth-child(2) { background: linear-gradient(180deg, #7a3a2a, #3c1d16); border-radius: 0 0 4px 4px; }
+
+/* ── Skills & tools ──────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] .skillRow,
+.ares[data-style="modern"] .toolRow,
+.ares[data-style="modern"] .engineRow {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 15px 0;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.08);
+}
+.ares[data-style="modern"] .engineInfo strong,
+.ares[data-style="modern"] .skillRow strong {
+  font: 400 13.5px/1.3 var(--font);
+  font-weight: 500;
+  color: #f0e3cd;
+}
+.ares[data-style="modern"] .engineInfo span,
+.ares[data-style="modern"] .skillRow span {
+  font-size: 12px;
+  color: var(--faint);
+  line-height: 1.5;
+}
+.ares[data-style="modern"] .engineRow input[type="number"] {
+  padding: 7px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(200, 155, 94, 0.24);
+  background: rgba(0, 0, 0, 0.3);
+  font: 400 12px/1 var(--mono);
+  color: rgba(232, 200, 147, 0.9);
+}
+
+/* the segmented range/tab control the design uses in every header */
+.ares[data-style="modern"] .segment {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: 10px;
+  background: transparent;
+}
+.ares[data-style="modern"] .segment button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 7px;
+  font: 400 11.5px/1 var(--mono);
+  color: rgba(239, 227, 207, 0.6);
+  background: transparent;
+}
+.ares[data-style="modern"] .segment button[data-on="1"] { background: rgba(200, 155, 94, 0.12); color: var(--gold-hi); }
+.ares[data-style="modern"] .usageHead { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+.ares[data-style="modern"] .usageHead .paneTitle { flex: 1; margin: 0; }
+.ares[data-style="modern"] .paneEmpty { color: var(--faint); font-size: 13px; }
+
+/* ── Artifacts (the vault) ───────────────────────────────────────────────── */
+
+/* The base sheet hides the composer on this view, but the modern `.composer`
+   rule matches with equal specificity and loads later — so it won re-display.
+   Restate the hide here. */
+.ares[data-style="modern"] .stage[data-view="artifacts"] > .composer { display: none; }
+
+.ares[data-style="modern"] .vault { padding: 32px 40px 40px; background: transparent; }
+
+/* the hero collapses into the design's one-line header */
+.ares[data-style="modern"] .vaultHero {
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+.ares[data-style="modern"] .vaultEyebrow,
+.ares[data-style="modern"] .vaultHero p { display: none; }
+.ares[data-style="modern"] .vaultHero h2 {
+  margin: 0;
+  font: 600 25px/1.1 var(--display);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #f3e6cf;
+}
+.ares[data-style="modern"] .vaultMetric {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+.ares[data-style="modern"] .vaultMetric strong { font: 400 12px/1 var(--mono); color: var(--gold-hi); }
+.ares[data-style="modern"] .vaultMetric span { font-size: 12px; color: var(--faint); text-transform: lowercase; letter-spacing: 0; }
+
+/* search + the filter pill group */
+.ares[data-style="modern"] .vaultHead { gap: 14px; margin-bottom: 18px; border: none; padding: 0; }
+.ares[data-style="modern"] .vaultHead input {
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.012);
+  padding: 9px 13px;
+  font-size: 13px;
+}
+.ares[data-style="modern"] .vaultHead input:focus { border-color: rgba(200, 155, 94, 0.42); outline: none; }
+.ares[data-style="modern"] .vaultHead nav {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: 10px;
+}
+.ares[data-style="modern"] .vaultHead nav button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 7px;
+  font-size: 12px;
+  text-transform: capitalize;
+  color: rgba(239, 227, 207, 0.6);
+  background: transparent;
+}
+.ares[data-style="modern"] .vaultHead nav button[data-on="1"] {
+  background: rgba(200, 155, 94, 0.12);
+  color: var(--gold-hi);
+}
+.ares[data-style="modern"] .vaultHead nav button em {
+  font-style: normal;
+  margin-left: 5px;
+  font: 400 10.5px/1 var(--mono);
+  color: rgba(239, 227, 207, 0.35);
+}
+
+.ares[data-style="modern"] .vaultLabel {
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.5);
+  margin: 22px 0 12px;
+}
+
+/* the card grid — an icon plate over a name and its provenance */
+.ares[data-style="modern"] .vaultGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
+  gap: 16px;
+}
+.ares[data-style="modern"] .vaultCard {
+  margin: 0;
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: 14px;
+  overflow: hidden;
+  background: #0b0a09;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.ares[data-style="modern"] .vaultCard:hover {
+  border-color: rgba(255, 150, 80, 0.45);
+  box-shadow: 0 0 30px rgba(255, 106, 48, 0.08);
+}
+.ares[data-style="modern"] .vaultCard img {
+  width: 100%;
+  height: 128px;
+  object-fit: cover;
+  display: block;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.12);
+  background: linear-gradient(140deg, #181413, #0a0908);
+}
+.ares[data-style="modern"] .vaultCard figcaption { padding: 12px 14px; display: flex; flex-direction: column; gap: 3px; }
+.ares[data-style="modern"] .vaultCard figcaption strong {
+  font: 400 13px/1.3 var(--font);
+  color: rgba(240, 227, 205, 0.9);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ares[data-style="modern"] .vaultCard figcaption button {
+  font: 400 11px/1 var(--mono);
+  color: var(--faint);
+  text-align: left;
+  padding: 0;
+}
+.ares[data-style="modern"] .vaultCard figcaption button:hover { color: var(--gold-hi); }
+
+/* file + link rows share the card frame, one line each */
+.ares[data-style="modern"] .vaultTable {
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: linear-gradient(180deg, #121010, #0a0908);
+}
+.ares[data-style="modern"] .vaultRow {
+  gap: 14px;
+  padding: 13px 18px;
+  border-bottom: 1px solid rgba(200, 155, 94, 0.08);
+  background: transparent;
+}
+.ares[data-style="modern"] .vaultRow:hover { background: rgba(200, 155, 94, 0.05); }
+.ares[data-style="modern"] .vaultName { font-size: 13.5px; color: rgba(240, 227, 205, 0.92); }
+.ares[data-style="modern"] .vaultLoc { font: 400 11.5px/1 var(--mono); color: var(--faint); }
+.ares[data-style="modern"] .vaultSession {
+  font: 400 10.5px/1 var(--mono);
+  color: rgba(232, 200, 147, 0.7);
+  padding: 3px 9px;
+  border: 1px solid rgba(200, 155, 94, 0.18);
+  border-radius: 999px;
+}
+.ares[data-style="modern"] .vaultEmpty { color: var(--faint); }
+.ares[data-style="modern"] .vaultEmpty strong { font: 600 15px/1.2 var(--display); letter-spacing: 0.1em; color: #f3e6cf; }
+
+/* ── boot ────────────────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] .boot { background: #080706; }
+.ares[data-style="modern"] .bootEmblem {
+  border-radius: 50%;
+  color: #e8bd83;
+  background: var(--coin-ember);
+  border: 1px solid rgba(226, 140, 80, 0.45);
+  box-shadow: 0 0 52px rgba(255, 106, 48, 0.2);
+}
+.ares[data-style="modern"] .bootWord {
+  font: 600 44px/1 var(--display);
+  letter-spacing: 0.28em;
+  text-indent: 0.28em;
+  color: #f6ecda;
+  text-shadow: 0 0 40px rgba(255, 140, 60, 0.3);
+}
+.ares[data-style="modern"] .bootSub {
+  font: 400 11px/1 var(--font);
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  color: rgba(239, 227, 207, 0.55);
+}
+.ares[data-style="modern"] .bootBar {
+  height: 3px;
+  border-radius: 3px;
+  border: none;
+  background: rgba(200, 155, 94, 0.14);
+  overflow: hidden;
+}
+.ares[data-style="modern"] .bootBar i { border-radius: 3px; background: linear-gradient(90deg, var(--blood), var(--ember-hi)); box-shadow: none; }
+.ares[data-style="modern"] .bootStatus {
+  font: 400 9.5px/1 var(--mono);
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  text-transform: uppercase;
+  color: rgba(239, 227, 207, 0.4);
+}
+
+/* ── chrome details ──────────────────────────────────────────────────────── */
+
+.ares[data-style="modern"] ::-webkit-scrollbar { width: 9px; height: 9px; }
+.ares[data-style="modern"] ::-webkit-scrollbar-thumb { background: rgba(200, 155, 94, 0.22); border-radius: 9px; }
+.ares[data-style="modern"] ::-webkit-scrollbar-track { background: transparent; }
+.ares[data-style="modern"] a { color: var(--gold-hi); border-bottom-color: rgba(200, 155, 94, 0.3); }
+.ares[data-style="modern"] a:hover { color: #ffd9a0; }
+.ares[data-style="modern"] ::selection { background: rgba(226, 102, 52, 0.3); }
+.ares[data-style="modern"] button:focus-visible,
+.ares[data-style="modern"] input:focus-visible,
+.ares[data-style="modern"] textarea:focus-visible {
+  outline: 2px solid rgba(255, 160, 90, 0.7);
+  outline-offset: 2px;
+}
+
+@keyframes emberPulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
+@keyframes emberSweep { 0% { background-position: 0% 50%; } 100% { background-position: 200% 50%; } }
+@keyframes riseIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes spinSlow { to { transform: rotate(360deg); } }
+
+/* ── responsive: desktop-first, but the shell must survive a narrow window ── */
+
+/* Narrow windows tighten the page padding — they must NOT hide the rail.
+   The previous rule here force-hid it below 940px whenever it was *not*
+   collapsed, which inverted the toggle: at a narrow window the rail could
+   never be shown at all, and pressing "show sidebar" actively hid it. That is
+   the panel that "disappeared and couldn't be found". Visibility belongs to
+   the owner's explicit toggle, never to a viewport query. */
+@media (max-width: 940px) {
+  .ares[data-style="modern"] .hm,
+  .ares[data-style="modern"] .vault { padding: 24px 20px 28px; }
+  .ares[data-style="modern"] { padding: 12px 10px 12px; column-gap: 10px; }
+}
+/* Below 1160px the Forge gets a smaller share — it is NOT hidden. Hiding a
+   panel the owner just opened (as this rule used to do) makes the button look
+   broken; the same inverted-intent bug as the rail's old auto-hide. The grid
+   tracks are minmax(0, …) so all three shrink instead. */
+@media (max-width: 1160px) {
+  .ares[data-style="modern"][data-panel="1"] {
+    grid-template-columns: 274px minmax(0, 1fr) minmax(0, clamp(260px, 38vw, var(--forge-w, 480px)));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ares[data-style="modern"] .composer::after,
+  .ares[data-style="modern"] .toolCard[data-state="running"] .toolCardIcon,
+  .ares[data-style="modern"] .empty { animation: none; }
+}
+
+/* WebKitGTK composites blur on the CPU — drop it, keep the surface. */
+html[data-perf="lite"] .ares[data-style="modern"] .composerRow {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: rgba(12, 10, 9, 0.97);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   HELM tabs + the Agents roster
+   ─────────────────────────────────────────────────────────────────────────
+   HELM is two rooms now: Overview (the war room) and Agents (the persona
+   roster). The bar is a real tablist with a sliding underline, and the panes
+   fade+lift in — transform/opacity only, so nothing here pulses or oscillates
+   in luminance. Photosensitive doctrine: nothing flashes, anywhere, in any
+   mode.                                                                    */
+
+.ares[data-style="modern"] .hmTabs {
+  position: relative;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  margin: 0 0 20px;
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  border-radius: var(--r-md);
+  background: linear-gradient(180deg, rgba(19, 17, 16, 0.9), rgba(11, 10, 9, 0.9));
+}
+.ares[data-style="modern"] .hmTab {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 11px 16px;
+  border: 0;
+  border-radius: calc(var(--r-md) - 5px);
+  background: transparent;
+  color: var(--muted);
+  font: 600 12.5px/1 var(--font);
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: color 160ms ease, background-color 160ms ease;
+}
+.ares[data-style="modern"] .hmTab svg { opacity: 0.7; transition: opacity 160ms ease; }
+.ares[data-style="modern"] .hmTab:hover { color: var(--text); background: rgba(255, 246, 236, 0.04); }
+.ares[data-style="modern"] .hmTab:hover svg { opacity: 1; }
+.ares[data-style="modern"] .hmTab[data-on="1"] { color: var(--text-hi); }
+.ares[data-style="modern"] .hmTab[data-on="1"] svg { opacity: 1; color: var(--gold-hi); }
+.ares[data-style="modern"] .hmTabCount {
+  font: 700 10px/1 var(--font);
+  font-style: normal;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(200, 155, 94, 0.16);
+  color: var(--gold-hi);
+}
+/* The sliding highlight. Two tabs → 50% each; keyed off data-at so adding a
+   third tab is one more rule, not a JS measurement pass. */
+.ares[data-style="modern"] .hmTabRail {
+  position: absolute;
+  z-index: 0;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc(50% - 4px);
+  border-radius: calc(var(--r-md) - 5px);
+  background: linear-gradient(180deg, rgba(255, 246, 236, 0.1), rgba(255, 246, 236, 0.03));
+  border: 1px solid rgba(200, 155, 94, 0.3);
+  box-shadow: inset 0 1px 0 rgba(255, 246, 236, 0.14);
+  transition: transform 260ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.ares[data-style="modern"] .hmTabRail[data-at="agents"] { transform: translateX(100%); }
+
+.ares[data-style="modern"] .hmPane { animation: hmPaneIn 260ms cubic-bezier(0.32, 0.72, 0, 1) both; }
+@keyframes hmPaneIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ares[data-style="modern"] .hmPane { animation: none; }
+  .ares[data-style="modern"] .hmTabRail { transition: none; }
+}
+
+/* ── The lede: what a persona IS, in two sentences ───────────────────── */
+.ares[data-style="modern"] .hmAgentsLede {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  margin-bottom: 20px;
+}
+.ares[data-style="modern"] .hmAgentsLede p {
+  flex: 1 1 auto;
+  margin: 0;
+  max-width: 64ch;
+  font: 400 13px/1.65 var(--font);
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmAgentsLede strong { color: var(--text-hi); font-weight: 650; }
+.ares[data-style="modern"] .hmForge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--ember-rim);
+  background: linear-gradient(180deg, rgba(var(--ember-rgb), 0.18), rgba(var(--ember-rgb), 0.07));
+  color: var(--ember-text);
+  font: 650 12px/1 var(--font);
+  cursor: pointer;
+  transition: filter 160ms ease, border-color 160ms ease;
+}
+.ares[data-style="modern"] .hmForge:hover { filter: brightness(1.12); border-color: var(--ember-hi); }
+.ares[data-style="modern"] .hmForge[data-on="1"] {
+  background: rgba(255, 246, 236, 0.05);
+  color: var(--muted);
+  border-color: var(--line-raised);
+}
+
+/* ── "Wearing now" banner ────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmWearing {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 18px;
+  margin-bottom: 18px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--ember-rim);
+  background: linear-gradient(180deg, rgba(var(--ember-rgb), 0.1), rgba(var(--ember-rgb), 0.03));
+}
+.ares[data-style="modern"] .hmWearingText { flex: 1 1 auto; min-width: 0; display: grid; gap: 3px; }
+.ares[data-style="modern"] .hmWearingLabel {
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: rgba(255, 176, 131, 0.72);
+}
+.ares[data-style="modern"] .hmWearingText strong { font: 650 15px/1.25 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .hmWearingDesc { font: 400 12px/1.5 var(--font); color: var(--muted); }
+
+/* ── The gallery ─────────────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmRoster {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.ares[data-style="modern"] .hmCard {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-lg);
+  border: 1px solid rgba(200, 155, 94, 0.16);
+  background: linear-gradient(180deg, #131110, #0b0a09);
+  overflow: hidden;
+  transition: border-color 180ms ease, transform 180ms cubic-bezier(0.32, 0.72, 0, 1), box-shadow 180ms ease;
+}
+/* Hover matches the rest of the skin, which follows the handoff: a WARM border
+   and an ember bloom, not a cold drop shadow. The dark-shadow version I had
+   here first is what made these cards read flatter than every other surface. */
+.ares[data-style="modern"] .hmCard:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 150, 80, 0.45);
+  box-shadow: 0 0 30px rgba(255, 106, 48, 0.08);
+}
+.ares[data-style="modern"] .hmCard[data-worn="1"] { border-color: var(--ember-rim); }
+.ares[data-style="modern"] .hmCard[data-tone="mint"]:hover { border-color: rgba(94, 194, 122, 0.42); }
+
+.ares[data-style="modern"] .hmCardTop {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+  width: 100%;
+  padding: 16px 16px 12px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+.ares[data-style="modern"] .hmCardText { flex: 1 1 auto; min-width: 0; }
+.ares[data-style="modern"] .hmCardName { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ares[data-style="modern"] .hmCardName strong { font: 650 14.5px/1.2 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .hmCardWorn,
+.ares[data-style="modern"] .hmCardOrigin {
+  font: 700 9px/1 var(--font);
+  font-style: normal;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 3px 6px;
+  border-radius: 999px;
+}
+.ares[data-style="modern"] .hmCardWorn { background: rgba(var(--ember-rgb), 0.18); color: var(--ember-text); }
+.ares[data-style="modern"] .hmCardOrigin { background: rgba(200, 155, 94, 0.12); color: rgba(232, 200, 147, 0.72); }
+.ares[data-style="modern"] .hmCardDesc {
+  margin: 5px 0 0;
+  font: 400 12.5px/1.55 var(--font);
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmCardChevron {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  margin-top: 6px;
+  border-right: 1.5px solid var(--faint);
+  border-bottom: 1.5px solid var(--faint);
+  transform: rotate(45deg);
+  transition: transform 200ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.ares[data-style="modern"] .hmCardChevron[data-open="1"] { transform: rotate(-135deg); }
+
+.ares[data-style="modern"] .hmCardMeta { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 16px 12px; }
+.ares[data-style="modern"] .hmPill {
+  font: 600 10.5px/1 var(--font);
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 246, 236, 0.03);
+  color: var(--muted);
+  cursor: help;
+}
+
+.ares[data-style="modern"] .hmCardBody {
+  display: grid;
+  gap: 11px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--line);
+}
+.ares[data-style="modern"] .hmCardRow { display: grid; gap: 5px; }
+.ares[data-style="modern"] .hmCardRowLabel {
+  font: 600 9px/1 var(--display);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.46);
+}
+.ares[data-style="modern"] .hmTriggers { display: flex; flex-wrap: wrap; gap: 5px; }
+.ares[data-style="modern"] .hmTriggers em {
+  font: 500 11px/1 var(--font);
+  font-style: normal;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(200, 155, 94, 0.1);
+  color: rgba(239, 227, 207, 0.8);
+}
+.ares[data-style="modern"] .hmGreeting {
+  font: 400 12.5px/1.6 var(--font);
+  font-style: italic;
+  color: var(--text);
+}
+.ares[data-style="modern"] .hmCardFile {
+  font: 400 10.5px/1.5 ui-monospace, monospace;
+  color: var(--faint);
+  word-break: break-all;
+}
+
+.ares[data-style="modern"] .hmCardActions {
+  display: flex;
+  gap: 8px;
+  padding: 0 16px 16px;
+  margin-top: auto;
+}
+.ares[data-style="modern"] .hmAdopt {
+  flex: 1 1 auto;
+  padding: 10px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--ember-rim);
+  background: linear-gradient(180deg, rgba(var(--ember-rgb), 0.2), rgba(var(--ember-rgb), 0.08));
+  color: var(--ember-text);
+  font: 650 12px/1 var(--font);
+  cursor: pointer;
+  transition: filter 160ms ease;
+}
+.ares[data-style="modern"] .hmAdopt:hover:not(:disabled) { filter: brightness(1.14); }
+.ares[data-style="modern"] .hmAdopt:disabled { opacity: 0.4; cursor: not-allowed; }
+.ares[data-style="modern"] .hmCardActions .hmGhost { flex: 0 0 auto; }
+.ares[data-style="modern"] .hmDanger:hover { color: var(--crimson); border-color: rgba(201, 86, 74, 0.5); }
+
+/* ── The composer ────────────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmComposer {
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+  margin-bottom: 18px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-raised);
+  background: linear-gradient(180deg, #151312, #0c0b0a);
+  animation: hmPaneIn 220ms cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+.ares[data-style="modern"] .hmComposerHead { display: flex; align-items: flex-start; gap: 14px; }
+.ares[data-style="modern"] .hmComposerHead strong { font: 650 15px/1.3 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .hmComposerHead p {
+  margin: 4px 0 0;
+  max-width: 62ch;
+  font: 400 12.5px/1.6 var(--font);
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmField { display: grid; gap: 6px; }
+.ares[data-style="modern"] .hmField > span {
+  font: 600 9.5px/1 var(--display);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: rgba(232, 200, 147, 0.5);
+}
+.ares[data-style="modern"] .hmField > span em {
+  font-style: normal;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--faint);
+}
+.ares[data-style="modern"] .hmField input,
+.ares[data-style="modern"] .hmField textarea {
+  width: 100%;
+  padding: 11px 13px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-raised);
+  background: rgba(8, 7, 6, 0.7);
+  color: var(--text);
+  font: 400 13px/1.6 var(--font);
+  resize: vertical;
+}
+.ares[data-style="modern"] .hmField textarea { font-family: ui-monospace, monospace; font-size: 12px; }
+.ares[data-style="modern"] .hmField input:focus,
+.ares[data-style="modern"] .hmField textarea:focus {
+  outline: none;
+  border-color: var(--ember-rim);
+  box-shadow: 0 0 0 3px rgba(var(--ember-rgb), 0.12);
+}
+.ares[data-style="modern"] .hmFieldRow { display: grid; grid-template-columns: 1fr auto; gap: 14px; align-items: start; }
+
+.ares[data-style="modern"] .hmGlyphPick { display: flex; flex-wrap: wrap; gap: 6px; }
+.ares[data-style="modern"] .hmGlyphPick button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid var(--line-raised);
+  background: var(--coin);
+  color: var(--gold-glyph);
+  cursor: pointer;
+  transition: border-color 150ms ease, color 150ms ease;
+}
+.ares[data-style="modern"] .hmGlyphPick button:hover { border-color: var(--line-active); color: var(--gold-hi); }
+.ares[data-style="modern"] .hmGlyphPick button[data-on="1"] {
+  border-color: var(--ember-rim);
+  color: #e8bd83;
+  background: var(--coin-ember);
+}
+
+.ares[data-style="modern"] .hmTonePick { display: flex; gap: 6px; }
+.ares[data-style="modern"] .hmTonePick button {
+  padding: 9px 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-raised);
+  background: rgba(255, 246, 236, 0.03);
+  color: var(--muted);
+  font: 600 11px/1 var(--font);
+  text-transform: capitalize;
+  cursor: pointer;
+}
+.ares[data-style="modern"] .hmTonePick button[data-tone="ember"][data-on="1"] { border-color: var(--ember-rim); color: var(--ember-text); background: rgba(var(--ember-rgb), 0.12); }
+.ares[data-style="modern"] .hmTonePick button[data-tone="mint"][data-on="1"] { border-color: rgba(94, 194, 122, 0.42); color: var(--mint-text); background: rgba(94, 194, 122, 0.1); }
+.ares[data-style="modern"] .hmTonePick button[data-tone="ivory"][data-on="1"] { border-color: var(--line-active); color: var(--text-hi); background: rgba(255, 246, 236, 0.07); }
+
+.ares[data-style="modern"] .hmAutonomyPick { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; }
+.ares[data-style="modern"] .hmAutonomyPick button {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-raised);
+  background: rgba(255, 246, 236, 0.02);
+  text-align: left;
+  cursor: pointer;
+}
+.ares[data-style="modern"] .hmAutonomyPick button strong { font: 650 12.5px/1.2 var(--font); color: var(--text); }
+.ares[data-style="modern"] .hmAutonomyPick button span { font: 400 11px/1.5 var(--font); color: var(--muted); }
+.ares[data-style="modern"] .hmAutonomyPick button[data-on="1"] {
+  border-color: var(--ember-rim);
+  background: rgba(var(--ember-rgb), 0.09);
+}
+.ares[data-style="modern"] .hmAutonomyPick button[data-on="1"] strong { color: var(--ember-text); }
+
+.ares[data-style="modern"] .hmComposerActions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ── The inline chip: which persona is answering, and why ─────────────── */
+.ares[data-style="modern"] .personaChip {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  /* No `width` here on purpose. `.chat > *` already sets the transcript measure
+     (min(880px, 92%) with auto margins) at the SAME specificity, and this block
+     loads later — so declaring width:100% here silently won and the chip jutted
+     out past every turn on both sides. Inherit the column instead.
+     For the same reason the margin shorthand keeps `auto` on the inline sides:
+     writing `margin: 6px 0 10px` zeroed them and pinned the chip to the far
+     left of the column. */
+  padding: 11px 14px;
+  margin: 6px auto 10px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--ember-rim);
+  background: linear-gradient(180deg, rgba(var(--ember-rgb), 0.11), rgba(var(--ember-rgb), 0.035));
+  animation: hmPaneIn 240ms cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+.ares[data-style="modern"] .personaChip[data-kind="suggestion"] {
+  border-color: var(--line-active);
+  background: linear-gradient(180deg, rgba(255, 246, 236, 0.055), rgba(255, 246, 236, 0.02));
+}
+.ares[data-style="modern"] .personaChipText { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; }
+.ares[data-style="modern"] .personaChipTitle { font: 650 12.5px/1.3 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .personaChipWhy { font: 400 11px/1.45 var(--font); color: var(--muted); }
+.ares[data-style="modern"] .personaChipWhy em { font-style: normal; color: var(--ember-text); }
+.ares[data-style="modern"] .personaChipActions { flex: 0 0 auto; display: flex; gap: 6px; }
+.ares[data-style="modern"] .personaChipBtn {
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line-raised);
+  background: rgba(255, 246, 236, 0.04);
+  color: var(--muted);
+  font: 600 11px/1 var(--font);
+  cursor: pointer;
+  transition: color 150ms ease, border-color 150ms ease;
+}
+.ares[data-style="modern"] .personaChipBtn:hover { color: var(--text-hi); border-color: var(--line-active); }
+.ares[data-style="modern"] .personaChipBtn[data-primary="1"] {
+  border-color: var(--ember-rim);
+  background: rgba(var(--ember-rgb), 0.16);
+  color: var(--ember-text);
+}
+
+/* Narrow windows: the roster becomes one column and the lede stacks. Panels
+   SHRINK, they never disappear — a viewport query must never countermand an
+   explicit user action. */
+@container (max-width: 720px) {
+  .ares[data-style="modern"] .hmRoster { grid-template-columns: 1fr; }
+  .ares[data-style="modern"] .hmAgentsLede { flex-direction: column; gap: 12px; }
+  .ares[data-style="modern"] .hmForge { align-self: flex-start; }
+  .ares[data-style="modern"] .hmFieldRow { grid-template-columns: 1fr; }
+  .ares[data-style="modern"] .personaChip { flex-wrap: wrap; }
+}
+
+html[data-perf="lite"] .ares[data-style="modern"] .hmCard:hover { transform: none; box-shadow: none; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   HELM → Mind: the cognitive cockpit
+   ─────────────────────────────────────────────────────────────────────────
+   Read-only instrument. Its whole job is to make a dead subsystem look
+   different from an absent one, so the visual language is deliberately blunt:
+   verdicts are words (PASS/FAIL/SKIP) not colours alone, a cached check is
+   labelled, and liveness carries a state word beside its dot. Colour-blind and
+   screenshot-legible both matter here — someone will paste this into a bug
+   report.
+
+   Nothing animates in luminance. Standing photosensitive doctrine.            */
+
+/* The rail now spans three tabs. Exact geometry rather than approximate:
+   each tab is (100% - 2 gaps of 4px - 8px of container padding) / 3, and one
+   step is the element's own width + one gap. translateX percentages resolve
+   against the element's own width, so `100% + 4px` is exactly one slot. */
+.ares[data-style="modern"] .hmTabRail {
+  width: calc((100% - 16px) / 3);
+}
+.ares[data-style="modern"] .hmTabRail[data-at="agents"] { transform: translateX(calc(100% + 4px)); }
+.ares[data-style="modern"] .hmTabRail[data-at="mind"] { transform: translateX(calc(200% + 8px)); }
+
+/* An attention count that is a warning, not an inventory. */
+.ares[data-style="modern"] .hmTabCount[data-alert="1"] {
+  background: rgba(var(--ember-rgb), 0.22);
+  color: var(--ember-text);
+}
+
+/* ── The alarm: a subsystem that should be working and is not ─────────── */
+.ares[data-style="modern"] .hmAlarm {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+  padding: 15px 17px;
+  margin-bottom: 18px;
+  border-radius: var(--r-lg);
+  border: 1px solid rgba(201, 86, 74, 0.5);
+  background: linear-gradient(180deg, rgba(201, 86, 74, 0.13), rgba(201, 86, 74, 0.04));
+}
+.ares[data-style="modern"] .hmAlarmText { display: grid; gap: 4px; min-width: 0; }
+.ares[data-style="modern"] .hmAlarmText strong { font: 650 13.5px/1.3 var(--font); color: #f3d3cd; }
+.ares[data-style="modern"] .hmAlarmText span { font: 400 12px/1.55 var(--font); color: var(--muted); }
+
+.ares[data-style="modern"] .hmMindGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.ares[data-style="modern"] .hmMindCard { display: grid; gap: 10px; align-content: start; }
+
+/* ── Pursuing ─────────────────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmMindObjective { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.ares[data-style="modern"] .hmMindObjective strong { font: 650 14px/1.35 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .hmMindStep {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font: 500 12.5px/1.4 var(--font);
+  color: var(--ember-text);
+}
+/* A steady dot, never a blinking one. */
+.ares[data-style="modern"] .hmStepDot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ember-hi);
+  box-shadow: 0 0 8px rgba(var(--ember-rgb), 0.55);
+}
+.ares[data-style="modern"] .hmMindContract {
+  margin: 6px 0 0;
+  font: 400 11.5px/1.55 var(--font);
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmMindContract[data-warn="1"] { color: var(--ember-text); }
+.ares[data-style="modern"] .hmMindTodos { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 5px; }
+.ares[data-style="modern"] .hmMindTodos li {
+  position: relative;
+  padding-left: 20px;
+  font: 400 12px/1.5 var(--font);
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmMindTodos li::before {
+  content: "○";
+  position: absolute;
+  left: 2px;
+  color: var(--faint);
+}
+.ares[data-style="modern"] .hmMindTodos li[data-status="completed"] { color: var(--faint); }
+.ares[data-style="modern"] .hmMindTodos li[data-status="completed"]::before { content: "●"; color: var(--steel); }
+.ares[data-style="modern"] .hmMindTodos li[data-status="in_progress"] { color: var(--text); }
+.ares[data-style="modern"] .hmMindTodos li[data-status="in_progress"]::before { content: "◉"; color: var(--ember-hi); }
+
+/* ── Evidence ─────────────────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmProof {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+  background: rgba(8, 7, 6, 0.4);
+  display: grid;
+  gap: 7px;
+}
+.ares[data-style="modern"] .hmProof[data-verdict="fail"] { border-color: rgba(201, 86, 74, 0.42); }
+.ares[data-style="modern"] .hmProofTop {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  text-align: left;
+}
+/* The verdict is a WORD, not just a colour — a red dot alone is unreadable to
+   a colour-blind owner and unreadable in a greyscale screenshot. */
+.ares[data-style="modern"] .hmProofVerdict {
+  flex: none;
+  font: 700 9.5px/1 var(--font);
+  letter-spacing: 0.12em;
+  padding: 5px 7px;
+  border-radius: 5px;
+}
+.ares[data-style="modern"] .hmProofVerdict[data-verdict="pass"] { background: rgba(94, 194, 122, 0.16); color: var(--mint-text); }
+.ares[data-style="modern"] .hmProofVerdict[data-verdict="fail"] { background: rgba(201, 86, 74, 0.2); color: #eda9a0; }
+.ares[data-style="modern"] .hmProofVerdict[data-verdict="skip"] { background: rgba(200, 155, 94, 0.14); color: rgba(232, 200, 147, 0.8); }
+.ares[data-style="modern"] .hmProofLabel { flex: 1 1 auto; min-width: 0; font: 600 12.5px/1.3 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .hmProofMs { flex: none; font: 400 11px/1 var(--font); color: var(--faint); }
+.ares[data-style="modern"] .hmProofCmd {
+  font: 400 11px/1.5 ui-monospace, monospace;
+  color: var(--gold-hi);
+  word-break: break-all;
+}
+.ares[data-style="modern"] .hmProofOut {
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: var(--r-sm);
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--line);
+  font: 400 10.5px/1.6 ui-monospace, monospace;
+  color: var(--text);
+  white-space: pre-wrap;
+  /* Wide output scrolls inside itself; the column never scrolls sideways. */
+  overflow-x: auto;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+/* ── Uncertainty ──────────────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmMindWork {
+  justify-self: start;
+  font: 700 9.5px/1 var(--font);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 6px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-raised);
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmMindWork[data-status="verified"] { border-color: rgba(94, 194, 122, 0.42); color: var(--mint-text); }
+.ares[data-style="modern"] .hmMindWork[data-status="unverified"] { border-color: var(--ember-rim); color: var(--ember-text); }
+.ares[data-style="modern"] .hmMindWork[data-status="blocked"] { border-color: rgba(201, 86, 74, 0.5); color: #eda9a0; }
+.ares[data-style="modern"] .hmMindList { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; }
+.ares[data-style="modern"] .hmMindList li {
+  position: relative;
+  padding-left: 16px;
+  font: 400 12px/1.55 var(--font);
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmMindList li::before {
+  content: "—";
+  position: absolute;
+  left: 0;
+  color: var(--faint);
+}
+
+/* ── Failures ─────────────────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmFail {
+  border-left: 2px solid rgba(201, 86, 74, 0.45);
+  padding: 2px 0 2px 11px;
+  display: grid;
+  gap: 4px;
+}
+.ares[data-style="modern"] .hmFailTop { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ares[data-style="modern"] .hmFailTool { font: 650 12.5px/1 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .hmFailCount {
+  font: 700 10px/1 var(--font);
+  font-style: normal;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(200, 155, 94, 0.14);
+  color: rgba(232, 200, 147, 0.85);
+}
+/* Three strikes on one signature is the threshold the engine itself acts on. */
+.ares[data-style="modern"] .hmFailCount[data-hot="1"] { background: rgba(201, 86, 74, 0.22); color: #eda9a0; }
+.ares[data-style="modern"] .hmFailSig { font: 400 10px/1 ui-monospace, monospace; color: var(--faint); }
+.ares[data-style="modern"] .hmFailMsg { margin: 0; font: 400 11.5px/1.55 var(--font); color: var(--muted); }
+
+/* ── Recalled / blocked ───────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmMindCount { margin: 0; font: 600 12px/1.3 var(--font); color: var(--text); }
+.ares[data-style="modern"] .hmBlocked {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--ember-rim);
+  background: rgba(var(--ember-rgb), 0.07);
+}
+.ares[data-style="modern"] .hmBlocked > div { display: grid; gap: 2px; min-width: 0; }
+.ares[data-style="modern"] .hmBlocked strong { font: 650 12.5px/1.2 var(--font); color: var(--text-hi); }
+.ares[data-style="modern"] .hmBlocked span { font: 400 11.5px/1.45 var(--font); color: var(--muted); }
+
+/* ── Liveness strip ───────────────────────────────────────────────────── */
+.ares[data-style="modern"] .hmLive {
+  display: grid;
+  gap: 1px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--line);
+}
+.ares[data-style="modern"] .hmLiveRow {
+  display: grid;
+  grid-template-columns: 12px minmax(140px, auto) 62px 1fr;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 14px;
+  background: #0c0b0a;
+}
+.ares[data-style="modern"] .hmLiveDot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.ares[data-style="modern"] .hmLiveName { font: 600 12px/1.3 var(--font); color: var(--text); }
+.ares[data-style="modern"] .hmLiveState {
+  font: 700 9px/1 var(--font);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.ares[data-style="modern"] .hmLiveDetail { font: 400 11.5px/1.5 var(--font); color: var(--muted); min-width: 0; }
+
+.ares[data-style="modern"] .hmLiveRow[data-state="live"] .hmLiveDot { background: var(--steel); box-shadow: 0 0 8px rgba(94, 194, 122, 0.5); }
+.ares[data-style="modern"] .hmLiveRow[data-state="live"] .hmLiveState { color: var(--mint-text); }
+.ares[data-style="modern"] .hmLiveRow[data-state="idle"] .hmLiveDot { background: rgba(232, 200, 147, 0.5); }
+/* Dead is the state this whole panel exists to surface — it gets the loudest
+   treatment in the strip, and a tinted row so it reads at a glance. */
+.ares[data-style="modern"] .hmLiveRow[data-state="dead"] { background: rgba(201, 86, 74, 0.1); }
+.ares[data-style="modern"] .hmLiveRow[data-state="dead"] .hmLiveDot { background: var(--crimson); box-shadow: 0 0 9px rgba(201, 86, 74, 0.6); }
+.ares[data-style="modern"] .hmLiveRow[data-state="dead"] .hmLiveState { color: #eda9a0; }
+.ares[data-style="modern"] .hmLiveRow[data-state="unknown"] .hmLiveDot { background: transparent; border: 1px dashed var(--faint); }
+
+@container (max-width: 720px) {
+  .ares[data-style="modern"] .hmMindGrid { grid-template-columns: 1fr; }
+  /* Panels shrink; they never disappear. */
+  .ares[data-style="modern"] .hmLiveRow { grid-template-columns: 12px 1fr auto; row-gap: 4px; }
+  .ares[data-style="modern"] .hmLiveDetail { grid-column: 2 / -1; }
+}

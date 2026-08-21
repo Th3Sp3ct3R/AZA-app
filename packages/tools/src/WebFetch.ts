@@ -6,8 +6,133 @@
 // free in terms of context window usage.
 
 import { z } from "zod";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { buildTool } from "./_shared.js";
 import { cdpRenderer, looksJsGated, type JsRenderer } from "./cdpRender.js";
+
+/** Is a literal IP address private / loopback / link-local / unique-local /
+ *  cloud-metadata? Those are the SSRF-sensitive ranges WebFetch must not reach. */
+export function isBlockedIp(ip: string): boolean {
+  const v = isIP(ip);
+  if (v === 4) {
+    const p = ip.split(".").map(Number);
+    if (p.length !== 4 || p.some((n) => Number.isNaN(n))) return true;
+    const [a, b] = p;
+    if (a === 10) return true; // 10/8 private
+    if (a === 127) return true; // loopback
+    if (a === 0) return true; // "this network"
+    if (a === 169 && b === 254) return true; // link-local + 169.254.169.254 metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12 private
+    if (a === 192 && b === 168) return true; // 192.168/16 private
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+    if (a >= 224) return true; // multicast / reserved
+    return false;
+  }
+  if (v === 6) {
+    const lower = ip.toLowerCase().replace(/^\[|\]$/g, "");
+    if (lower === "::1" || lower === "::") return true; // loopback / unspecified
+    if (lower.startsWith("fe80")) return true; // link-local
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // unique-local
+    if (lower.startsWith("::ffff:")) return isBlockedIp(lower.slice(7)); // v4-mapped
+    if (lower.startsWith("ff")) return true; // multicast
+    return false;
+  }
+  return true; // unparseable → block
+}
+
+/** Is this IP the machine's OWN loopback (127/8, ::1)? Distinct from the wider
+ *  private ranges: the owner's own dev server on localhost is a legitimate,
+ *  routine fetch target during coding verification. */
+function isLoopbackIp(ip: string): boolean {
+  const v = isIP(ip);
+  if (v === 4) return ip.split(".")[0] === "127";
+  if (v === 6) {
+    const lower = ip.toLowerCase().replace(/^\[|\]$/g, "");
+    if (lower === "::1") return true;
+    if (lower.startsWith("::ffff:")) return isLoopbackIp(lower.slice(7));
+  }
+  return false;
+}
+
+/** Resolve a hostname and reject if it (or any A/AAAA record) is a blocked IP —
+ *  the DNS-rebinding-safe SSRF gate.
+ *
+ *  EXPLICIT loopback is allowed: a URL that literally names localhost /
+ *  127.x / ::1 is the owner probing their own dev server — the core coding
+ *  verify loop, and no more privilege than the shell already has with curl.
+ *  COVERT loopback stays blocked: a public hostname that merely RESOLVES to
+ *  loopback is the DNS-rebinding shape (a hostile page steering a fetch into
+ *  local admin endpoints), and LAN/metadata ranges stay blocked either way. */
+export async function assertPublicHost(
+  hostname: string,
+  opts: { allowLoopback?: boolean } = {},
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopbackByName = host === "localhost" || host.endsWith(".localhost"); // RFC 6761: always loopback
+  if (loopbackByName || (isIP(host) && isLoopbackIp(host))) {
+    return opts.allowLoopback
+      ? { ok: true }
+      : { ok: false, message: `WebFetch won't follow a redirect from a public page onto loopback (${hostname}) — fetch the local URL directly instead.` };
+  }
+  if (host.endsWith(".internal") || host.endsWith(".local")) {
+    return { ok: false, message: `WebFetch won't reach internal host "${hostname}". It fetches public web pages only.` };
+  }
+  if (isIP(host)) {
+    return isBlockedIp(host)
+      ? { ok: false, message: `WebFetch won't reach the private address ${hostname}.` }
+      : { ok: true };
+  }
+  try {
+    const records = await dnsLookup(host, { all: true });
+    if (records.length === 0) return { ok: false, message: `Couldn't resolve "${hostname}".` };
+    for (const r of records) {
+      if (isBlockedIp(r.address)) {
+        return { ok: false, message: `WebFetch won't reach "${hostname}" — it resolves to a private/internal address.` };
+      }
+    }
+    return { ok: true };
+  } catch {
+    // DNS failure isn't an SSRF signal — let the fetch surface the real error.
+    return { ok: true };
+  }
+}
+
+/** Hard cap on bytes read from a response body (SSRF/DoS: a hostile or huge
+ *  endpoint shouldn't be able to stream unbounded data into memory). 8 MB. */
+const MAX_FETCH_BYTES = 8 * 1024 * 1024;
+
+async function readCapped(res: Response): Promise<{ text: string; truncated: boolean }> {
+  if (!res.body) return { text: await res.text(), truncated: false };
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > MAX_FETCH_BYTES) {
+        chunks.push(value.slice(0, value.byteLength - (total - MAX_FETCH_BYTES)));
+        truncated = true;
+        try { await reader.cancel(); } catch { /* ignore */ }
+        break;
+      }
+      chunks.push(value);
+    }
+  }
+  return { text: new TextDecoder("utf-8", { fatal: false }).decode(concatBytes(chunks)), truncated };
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  let len = 0;
+  for (const c of chunks) len += c.byteLength;
+  const out = new Uint8Array(len);
+  let at = 0;
+  for (const c of chunks) { out.set(c, at); at += c.byteLength; }
+  return out;
+}
 
 export interface Summarizer {
   summarize(req: { input: string; instructions?: string; signal?: AbortSignal }): Promise<string>;
@@ -78,6 +203,10 @@ export function makeWebFetchTool(summarizer?: Summarizer, jsRenderer: JsRenderer
     description:
       "Fetch a URL and return its text content. Pass a `prompt` to have the page summarized via the cheap SUMMARIZE slot first (recommended — keeps your context lean). Use for: looking up current docs, reading specific pages the user pointed at, fact-checking framework APIs. HTTPS is enforced; HTTP is upgraded.",
     safety: "external-state",
+    // HTTP GET only. Static safety remains conservative for catalogs compiled
+    // without input classification; the shared engine classifier admits this
+    // inspection call during plan mode and records it as read-only.
+    dynamicSafety: () => "read-only",
     concurrency: "parallel-safe",
     inputZod: inputSchema,
     activityDescription: (i) => `Fetching ${shortUrl(i.url)}`,
@@ -96,6 +225,14 @@ export function makeWebFetchTool(summarizer?: Summarizer, jsRenderer: JsRenderer
           ok: false,
           message: `WebFetch only fetches http:// and https:// URLs — got ${scheme}//. For local files use Read; for other protocols use a shell tool.`,
         };
+      }
+      // SSRF gate: block private/metadata ranges (opt-out for users who
+      // genuinely need to fetch a LAN service in a trusted setup). EXPLICIT
+      // loopback is allowed at pre-flight — probing the owner's own dev server
+      // is the routine coding verify loop.
+      if (process.env.ARES_WEBFETCH_ALLOW_PRIVATE !== "1") {
+        const guard = await assertPublicHost(new URL(i.url).hostname, { allowLoopback: true });
+        if (!guard.ok) return guard;
       }
       return { ok: true };
     },
@@ -118,6 +255,27 @@ export function makeWebFetchTool(summarizer?: Summarizer, jsRenderer: JsRenderer
         clearTimeout(timeout);
         ctx.signal.removeEventListener("abort", onAbort);
 
+        // A redirect can jump to an internal host AFTER the pre-flight check
+        // passed — re-validate the final URL before reading its body. Loopback
+        // finals are legal only when the ORIGINAL request already targeted
+        // loopback (local dev servers redirect within themselves constantly);
+        // a public page 302'ing onto localhost stays blocked.
+        if (process.env.ARES_WEBFETCH_ALLOW_PRIVATE !== "1" && res.url) {
+          try {
+            const originalHost = new URL(upgraded).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+            const originalWasLoopback =
+              originalHost === "localhost" || originalHost.endsWith(".localhost") ||
+              (isIP(originalHost) !== 0 && isLoopbackIp(originalHost));
+            const finalGuard = await assertPublicHost(new URL(res.url).hostname, { allowLoopback: originalWasLoopback });
+            if (!finalGuard.ok) {
+              return {
+                output: { url: upgraded, finalUrl: res.url, status: res.status, contentType: "", text: `[blocked: ${finalGuard.message}]`, truncated: false },
+                display: `Blocked redirect to ${shortUrl(res.url)}`,
+              };
+            }
+          } catch { /* unparseable final url — fall through */ }
+        }
+
         const contentType = res.headers.get("content-type") ?? "";
         // Don't dump binary (PDF/image/octet-stream) into context as garbage.
         if (/application\/pdf|^image\/|application\/octet-stream|^audio\/|^video\//i.test(contentType)) {
@@ -133,7 +291,7 @@ export function makeWebFetchTool(summarizer?: Summarizer, jsRenderer: JsRenderer
             display: `Fetched ${shortUrl(res.url)} (${res.status}, ${contentType || "binary"})`,
           };
         }
-        const raw = await res.text();
+        const { text: raw, truncated: bodyTruncated } = await readCapped(res);
         const isHtml = /text\/html|application\/xhtml/i.test(contentType) ||
           (!contentType && /^\s*<!DOCTYPE html|<html/i.test(raw));
         let rendered = isHtml ? htmlToText(raw) : raw;
@@ -160,8 +318,10 @@ export function makeWebFetchTool(summarizer?: Summarizer, jsRenderer: JsRenderer
         // Page through long docs with offset (content past the window was
         // previously permanently unreachable).
         const windowed = i.offset > 0 ? rendered.slice(i.offset) : rendered;
-        const truncated = windowed.length > i.max_chars;
-        const text = truncated ? windowed.slice(0, i.max_chars) + "\n\n…[truncated — advance `offset` to read more]…" : windowed;
+        // `bodyTruncated` = we hit the 8MB wire cap; either that or the char
+        // window overflowing means there's more the agent didn't get.
+        const truncated = bodyTruncated || windowed.length > i.max_chars;
+        const text = windowed.length > i.max_chars ? windowed.slice(0, i.max_chars) + "\n\n…[truncated — advance `offset` to read more]…" : windowed;
 
         let summary: string | undefined;
         let summarized = false;

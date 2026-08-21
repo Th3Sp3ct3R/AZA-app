@@ -94,6 +94,7 @@ export async function tickGoal(ctx: ControlLoopContext, goalRef: Goal): Promise<
 
   // ACT — a fresh, ephemeral Worker. No transcript persists across steps.
   const claim = await ctx.dispatcher.runStep(flighted, { signal, now });
+  const workerProofBlocked = claim.workStatus === "blocked" || claim.workStatus === "unverified";
 
   // VERIFY: reality wins over the Worker's claim. With a verification spec,
   // re-measure — goalMet comes from the probe, and "moved" from whether the
@@ -109,9 +110,11 @@ export async function tickGoal(ctx: ControlLoopContext, goalRef: Goal): Promise<
         ? pre.fingerprint !== post.fingerprint
         : claim.moved;
     verdict = {
-      moved,
-      goalMet: post.met && goalCanCompleteFromMission(contract),
-      evidence: post.summary,
+      moved: workerProofBlocked ? false : moved,
+      goalMet: !workerProofBlocked && post.met && goalCanCompleteFromMission(contract),
+      unverified: claim.unverified,
+      workStatus: claim.workStatus,
+      evidence: workerProofBlocked ? claim.evidence : post.summary,
       prediction: claim.prediction,
     };
     fingerprint = post.fingerprint ?? fingerprint;
@@ -128,8 +131,8 @@ export async function tickGoal(ctx: ControlLoopContext, goalRef: Goal): Promise<
       const canComplete = claim.goalMet && corroborated && goalCanCompleteFromMission(contract);
       verdict = {
         ...claim,
-        moved: worldMoved || claim.moved,
-        goalMet: canComplete,
+        moved: workerProofBlocked ? false : worldMoved || claim.moved,
+        goalMet: !workerProofBlocked && canComplete,
         // The WorldModel sources are a GLOBAL set with no link to THIS goal — an
         // unrelated already-green source (or an incidental fingerprint move) can
         // "corroborate" a bare regex goalMet. That corroboration is NOT

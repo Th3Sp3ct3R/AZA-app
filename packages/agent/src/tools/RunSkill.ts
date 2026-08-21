@@ -16,7 +16,7 @@ import { emitLifecycle } from "../lifecycle/bus.js";
 import { gainForTarget } from "../voice.js";
 import { runSkill } from "../skills/runtime.js";
 import { recordOutcome } from "../self/store.js";
-import { SKILL_NAME } from "./SkillCraft.js";
+import { SKILL_NAME, type CapabilityReceipt, type CapabilityScope } from "../skills/manifest.js";
 
 const inputSchema = z
   .object({
@@ -28,6 +28,14 @@ const inputSchema = z
       .unknown()
       .optional()
       .describe("JSON-serializable value passed to the handler as its first argument."),
+    target_root: z
+      .string()
+      .optional()
+      .describe("Directory the skill should operate against. Absolute paths are allowed; relative paths resolve from the current workspace."),
+    operation: z
+      .string()
+      .optional()
+      .describe("Capability-provider operation. For provider skills this may instead be supplied as input.op."),
     timeout_ms: z
       .number()
       .int()
@@ -42,12 +50,17 @@ const inputSchema = z
 
 export interface RunSkillOutput {
   name: string;
+  scope: CapabilityScope;
   ok: boolean;
   result?: unknown;
   error?: string;
   logs: string;
   durationMs: number;
   timedOut: boolean;
+  aborted: boolean;
+  targetRoot: string;
+  touchedFiles: string[];
+  receipt?: CapabilityReceipt;
 }
 
 export const RunSkillTool = buildTool({
@@ -65,7 +78,7 @@ export const RunSkillTool = buildTool({
   inputZod: inputSchema,
   activityDescription: (i) => `RunSkill ${i.name}`,
 
-  async call(input, ctx): Promise<{ output: RunSkillOutput; display: string }> {
+  async call(input, ctx): Promise<{ output: RunSkillOutput; touchedFiles?: string[]; display: string }> {
     const home = aresAgentHome(process.env.ARES_HOME);
     const run = await runSkill({
       home,
@@ -73,6 +86,10 @@ export const RunSkillTool = buildTool({
       input: input.input,
       timeoutMs: input.timeout_ms,
       signal: ctx.signal,
+      workspace: ctx.workspace,
+      targetRoot: input.target_root,
+      sessionId: ctx.sessionId,
+      operation: input.operation,
     });
 
     emitLifecycle({
@@ -101,19 +118,24 @@ export const RunSkillTool = buildTool({
 
     const output: RunSkillOutput = {
       name: run.name,
+      scope: run.scope,
       ok: run.ok,
       result: run.result,
       error: run.error,
       logs: run.logs,
       durationMs: run.durationMs,
       timedOut: run.timedOut,
+      aborted: run.aborted,
+      targetRoot: run.targetRoot,
+      touchedFiles: run.touchedFiles,
+      receipt: run.receipt,
     };
 
     const display = run.ok
       ? `+1 SKILL — ran ${run.name} (${run.durationMs}ms)`
       : `SKILL failed — ${run.name}: ${truncate(run.error ?? "unknown error", 80)}`;
 
-    return { output, display };
+    return { output, touchedFiles: run.touchedFiles.length ? run.touchedFiles : undefined, display };
   },
 });
 

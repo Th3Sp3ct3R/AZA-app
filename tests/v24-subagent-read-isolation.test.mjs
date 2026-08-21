@@ -3,8 +3,8 @@
 // read blesses the parent with edit permission" bug:
 //   - QueryEngine threads its OWN cfg.fileReadStamps into every tool call.
 //   - AresSubagentRunner gives each subagent run a FRESH Map (subagents.ts).
-// If either regressed (a shared/module-global map), a second reader would hit
-// the "already in context" guard instead of reading fresh — these tests catch it.
+// If either regressed (a shared/module-global map), one engine could falsely
+// grant another read-before-write authority — these tests catch it.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -21,8 +21,7 @@ import { ReadTool, adaptToolForEngine } from "../packages/tools/dist/index.js";
 
 const makeTmp = () => fs.mkdtemp(path.join(os.tmpdir(), "ares-v24-"));
 
-// A provider that performs ONE whole-file Read (no limit → the re-read guard
-// applies), then ends. Whole-file is essential: a range read bypasses the guard.
+// A provider that performs one whole-file Read, then ends.
 class WholeFileReadProvider {
   constructor(file) {
     this.file = file;
@@ -60,7 +59,7 @@ const readTool = adaptToolForEngine(ReadTool, (base) => ({
 }));
 
 async function runReadEngine(map, file, workspace) {
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider: new WholeFileReadProvider(file), model: "mock", systemPrompt: "t", tools: [readTool], workspace, signal: new AbortController().signal, fileReadStamps: map },
     "eng",
   );
@@ -151,5 +150,47 @@ test("subagent: a parent engine's read does not pre-satisfy a subagent's read", 
   });
   const r = await runner.run({ subagent_type: "reader", description: "child", prompt: "read", workspace: tmp });
   const out = await toolEndOutput(r.transcriptPath);
-  assert.match(out, /const parent = 1;/, "subagent read fresh content, not the parent's 'already in context' note");
+  assert.match(out, /const parent = 1;/, "subagent read fresh content in its isolated context");
+});
+
+test("subagent: dispatch awaits the live full parent prompt composition", async () => {
+  const tmp = await makeTmp();
+  let observedPrompt = "";
+  let compositions = 0;
+  const provider = {
+    name: "prompt-capture",
+    async *stream(req) {
+      observedPrompt = req.system;
+      yield {
+        type: "message_done",
+        message: {
+          id: "done",
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          createdAt: new Date().toISOString(),
+        },
+        usage: { inputTokens: 1, outputTokens: 1 },
+        stopReason: "end_turn",
+      };
+    },
+  };
+  const registry = new SubagentRegistry([
+    { name: "worker", description: "works", systemPrompt: "TYPE PROMPT", maxTurns: 2 },
+  ]);
+  const runner = new AresSubagentRunner({
+    registry,
+    provider,
+    model: "mock",
+    parentTools: [],
+    baseSystemPrompt: async () => {
+      compositions++;
+      await Promise.resolve();
+      return "OWNER + PERSONA + MEMORY + REPO";
+    },
+  });
+
+  await runner.run({ subagent_type: "worker", description: "child", prompt: "work", workspace: tmp });
+  assert.equal(compositions, 1);
+  assert.match(observedPrompt, /TYPE PROMPT/);
+  assert.match(observedPrompt, /OWNER \+ PERSONA \+ MEMORY \+ REPO/);
 });

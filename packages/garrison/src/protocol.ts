@@ -39,9 +39,27 @@ export type GatewayClientFrame =
   | { type: "hello"; token: string; client: string; proto: typeof PROTO_VERSION }
   | { type: "session.create"; provider?: string; model?: string; workspace?: string }
   | { type: "session.attach"; sessionId: string }
-  | { type: "session.send"; sessionId: string; text: string }
+  | {
+      type: "session.send";
+      sessionId: string;
+      text: string;
+      /** Stable owner-generated identity. Reusing it retries one logical input
+       * instead of creating a second coding turn after an ambiguous disconnect. */
+      inputId?: string;
+      /** queue starts a later turn; steer injects the correction at the next
+       * safe boundary of the active canonical turn. Defaults to queue. */
+      delivery?: "queue" | "steer";
+    }
   | { type: "session.interrupt"; sessionId: string }
   | { type: "sessions.list" }
+  | {
+      /** Read-only replay of a session's recorded events (the rollout/audit
+       * trail) so a viewer can render history it wasn't attached for. */
+      type: "session.history";
+      sessionId: string;
+      /** Newest-N cap; the server may clamp it. */
+      limit?: number;
+    }
   | { type: "status" }
   | {
       type: "permission.respond";
@@ -77,6 +95,12 @@ export type GatewayServerFrame =
   /** TurnEvents pass through VERBATIM — clients render exactly what the engine yielded. */
   | { type: "event"; sessionId: string; event: TurnEvent }
   | { type: "sessions"; sessions: SessionSummary[] }
+  | {
+      type: "session.history";
+      sessionId: string;
+      /** Recorded {ts?, event} entries, oldest first. */
+      entries: Array<{ ts?: string; event: TurnEvent }>;
+    }
   | { type: "status"; garrison: GarrisonStatus }
   | { type: "approval.pending"; staged: StagedApproval }
   | { type: "error"; message: string }

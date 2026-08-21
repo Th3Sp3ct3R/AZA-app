@@ -34,10 +34,11 @@ export {
 export {
   QueryEngineDispatcher,
   defaultEvaluate,
+  scopeOperatorWorkerTools,
   type QueryEngineDispatcherOptions,
 } from "./dispatcher.js";
 
-export { Scheduler, type SchedulerOptions } from "./scheduler.js";
+export { Scheduler, MAX_QUEUED_EVENTS, type SchedulerOptions } from "./scheduler.js";
 
 export {
   decideAttention,
@@ -53,6 +54,7 @@ export {
 export {
   OperatorBackgroundLoop,
   operatorLoopEnabled,
+  operatorTickIntervalMs,
   type OperatorBackgroundLoopOptions,
   type OperatorBackgroundTick,
   type OperatorBackgroundEvent,
@@ -84,6 +86,28 @@ export {
   type StandingOrder,
   type MaterializeResult,
 } from "./standingOrders.js";
+
+export {
+  WATCHER_SCHEMA,
+  MIN_WATCHER_CADENCE_MS,
+  MAX_PROBES_PER_TICK,
+  newWatcherId,
+  normalizeWatcher,
+  saveWatcher,
+  loadWatchers,
+  addWatcher,
+  removeWatcher,
+  setWatcherEnabled,
+  dueWatchers,
+  wakeMatchedWatchers,
+  checkWatchers,
+  renderWatchers,
+  type Watcher,
+  type FiredWatcher,
+  type CheckWatchersResult,
+  type CheckWatchersContext,
+  type WatcherExecutionRequest,
+} from "./watchers.js";
 
 export { runProbe, type ProbeResult, type ProbeContext } from "./probe.js";
 
@@ -238,10 +262,14 @@ export { renderCapabilitiesDoc, writeCapabilitiesDoc } from "./ledger.js";
 export {
   acquireCapability,
   listAcquisitions,
+  setAcquisitionStatus,
+  markAcquisitionAcquired,
   type Acquisition,
   type AcquisitionKind,
   type AcquisitionStatus,
   type AcquisitionResult,
+  type AcquisitionVerification,
+  type AcquisitionHealthcheckProof,
   type AcquireCapabilityInput,
 } from "./acquisition.js";
 
@@ -301,6 +329,7 @@ export type {
   Goal,
   GoalStatus,
   GoalStepRecord,
+  OperatorWorkStatus,
   StepVerdict,
   VerificationSpec,
   Dispatcher,
@@ -329,10 +358,34 @@ export {
 export {
   runGauntlet,
   CODING_GAUNTLET,
+  CODING_GAUNTLET_V2,
+  CODING_GAUNTLET_V3,
+  CODING_GAUNTLET_V4,
+  GAUNTLET_SUITES,
   GAUNTLET_SCHEMA_VERSION,
   type GauntletTask,
   type GauntletTaskResult,
   type GauntletReport,
   type GauntletOptions,
   type GauntletProbeOutcome,
+  type GauntletUsage,
 } from "./gauntlet.js";
+export {
+  parseScoreboard,
+  parseScoreboardRow,
+  scoreboardCellKey,
+  summarizeCells,
+  harnessDeltas,
+  detectRegression,
+  renderTrend,
+  formatCompact,
+  type ScoreboardRow,
+  type ScoreboardMetrics,
+  type ScoreboardCell,
+  type CellStat,
+  type HarnessDelta,
+  type RegressionAxis,
+  type RegressionFinding,
+  type RegressionVerdict,
+  type RegressionThresholds,
+} from "./scoreboard.js";

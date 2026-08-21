@@ -17,12 +17,21 @@
 // runAgent fn (defaults to runForkedTurn) so the whole runtime is unit-testable
 // with a mock runner — no live provider required.
 
-import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rename, rm, open } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import type { PermissionPromptDecision, TurnEndStatus, TurnEvent, Usage } from "@ares/protocol";
+import type { PermissionPromptDecision, TurnEndStatus, TurnEvent, Usage, WorkStatus } from "@ares/protocol";
 import { runForkedTurn } from "./forkedTurn.js";
-import type { EngineTool, Provider, ToolPermissionRequest } from "./queryEngine.js";
+import type { EngineTool, Provider, QueryEngineConfig, ToolPermissionRequest } from "./queryEngine.js";
 import { extractFirstJson } from "./sideQuery.js";
+import { projectMessagesFromKernel } from "./session.js";
+import type { SessionKernelStore } from "./sessionKernel/index.js";
+import { withComposedVerifiedChildSession } from "./childSessionComposition.js";
+import type { VerifierOptions } from "./verifier.js";
+import {
+  applyWorkspaceMutation,
+  type WorkspaceMutationOperation,
+} from "./workspaceMutation.js";
 
 // ─── Hard ceilings (defence against an adversarial/weak-model spec) ────────
 
@@ -33,7 +42,14 @@ export const MAX_AGENTS_PER_FLEET = 64;
 /** Max in-flight forks, regardless of the spec's `concurrency`. */
 export const MAX_CONCURRENCY = 8;
 /** Tool names a fleet child may NEVER be scoped — blocks recursive fleets. */
-export const FORBIDDEN_CHILD_TOOLS = new Set(["Conductor", "Task", "Operator"]);
+export const FORBIDDEN_CHILD_TOOLS = new Set([
+  "Conductor",
+  "Task",
+  "Operator",
+  "EnterPlanMode",
+  "UpdatePlanDraft",
+  "ExitPlanMode",
+]);
 
 /** Non-read-only tools that are nonetheless SAFE for an unattended leaf: pure
  *  research/inspection that reads the world but has no outward effect. Without
@@ -72,6 +88,27 @@ export interface FleetAgentSpec {
    *  "src/api/**"). Used by the overlap check that gates un-isolated parallel
    *  writers (isolation:'none' requires every writer to declare a disjoint scope). */
   scope?: readonly string[];
+  /** Optional roster persona name. When the host supplies a resolver
+   *  (ConductorDeps.resolvePersona) and it knows the name, the leaf adopts the
+   *  persona's prompt layer, tool limits, and turn ceiling. An unknown name is
+   *  never fatal — the leaf runs without it and carries a hint. */
+  persona?: string;
+  /** WORK CONTRACT v1 (build leaves): file globs this leaf must create/modify.
+   *  If NO changed file matches any deliverable pattern the leaf fails its work
+   *  contract (same failure shape as an unverified mutation). */
+  contract?: { deliverables?: readonly string[] };
+}
+
+/** What a resolved roster persona contributes to a fleet leaf. */
+export interface FleetPersonaDef {
+  /** Prepended to the leaf's system prompt (voice, standards, method). */
+  promptLayer: string;
+  /** Tool-name limit intersected with the leaf's whitelist. Empty/omitted = no restriction. */
+  tools?: readonly string[];
+  /** Turn ceiling applied as a MIN with the leaf's existing cap. */
+  maxTurns?: number;
+  /** Advisory model hint used when the leaf spec names none. */
+  model?: string;
 }
 
 export type FleetReduce = "concat" | "first" | "judge";
@@ -105,6 +142,9 @@ export interface FleetPhaseSpec {
    *  'none' opts OUT (shared workspace) — allowed only when every writer declares
    *  a disjoint `scope`, so un-isolated parallel writers provably can't clobber. */
   isolation?: "worktree" | "none";
+  /** Explicit completion rule. Reliability defaults to `all`; use `any` only
+   * for deliberately redundant search and `quorum` for panels. */
+  successPolicy?: "all" | "any" | "quorum" | "best_effort";
 }
 
 export interface FleetSpec {
@@ -145,6 +185,8 @@ export interface LeafResult {
   role: string;
   phaseId: string;
   status: TurnEndStatus; // raw fork status — 'completed' | 'interrupted' | 'failed'
+  /** Proof-bearing outcome. A completed loop may still be unverified/blocked. */
+  workStatus: WorkStatus;
   /** Raw last-assistant text. */
   text: string;
   /** Validated structured payload when a schema was supplied AND it passed. */
@@ -165,6 +207,14 @@ export interface LeafResult {
   /** True when this leaf was admitted-as-completed without real work because the
    *  fleet was over its soft budget — a graceful degrade, never an abort (W2). */
   degraded?: boolean;
+  /** Workspace-relative files this leaf changed (from tool receipts, augmented
+   *  with the worktree diff for isolated builders). Basis for `deliverables`. */
+  changedFiles?: string[];
+  /** Per-deliverable contract outcome, present when the spec declared one. */
+  deliverables?: Array<{ pattern: string; met: boolean }>;
+  /** One-line advisories surfaced into the Conductor tool's hints (e.g. an
+   *  unknown persona name, an unmet deliverable contract). */
+  hints?: string[];
 }
 
 export interface PhaseResult {
@@ -197,20 +247,32 @@ export interface FleetResult {
   manifestPath: string;
 }
 
-/** An isolated build sandbox for one parallel writer (a git worktree). The host
+/** An isolated build sandbox for one parallel writer (copy branch or git worktree). The host
  *  supplies these via ConductorDeps.makeWorktree so MANY builders run at once
  *  without clobbering, then file-disjoint changes merge back. */
 export interface Worktree {
   /** The isolated workspace dir the leaf runs in. */
   dir: string;
+  /** Durable branches survive failed/uncheckpointed integration. Omitted means
+   * disposable for backward-compatible host/test factories. */
+  lifetime?: "durable" | "disposable";
   /** Relative paths this leaf created/modified (e.g. `git status --porcelain`). */
   changedFiles(): Promise<string[]>;
+  /** Prepare this branch's complete CAS mutation set without changing the
+   * owner workspace. Production copy branches implement this so Conductor can
+   * combine every verified leaf into one phase transaction. */
+  prepareApply?(mainWorkspace: string): Promise<{
+    operations: WorkspaceMutationOperation[];
+    alreadyApplied: string[];
+  }>;
   /** Copy this worktree's changed files into the main workspace. Returns a per-file
    *  inventory — never throws on a single failed copy (EACCES/ENOSPC/locked) — so the
    *  caller can report exactly what was written vs failed instead of half-merging the
    *  workspace and letting the exception escape the phase (merge-honesty). */
   applyTo(mainWorkspace: string): Promise<{ applied: string[]; failed: { rel: string; err: string }[] }>;
-  /** Tear the worktree down. */
+  /** Explicit scoped teardown. The runtime calls this for disposable branches
+   * immediately, but only calls it for durable branches after their successful
+   * integration is represented in a durable phase checkpoint. */
   cleanup(): Promise<void>;
 }
 
@@ -236,6 +298,10 @@ export type SchemaHinter = (schema: Record<string, unknown>) => string;
 // ─── Injected agent runner (so the runtime is testable) ────────────────────
 
 export interface RunAgentArgs {
+  /** Stable durable child identity supplied by the DAG node. */
+  sessionId?: string;
+  /** Stable admission/idempotency key for this child node's logical input. */
+  inputId?: string;
   role: string;
   prompt: string;
   tools: readonly EngineTool[];
@@ -250,6 +316,8 @@ export interface RunAgentArgs {
   /** Optional per-leaf workspace (an isolated git worktree for parallel builders;
    *  defaults to deps.workspace). */
   workspace?: string;
+  /** Optional persona prompt layer prepended to the leaf system prompt. */
+  promptLayer?: string;
 }
 
 export interface RunAgentResult {
@@ -257,6 +325,7 @@ export interface RunAgentResult {
   events: TurnEvent[];
   usage: Usage;
   status: TurnEndStatus;
+  workStatus?: WorkStatus;
 }
 
 /** The one primitive the runtime spawns a child through. Defaults to a
@@ -273,13 +342,22 @@ export interface ConductorDeps {
   workspace: string;
   /** Parent abort signal — forwarded into EVERY fork; aborting it cancels all. */
   signal: AbortSignal;
+  sessionKernel?: SessionKernelStore;
+  parentSessionId?: string;
+  /** Provider-issued id of the parent Conductor tool call. Together with the
+   * parent session this identifies one logical invocation across crash replay. */
+  invocationId?: string;
   /** HUD progress sink (the tool forwards ctx.emitProgress here). */
   emitProgress?: (data: unknown) => void;
   /** Optional cheap-model coercion for the last-ditch structured-output step. */
   subModel?: { summarize(req: { input: string; instructions?: string }): Promise<string> };
+  summarizeSpan?: QueryEngineConfig["summarizeSpan"];
   defaultMaxTurns?: number;
   /** Reprompt attempts on a schema miss before falling back to coercion. */
   schemaRetries?: number;
+  /** Per-leaf verifier tuning/injection. Every production durable leaf owns a
+   * distinct verifier rooted at that leaf's workspace/worktree. */
+  childVerifierOptions?: Omit<VerifierOptions, "workspace">;
   validate: LeafValidator;
   schemaHint: SchemaHinter;
   /** Unattended posture: by default the runtime strips any tool that is NOT
@@ -299,6 +377,15 @@ export interface ConductorDeps {
   /** Internal: completed leaves reused on resume, keyed `${phaseId}#${index}`.
    *  Populated by runFleet from spec.resumeFleetId; never set by callers. */
   resume?: ReadonlyMap<string, LeafResult>;
+  /** Internal durable graph identity assigned by runFleet. */
+  fleetId?: string;
+  /** Internal execution namespace. Repair rounds deliberately get fresh nodes. */
+  executionKey?: string;
+  /** Internal branch-lifecycle sink owned by runFleet. Durable worktrees defer
+   * teardown through this boundary; callers never set it directly. */
+  branchLifecycle?: {
+    deferUntilCheckpoint(checkpointKey: string, worktree: Worktree): void;
+  };
   /** Soft-budget multiplier: a fleet keeps ADMITTING leaves until the running
    *  total reaches budget * this. Past the soft budget, further leaves are marked
    *  degraded+completed (skipped, zero tokens) — peers are never aborted. The hard
@@ -307,7 +394,15 @@ export interface ConductorDeps {
   /** Host factory for an isolated git worktree, enabling PARALLEL build phases
    *  (isolation:'worktree'). Absent ⇒ such a phase safely runs its writers SERIALLY
    *  in the shared workspace instead (no clobber, just no parallelism). */
-  makeWorktree?: (label: string) => Promise<Worktree>;
+  /** `durableKey`, when present, identifies the same isolated branch across a
+   * process restart. Factories that do not persist branches may ignore it. */
+  makeWorktree?: (label: string, durableKey?: string) => Promise<Worktree>;
+  /** Host resolver for FleetAgentSpec.persona names (the ~/.ares roster). Returns
+   *  null/undefined for an unknown name — the leaf then runs persona-less with a
+   *  hint; a persona lookup NEVER fails the fleet. */
+  resolvePersona?: (
+    name: string,
+  ) => FleetPersonaDef | null | undefined | Promise<FleetPersonaDef | null | undefined>;
 }
 
 // ─── Small async semaphore (caps in-flight forks) ──────────────────────────
@@ -374,6 +469,61 @@ function budgetSpent(ledger: { usage: Usage }, budget: number): boolean {
 
 function newId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Content-address one orchestration node without putting prompts, roles, or
+ * provider ids directly into filesystem/session names. Length-delimited parts
+ * make the preimage unambiguous (`["ab", "c"]` cannot collide with `["a", "bc"]`). */
+function stableId(prefix: string, ...parts: string[]): string {
+  const hash = createHash("sha256");
+  hash.update("ares-conductor-v1\0");
+  for (const part of parts) hash.update(`${Buffer.byteLength(part, "utf8")}:`).update(part);
+  return `${prefix}_${hash.digest("hex").slice(0, 32)}`;
+}
+
+function fleetIdentity(spec: FleetSpec, deps: ConductorDeps): { id: string; replayable: boolean } {
+  // An owner-supplied resume target is the strongest identity: continuing it
+  // must not silently fork a second fleet merely because this is a new tool call.
+  if (spec.resumeFleetId) return { id: spec.resumeFleetId, replayable: true };
+  if (deps.parentSessionId && deps.invocationId) {
+    return {
+      id: stableId("fleet", deps.parentSessionId, deps.invocationId),
+      replayable: true,
+    };
+  }
+  // Legacy/direct callers without a provider invocation id retain fresh-run
+  // semantics, so unrelated calls from tests/embedders never alias by accident.
+  return { id: newId("fleet"), replayable: false };
+}
+
+function graphSessionId(
+  deps: ConductorDeps,
+  kind: "leaf" | "schema" | "judge" | "planner",
+  phaseId: string,
+  index: number,
+  role: string,
+): string {
+  if (!deps.fleetId) return newId("agent");
+  return stableId(
+    "agent",
+    deps.fleetId,
+    deps.executionKey ?? "initial",
+    kind,
+    phaseId,
+    String(index),
+    role,
+  );
+}
+
+function graphInputId(sessionId: string, slot = "primary"): string {
+  // The prompt is deliberately NOT part of this key. Replaying the same graph
+  // node with different bytes must trip the kernel's idempotency conflict rather
+  // than quietly execute a second interpretation of one logical invocation.
+  return stableId("fleet_input", sessionId, slot);
+}
+
+function branchCheckpointKey(deps: ConductorDeps, phaseId: string): string {
+  return `${deps.executionKey ?? "initial"}\0${phaseId}`;
 }
 
 /** Resolve {{field}} / {{phaseId.index.field}} templates against a context object
@@ -531,8 +681,8 @@ export function validateSpec(spec: FleetSpec, parentTools: readonly EngineTool[]
       for (const name of agent.tools ?? []) {
         if (FORBIDDEN_CHILD_TOOLS.has(name)) {
           throw new Error(
-            `phase '${phase.id}' agent '${agent.role}' whitelists '${name}', which would let a ` +
-              `fleet child spawn another fleet/subagent. Orchestration tools cannot be delegated.`,
+            `phase '${phase.id}' agent '${agent.role}' whitelists '${name}', an owner/control-plane ` +
+              `capability that cannot be delegated to a fleet child.`,
           );
         }
         if (!known.has(name)) {
@@ -568,8 +718,76 @@ function defaultRunAgent(deps: ConductorDeps): RunAgentFn {
 
   return async (args: RunAgentArgs): Promise<RunAgentResult> => {
     const systemPrompt =
+      (args.promptLayer ? `${args.promptLayer}\n\n---\n\n` : "") +
       `You are the '${args.role}' agent in a deterministic fleet. Complete ONLY your assigned task, ` +
       `then stop. Be concise.\n\n---\n\n${deps.baseSystemPrompt}`;
+    const childSessionId = args.sessionId ?? newId("agent");
+    if (deps.sessionKernel) {
+      const parentId = deps.parentSessionId ?? `fleet_root_${childSessionId}`;
+      if (!deps.sessionKernel.getSession(parentId)) {
+        deps.sessionKernel.createSession({
+          id: parentId,
+          workspaceKey: path.resolve(deps.workspace),
+          metadata: { source: "conductor-root" },
+        });
+      }
+      if (!deps.sessionKernel.getSession(childSessionId)) {
+        deps.sessionKernel.createChildSession({
+          id: childSessionId,
+          parentSessionId: parentId,
+          relation: "fleet-leaf",
+          externalKey: childSessionId,
+          workspaceKey: path.resolve(args.workspace ?? deps.workspace),
+          title: args.role,
+          metadata: { role: args.role },
+        });
+      }
+      const durableChild = deps.sessionKernel.requireSession(childSessionId);
+      const restoredMessages = projectMessagesFromKernel(deps.sessionKernel, childSessionId);
+      const childWorkspace = args.workspace ?? deps.workspace;
+      return withComposedVerifiedChildSession({
+        surface: "conductor",
+        workspace: childWorkspace,
+        provider: args.provider ?? deps.provider,
+        model: args.model ?? deps.model,
+        systemPrompt,
+        tools: args.tools,
+        signal: args.signal,
+        maxTurns: args.maxTurns,
+        requestPermission,
+        contextBudgetTokens: 128_000,
+        summarizeSpan: deps.summarizeSpan,
+        sessionId: childSessionId,
+        sessionKernel: deps.sessionKernel,
+        initialMessages: restoredMessages,
+        verifierOptions: deps.childVerifierOptions,
+      }, async ({ session }) => {
+        const events: TurnEvent[] = [];
+        let finalStatus: TurnEndStatus = "completed";
+        let workStatus: WorkStatus = durableChild.workOutcome === "pending"
+          ? "unverified"
+          : durableChild.workOutcome;
+        let usage: Usage = { inputTokens: 0, outputTokens: 0 };
+        for await (const event of session.sendContent(
+          [{ type: "text", text: args.prompt }],
+          { inputId: args.inputId ?? graphInputId(childSessionId) },
+        )) {
+          events.push(event);
+          args.onEvent?.(event);
+          if (event.type === "turn_end") {
+            finalStatus = event.status;
+            workStatus = event.workStatus ?? "not_applicable";
+            usage = event.usage;
+          }
+        }
+        const lastAssistant = [...session.history()].reverse().find((message) => message.role === "assistant");
+        const finalText = lastAssistant
+          ? lastAssistant.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim()
+          : "";
+        return { finalText, events, usage, status: finalStatus, workStatus };
+      });
+    }
+
     const result = await runForkedTurn({
       config: {
         provider: args.provider ?? deps.provider,
@@ -580,8 +798,10 @@ function defaultRunAgent(deps: ConductorDeps): RunAgentFn {
         signal: args.signal,
         maxTurns: args.maxTurns,
         requestPermission,
+        summarizeSpan: deps.summarizeSpan,
       },
-      sessionId: newId("agent"),
+      sessionId: childSessionId,
+      inputId: args.inputId ?? graphInputId(childSessionId),
       seed: { kind: "work-item", text: args.prompt },
       onEvent: args.onEvent,
     });
@@ -590,6 +810,7 @@ function defaultRunAgent(deps: ConductorDeps): RunAgentFn {
       events: result.events,
       usage: result.usage,
       status: result.status,
+      workStatus: result.workStatus,
     };
   };
 }
@@ -717,6 +938,7 @@ function scopeTools(
 async function runLeaf(
   agent: FleetAgentSpec,
   phaseId: string,
+  leafIndex: number,
   resolvedPrompt: string,
   unresolvedTemplates: number,
   deps: ConductorDeps,
@@ -725,13 +947,48 @@ async function runLeaf(
   budget: number,
   allowWrite = false,
   workspaceOverride?: string,
+  // Worktree phases evaluate the deliverable contract themselves AFTER
+  // augmenting changedFiles with the authoritative worktree diff.
+  deferContract = false,
 ): Promise<LeafResult> {
-  const agentId = newId("agent");
+  const agentId = graphSessionId(deps, "leaf", phaseId, leafIndex, agent.role);
   // A build phase grants write tools to its leaves; the host's global flag still
   // forces it on everywhere if set.
-  const { tools, stripped } = scopeTools(deps.parentTools, agent.tools, allowWrite || (deps.allowWriteTools ?? false));
-  const maxTurns = agent.maxTurns ?? deps.defaultMaxTurns ?? 12;
+  const { tools: scopedTools, stripped } = scopeTools(deps.parentTools, agent.tools, allowWrite || (deps.allowWriteTools ?? false));
+  const hints: string[] = [];
+
+  // PERSONA: resolve the named roster persona through the host resolver. A
+  // missing resolver / unknown name / resolver crash is NEVER fatal — the leaf
+  // runs persona-less and carries a hint the model will see.
+  let persona: FleetPersonaDef | undefined;
+  if (agent.persona) {
+    if (deps.resolvePersona) {
+      try {
+        persona = (await deps.resolvePersona(agent.persona)) ?? undefined;
+      } catch {
+        persona = undefined;
+      }
+      if (!persona) {
+        hints.push(`persona '${agent.persona}' was not found on the roster; leaf '${agent.role}' ran without it.`);
+      }
+    } else {
+      hints.push(`persona '${agent.persona}' was requested but this host has no persona resolver; leaf '${agent.role}' ran without it.`);
+    }
+  }
+  // The persona's tool list narrows the leaf's belt (never widens it — the
+  // scoped catalog stays the outer bound). Empty/omitted = no restriction.
+  const tools =
+    persona?.tools && persona.tools.length > 0
+      ? scopedTools.filter((t) => persona!.tools!.includes(t.schema.name))
+      : scopedTools;
+  const baseMaxTurns = agent.maxTurns ?? deps.defaultMaxTurns ?? 12;
+  const maxTurns = persona?.maxTurns ? Math.min(baseMaxTurns, persona.maxTurns) : baseMaxTurns;
   const collected: TurnEvent[] = [];
+  // Workspace-relative changed files from tool receipts (Edit/Write/… report
+  // touchedFiles on tool_end). Bash writes are invisible here; the worktree
+  // phase augments with its authoritative snapshot diff.
+  const leafWorkspace = workspaceOverride ?? deps.workspace;
+  const changedFiles = new Set<string>();
 
   const onEvent = (ev: TurnEvent) => {
     collected.push(ev);
@@ -748,6 +1005,13 @@ async function runLeaf(
         activity: (ev as { activityDescription?: string }).activityDescription,
       });
     }
+    if (ev.type === "tool_end" && Array.isArray(ev.touchedFiles)) {
+      for (const file of ev.touchedFiles) {
+        if (typeof file !== "string" || !file) continue;
+        const rel = path.isAbsolute(file) ? path.relative(leafWorkspace, file) : file;
+        if (rel && !rel.startsWith("..")) changedFiles.add(rel.split(path.sep).join("/"));
+      }
+    }
   };
 
   // Leaf lifecycle for the desktop fleet board: a "start" so the agent appears
@@ -755,14 +1019,17 @@ async function runLeaf(
   deps.emitProgress?.({ kind: "fleet_activity", event: "start", agentId, role: agent.role, phase: phaseId });
 
   const first = await run({
+    sessionId: agentId,
+    inputId: graphInputId(agentId),
     role: agent.role,
     prompt: resolvedPrompt,
     tools,
     maxTurns,
     signal: deps.signal,
     onEvent,
-    model: agent.model,
+    model: agent.model ?? persona?.model,
     workspace: workspaceOverride,
+    promptLayer: persona?.promptLayer,
   });
   deps.emitProgress?.({ kind: "fleet_activity", event: "done", agentId, role: agent.role, phase: phaseId, status: first.status });
   ledger.usage = addUsage(ledger.usage, first.usage);
@@ -770,16 +1037,28 @@ async function runLeaf(
   let structured: unknown;
   let schemaValid = true;
   if (agent.schema) {
+    let schemaAttempt = 0;
     const reFork = async (instruction: string) => {
+      const attempt = schemaAttempt++;
+      const schemaSessionId = graphSessionId(
+        deps,
+        "schema",
+        `${phaseId}#${leafIndex}`,
+        attempt,
+        agent.role,
+      );
       const r = await run({
+        sessionId: schemaSessionId,
+        inputId: graphInputId(schemaSessionId),
         role: agent.role,
         prompt: instruction,
         tools,
         maxTurns: 1,
         signal: deps.signal,
         onEvent,
-        model: agent.model,
+        model: agent.model ?? persona?.model,
         workspace: workspaceOverride,
+        promptLayer: persona?.promptLayer,
       });
       return { text: r.finalText, usage: r.usage, events: r.events };
     };
@@ -802,11 +1081,12 @@ async function runLeaf(
   // transcript the manifest will reference so the path is never dangling.
   void writeTranscript(transcriptPath, collected, first.finalText);
 
-  return {
+  const leaf: LeafResult = {
     agentId,
     role: agent.role,
     phaseId,
     status: first.status,
+    workStatus: first.workStatus ?? "not_applicable",
     text: first.finalText,
     structured,
     schemaValid,
@@ -815,7 +1095,14 @@ async function runLeaf(
     unresolvedTemplates,
     strippedTools: stripped,
     transcriptPath,
+    changedFiles: changedFiles.size > 0 ? [...changedFiles].sort() : undefined,
+    hints: hints.length > 0 ? hints : undefined,
   };
+  // CONTRACT v1: a build leaf that declared deliverables must have changed at
+  // least one matching file. Worktree phases defer this until the authoritative
+  // snapshot diff has been folded into changedFiles.
+  if (!deferContract && allowWrite) applyDeliverableContract(leaf, agent);
+  return leaf;
 }
 
 // ─── Phase execution ───────────────────────────────────────────────────────
@@ -871,7 +1158,7 @@ async function runParallelPhase(
           return invalidLeaf(agent, phase.id, "(skipped: over soft budget)", 0, true);
         }
         const { text: prompt, unresolved } = resolveTemplates(agent.prompt, pipelineCtx);
-        const leaf = await runLeaf(agent, phase.id, prompt, unresolved, deps, run, ledger, budget, phase.build === true);
+        const leaf = await runLeaf(agent, phase.id, i, prompt, unresolved, deps, run, ledger, budget, phase.build === true);
         return leaf;
       } finally {
         // Release the slot BEFORE journaling so a slow .ares write never gates
@@ -901,8 +1188,8 @@ async function runParallelPhase(
     reduced = reduceLeaves(leaves, mode);
   }
   const unresolvedTemplates = leaves.reduce((n, l) => n + l.unresolvedTemplates, 0);
-  const anyCompleted = leaves.some((l) => l.status === "completed");
-  const phaseStatus: PhaseResult["status"] = skipped > 0 ? "aborted" : anyCompleted ? "completed" : "failed";
+  const succeeded = phaseMeetsSuccessPolicy(leaves, phase.successPolicy ?? "all", phase.build === true);
+  const phaseStatus: PhaseResult["status"] = skipped > 0 ? "aborted" : succeeded ? "completed" : "failed";
   return {
     id: phase.id,
     kind: "parallel",
@@ -913,7 +1200,9 @@ async function runParallelPhase(
     status: phaseStatus,
     failureReason:
       phaseStatus === "failed"
-        ? "every leaf in this parallel phase failed; its reduced text is error output, not a result."
+        ? leaves.every((leaf) => leaf.status !== "completed")
+          ? `every leaf failed; parallel phase did not satisfy success policy '${phase.successPolicy ?? "all"}'.`
+          : `parallel phase did not satisfy success policy '${phase.successPolicy ?? "all"}'.`
         : undefined,
   };
 }
@@ -947,13 +1236,35 @@ async function runWorktreePhase(
         if (admitBlocked()) return invalidLeaf(agent, phase.id, "(skipped: over soft budget)", 0, true);
         let wt: Worktree;
         try {
-          wt = await make(`${phase.id}-${i}`);
+          const durableKey = deps.fleetId
+            ? stableId(
+                "worktree",
+                deps.fleetId,
+                deps.executionKey ?? "initial",
+                phase.id,
+                String(i),
+              )
+            : undefined;
+          wt = await make(`${phase.id}-${i}`, durableKey);
         } catch (e) {
           return invalidLeaf(agent, phase.id, `(worktree create failed: ${e instanceof Error ? e.message : String(e)})`, 0);
         }
         worktrees[i] = wt;
         const { text: prompt, unresolved } = resolveTemplates(agent.prompt, pipelineCtx);
-        return await runLeaf(agent, phase.id, prompt, unresolved, deps, run, ledger, budget, true, wt.dir);
+        // Contract evaluation is DEFERRED past runLeaf: the worktree snapshot
+        // diff is the authoritative changed-files set (it sees Bash writes the
+        // tool receipts miss), so fold it in before judging deliverables.
+        const leaf = await runLeaf(agent, phase.id, i, prompt, unresolved, deps, run, ledger, budget, true, wt.dir, true);
+        if (agent.contract?.deliverables?.length) {
+          try {
+            const diff = await wt.changedFiles();
+            leaf.changedFiles = [...new Set([...(leaf.changedFiles ?? []), ...diff.map((f) => f.split(path.sep).join("/"))])].sort();
+          } catch {
+            // keep the tool-receipt set; the merge stage will surface enumeration failures
+          }
+          applyDeliverableContract(leaf, agent);
+        }
+        return leaf;
       } finally {
         release();
       }
@@ -964,8 +1275,16 @@ async function runWorktreePhase(
   );
 
   // Merge: collect each leaf's changed files, FAIL CLOSED on cross-leaf overlap,
-  // otherwise apply all. Always clean up the worktrees.
+  // otherwise apply all. Disposable branches die here. Durable branches are
+  // retained on every non-integrated path and only DEFER cleanup after a clean
+  // integration pass; runFleet releases them once that exact phase attempt is
+  // represented in the durable leaves checkpoint.
   let failureReason: string | undefined;
+  let mergePassSucceeded = false;
+  const mergeEligible = new Set<number>();
+  for (let i = 0; i < worktrees.length; i++) {
+    if (worktrees[i] && leafMeetsWorkContract(leaves[i], true)) mergeEligible.add(i);
+  }
   try {
     // Enumerate each present leaf's changes. A changedFiles() REJECTION must NOT be
     // swallowed into [] — an empty list registers ZERO owned paths (invisible to the
@@ -974,12 +1293,16 @@ async function runWorktreePhase(
     // CLOSED: capture rejections and, if any present leaf could not be enumerated,
     // merge NOTHING (merge-honesty — never overwrite what we couldn't account for).
     const enumerated = await Promise.allSettled(
-      worktrees.map((w) => (w ? w.changedFiles() : Promise.resolve([] as string[]))),
+      worktrees.map((w, i) =>
+        w && leafMeetsWorkContract(leaves[i], true)
+          ? w.changedFiles()
+          : Promise.resolve([] as string[]),
+      ),
     );
     const enumFailed: number[] = [];
     const changedByLeaf: string[][] = enumerated.map((r, i) => {
       if (r.status === "fulfilled") return r.value;
-      if (worktrees[i]) enumFailed.push(i);
+      if (worktrees[i] && leafMeetsWorkContract(leaves[i], true)) enumFailed.push(i);
       return [];
     });
     const owner = new Map<string, number>();
@@ -1008,26 +1331,74 @@ async function runWorktreePhase(
       // half-merged workspace whose exception escapes the phase.
       const allApplied: string[] = [];
       const allFailed: { rel: string; err: string }[] = [];
-      for (const w of worktrees) {
-        if (!w) continue;
-        const res = await w.applyTo(deps.workspace);
-        allApplied.push(...res.applied);
-        allFailed.push(...res.failed);
+      const eligibleWorktrees = worktrees
+        .map((worktree, index) => ({ worktree, index }))
+        .filter((entry): entry is { worktree: Worktree; index: number } =>
+          Boolean(entry.worktree) && leafMeetsWorkContract(leaves[entry.index], true),
+        );
+      const phaseAtomic =
+        eligibleWorktrees.length > 0 &&
+        eligibleWorktrees.every(({ worktree }) => typeof worktree.prepareApply === "function");
+      if (phaseAtomic) {
+        try {
+          const prepared = await Promise.all(
+            eligibleWorktrees.map(({ worktree }) => worktree.prepareApply!(deps.workspace)),
+          );
+          const operations = prepared.flatMap((entry) => entry.operations);
+          allApplied.push(...prepared.flatMap((entry) => entry.alreadyApplied));
+          if (operations.length > 0) {
+            const receipt = await applyWorkspaceMutation(deps.workspace, operations, {
+              label: `Conductor phase ${phase.id}`,
+              transactionId: stableId(
+                "conductor_phase",
+                deps.fleetId ?? "unscoped",
+                deps.executionKey ?? "initial",
+                phase.id,
+              ),
+            });
+            allApplied.push(...receipt.touchedFiles.map((file) => path.relative(deps.workspace, file)));
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          for (const files of changedByLeaf) {
+            for (const rel of files) allFailed.push({ rel, err: message });
+          }
+        }
+      } else {
+        for (const { worktree } of eligibleWorktrees) {
+          const res = await worktree.applyTo(deps.workspace);
+          allApplied.push(...res.applied);
+          allFailed.push(...res.failed);
+        }
       }
       if (allFailed.length > 0) {
-        failureReason =
-          `worktree merge PARTIAL — ${allApplied.length} file(s) written, ${allFailed.length} FAILED to copy ` +
-          `into the workspace. Failed: ${allFailed.slice(0, 6).map((f) => `${f.rel} (${f.err})`).join(", ")}. ` +
-          `Written: ${allApplied.slice(0, 6).join(", ")}${allApplied.length > 6 ? ", …" : ""}. ` +
-          `The workspace is half-merged — reconcile before relying on it.`;
+        failureReason = phaseAtomic
+          ? `worktree phase settlement failed before a successful phase commit. ${allFailed.length} path(s) were rejected: ` +
+            `${allFailed.slice(0, 6).map((f) => `${f.rel} (${f.err})`).join(", ")}. ` +
+            `No successful phase receipt was recorded; durable branches and the mutation journal were retained for recovery.`
+          : `worktree merge PARTIAL — ${allApplied.length} file(s) written, ${allFailed.length} FAILED to copy ` +
+            `into the workspace. Failed: ${allFailed.slice(0, 6).map((f) => `${f.rel} (${f.err})`).join(", ")}. ` +
+            `Written: ${allApplied.slice(0, 6).join(", ")}${allApplied.length > 6 ? ", …" : ""}. ` +
+            `The workspace is half-merged — reconcile before relying on it.`;
       }
+      if (allFailed.length === 0) mergePassSucceeded = true;
     }
   } finally {
-    await Promise.allSettled(worktrees.map((w) => (w ? w.cleanup() : Promise.resolve())));
+    const checkpointKey = branchCheckpointKey(deps, phase.id);
+    await Promise.allSettled(worktrees.map((worktree, index) => {
+      if (!worktree) return Promise.resolve();
+      if (worktree.lifetime !== "durable") return worktree.cleanup();
+      if (mergePassSucceeded && mergeEligible.has(index)) {
+        deps.branchLifecycle?.deferUntilCheckpoint(checkpointKey, worktree);
+      }
+      // A durable unverified, conflicted, partially-integrated, or otherwise
+      // failed branch remains owner-local for deterministic reopen/recovery.
+      return Promise.resolve();
+    }));
   }
 
-  const anyCompleted = leaves.some((l) => l.status === "completed");
-  const status: PhaseResult["status"] = failureReason ? "failed" : anyCompleted ? "completed" : "failed";
+  const succeeded = phaseMeetsSuccessPolicy(leaves, phase.successPolicy ?? "all", true);
+  const status: PhaseResult["status"] = failureReason ? "failed" : succeeded ? "completed" : "failed";
   const reduced = failureReason ?? reduceLeaves(leaves, "concat");
   return {
     id: phase.id,
@@ -1073,6 +1444,23 @@ async function runPipelinePhase(
     if (resumed && resumed.role === agent.role) {
       const leaf = resumedLeaf(resumed);
       leaves.push(leaf);
+      if (!leafMeetsWorkContract(leaf, phase.build === true)) {
+        status = "failed";
+        failureReason = phase.build === true
+          ? `resumed stage '${agent.role}' has mutation work status '${leaf.workStatus}'; build stages require verified evidence.`
+          : `resumed stage '${agent.role}' has unacceptable work status '${leaf.workStatus}'.`;
+        break;
+      }
+      if (agent.schema && !leaf.schemaValid) {
+        status = "failed";
+        failureReason = `resumed stage '${agent.role}' failed its schema; downstream stages cannot consume its output.`;
+        break;
+      }
+      if (leaf.unresolvedTemplates > 0) {
+        status = "failed";
+        failureReason = `resumed stage '${agent.role}' retained ${leaf.unresolvedTemplates} unresolved template reference(s).`;
+        break;
+      }
       prevStructured = leaf.structured;
       prevText = leaf.text;
       prevSchema = agent.schema && leaf.schemaValid ? agent.schema : undefined;
@@ -1114,7 +1502,7 @@ async function runPipelinePhase(
       prevText,
     };
     const { text: prompt, unresolved } = resolveTemplates(agent.prompt, localCtx);
-    const leaf = await runLeaf(agent, phase.id, prompt, unresolved, deps, run, ledger, budget, phase.build === true);
+    const leaf = await runLeaf(agent, phase.id, idx, prompt, unresolved, deps, run, ledger, budget, phase.build === true);
     leaves.push(leaf);
     journalTasks.push(journalLeaf(deps.workspace, leaf));
 
@@ -1125,6 +1513,13 @@ async function runPipelinePhase(
     if (leaf.status !== "completed") {
       status = "failed";
       failureReason = `stage '${agent.role}' ${leaf.status}: downstream stages cannot build on a stage that did not complete.`;
+      break;
+    }
+    if (!leafMeetsWorkContract(leaf, phase.build === true)) {
+      status = "failed";
+      failureReason = phase.build === true
+        ? `stage '${agent.role}' completed but its mutation work is ${leaf.workStatus}; build stages require verified evidence before their output can be accepted.`
+        : `stage '${agent.role}' completed with work status '${leaf.workStatus}', so its output is not an acceptable research result.`;
       break;
     }
 
@@ -1197,7 +1592,7 @@ async function judgeReduce(
 ): Promise<{ reduced: string; structured?: unknown }> {
   const fallback = reduceLeaves(leaves, "concat");
   if (deps.signal.aborted || budgetSpent(ledger, budget)) return { reduced: fallback };
-  const pool = leaves.filter((l) => l.status === "completed");
+  const pool = leaves.filter((leaf) => leafMeetsWorkContract(leaf, phase.build === true));
   if (pool.length === 0) return { reduced: fallback };
   if (pool.length === 1) return { reduced: pool[0].text }; // nothing to judge
   const corpus = pool
@@ -1208,25 +1603,154 @@ async function judgeReduce(
     "Synthesize the candidate outputs below into ONE strongest result. Weigh them against each " +
       "other, resolve contradictions, keep the best of each, and discard the weak. Output only the " +
       "synthesized result — not a meta-commentary about the candidates.";
+  // The judge is a real (if brief) fork — surface it on the fleet board like
+  // any other agent so a panel doesn't look stalled while it synthesizes.
+  const judgeAgentId = `${phase.id}-judge`;
+  deps.emitProgress?.({ kind: "fleet_activity", event: "start", agentId: judgeAgentId, role: "judge", phase: phase.id });
   try {
+    const judgeSessionId = graphSessionId(deps, "judge", phase.id, 0, `${phase.id}-judge`);
     const r = await run({
+      sessionId: judgeSessionId,
+      inputId: graphInputId(judgeSessionId),
       role: `${phase.id}-judge`,
       prompt: `${instruction}\n\n${corpus}`,
       tools: [],
       maxTurns: 2,
       signal: deps.signal,
-      onEvent: () => {},
+      onEvent: (ev) => {
+        if (ev.type === "tool_start") {
+          deps.emitProgress?.({
+            kind: "fleet_activity",
+            event: "tool",
+            agentId: judgeAgentId,
+            role: "judge",
+            phase: phase.id,
+            tool: (ev as { name?: string }).name,
+            activity: (ev as { activityDescription?: string }).activityDescription,
+          });
+        }
+      },
     });
     ledger.usage = addUsage(ledger.usage, r.usage);
+    deps.emitProgress?.({ kind: "fleet_activity", event: "done", agentId: judgeAgentId, role: "judge", phase: phase.id, status: "completed" });
     return { reduced: r.finalText || fallback };
   } catch {
+    deps.emitProgress?.({ kind: "fleet_activity", event: "done", agentId: judgeAgentId, role: "judge", phase: phase.id, status: "failed" });
     return { reduced: fallback };
   }
 }
 
 /** Build a LeafResult from a reused (resumed) leaf — no fork, no fresh usage. */
 function resumedLeaf(prior: LeafResult): LeafResult {
-  return { ...prior, usage: { inputTokens: 0, outputTokens: 0 }, toolCallCount: 0 };
+  return {
+    ...prior,
+    workStatus: prior.workStatus ?? "not_applicable",
+    usage: { inputTokens: 0, outputTokens: 0 },
+    toolCallCount: 0,
+  };
+}
+
+// ─── Deliverable contracts (v1: file globs vs changed files) ───────────────
+//
+// Small picomatch-style matcher kept local so @ares/core stays dependency-free
+// (mirrors the tools-layer globToRegExp; minimatch is not a dependency here).
+// Supports **, *, ?, and {a,b}; paths are compared with forward slashes.
+
+function fleetGlobToRegExp(glob: string): RegExp {
+  const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let r = "^";
+  let i = 0;
+  while (i < glob.length) {
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      r += ".*"; // ** — any number of path segments
+      i += 2;
+      if (glob[i] === "/") i++;
+    } else if (c === "*") {
+      r += "[^/]*";
+      i++;
+    } else if (c === "?") {
+      r += "[^/]";
+      i++;
+    } else if (c === "{") {
+      const close = glob.indexOf("}", i);
+      if (close < 0) {
+        r += "\\{";
+        i++;
+        continue;
+      }
+      r += "(?:" + glob.slice(i + 1, close).split(",").map(escapeRegex).join("|") + ")";
+      i = close + 1;
+    } else if (/[.+^${}()|[\]\\]/.test(c)) {
+      r += "\\" + c;
+      i++;
+    } else {
+      r += c;
+      i++;
+    }
+  }
+  r += "$";
+  return new RegExp(r);
+}
+
+/** Per-deliverable met/unmet against a set of workspace-relative changed files. */
+function evaluateDeliverables(
+  deliverables: readonly string[],
+  changedFiles: readonly string[],
+): Array<{ pattern: string; met: boolean }> {
+  const normalized = changedFiles.map((f) => f.split(path.sep).join("/").replace(/^\.\//, ""));
+  return deliverables.map((pattern) => {
+    let re: RegExp;
+    try {
+      re = fleetGlobToRegExp(pattern.split(path.sep).join("/"));
+    } catch {
+      return { pattern, met: false };
+    }
+    return { pattern, met: normalized.some((f) => re.test(f)) };
+  });
+}
+
+/** Enforce a build leaf's deliverable contract: when NONE of its declared
+ *  deliverable globs matched any changed file, the leaf fails its work contract
+ *  — the same failure shape as an unverified mutation (leafMeetsWorkContract
+ *  rejects it, success policies count it against the phase). Never throws. */
+function applyDeliverableContract(leaf: LeafResult, agent: FleetAgentSpec): void {
+  const declared = agent.contract?.deliverables?.filter((d) => typeof d === "string" && d.length > 0);
+  if (!declared || declared.length === 0) return;
+  leaf.deliverables = evaluateDeliverables(declared, leaf.changedFiles ?? []);
+  const anyMet = leaf.deliverables.some((d) => d.met);
+  if (!anyMet && leaf.status === "completed" && !leaf.degraded) {
+    leaf.workStatus = "unverified";
+    const hint =
+      `leaf '${leaf.role}' failed its work contract: no changed file matched its declared ` +
+      `deliverables [${declared.join(", ")}].`;
+    leaf.hints = [...(leaf.hints ?? []), hint];
+  }
+}
+
+function leafMeetsWorkContract(leaf: LeafResult | undefined, mutationWork: boolean): boolean {
+  if (!leaf || leaf.status !== "completed" || leaf.degraded) return false;
+  // A coding/build node must carry evidence tied to its newest mutation. A
+  // read-only/research node legitimately has no verification obligation and is
+  // represented as not_applicable. `unverified` and `blocked` are never success.
+  return mutationWork
+    ? leaf.workStatus === "verified"
+    : leaf.workStatus === "verified" || leaf.workStatus === "not_applicable";
+}
+
+function phaseMeetsSuccessPolicy(
+  leaves: readonly LeafResult[],
+  policy: NonNullable<FleetPhaseSpec["successPolicy"]>,
+  mutationWork: boolean,
+): boolean {
+  if (leaves.length === 0) return false;
+  const successful = leaves.filter((leaf) => leafMeetsWorkContract(leaf, mutationWork)).length;
+  switch (policy) {
+    case "all": return successful === leaves.length;
+    case "any": return successful > 0;
+    case "quorum": return successful >= Math.floor(leaves.length / 2) + 1;
+    case "best_effort": return successful > 0;
+  }
 }
 
 /** Per-leaf transcript — the manifest references <id>/transcript.jsonl, so it must
@@ -1251,7 +1775,10 @@ async function loadResume(workspace: string, fleetId: string): Promise<ReadonlyM
     const raw = await readFile(path.join(workspace, ".ares", "fleets", fleetId, "leaves.json"), "utf8");
     const arr = JSON.parse(raw) as Array<LeafResult & { index: number }>;
     for (const leaf of arr) {
-      if (leaf.status === "completed") map.set(`${leaf.phaseId}#${leaf.index}`, leaf);
+      const settledWork = leaf.workStatus === undefined || leaf.workStatus === "verified" || leaf.workStatus === "not_applicable";
+      if (leaf.status === "completed" && !leaf.degraded && settledWork) {
+        map.set(`${leaf.phaseId}#${leaf.index}`, leaf);
+      }
     }
   } catch {
     // no prior fleet (or unreadable) → nothing to resume; every leaf runs fresh
@@ -1260,16 +1787,67 @@ async function loadResume(workspace: string, fleetId: string): Promise<ReadonlyM
 }
 
 /** Persist every leaf (with its index) so a later resumeFleetId can reuse the
- *  completed ones. Written alongside the manifest, best-effort. */
-async function persistLeaves(workspace: string, fleetId: string, phases: PhaseResult[]): Promise<void> {
+ * completed ones. The boolean is a lifecycle barrier: durable worktree bytes
+ * may be discarded only after this atomic phase checkpoint succeeds. */
+async function persistLeaves(workspace: string, fleetId: string, phases: PhaseResult[]): Promise<boolean> {
   const flat: Array<LeafResult & { index: number }> = [];
   for (const phase of phases) phase.leaves.forEach((l, index) => flat.push({ ...l, index }));
+  const dir = path.join(workspace, ".ares", "fleets", fleetId);
+  const target = path.join(dir, "leaves.json");
+  const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  const backup = `${target}.bak`;
   try {
-    const dir = path.join(workspace, ".ares", "fleets", fleetId);
     await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, "leaves.json"), JSON.stringify(flat, null, 2) + "\n", "utf8");
+    const tempHandle = await open(temp, "w");
+    try {
+      await tempHandle.writeFile(JSON.stringify(flat, null, 2) + "\n", "utf8");
+      await tempHandle.sync();
+    } finally {
+      await tempHandle.close();
+    }
+    try {
+      await rename(temp, target);
+    } catch {
+      // Windows may reject rename-over-existing. Preserve the prior complete
+      // checkpoint until the new complete bytes occupy the stable path.
+      await rm(backup, { force: true }).catch(() => undefined);
+      let backedUp = false;
+      try {
+        await rename(target, backup);
+        backedUp = true;
+      } catch {
+        // First checkpoint has no previous target.
+      }
+      try {
+        await rename(temp, target);
+      } catch (error) {
+        if (backedUp) await rename(backup, target).catch(() => undefined);
+        throw error;
+      }
+      if (backedUp) await rm(backup, { force: true }).catch(() => undefined);
+    }
+    // Flush the stable name before treating this as the branch-destruction
+    // barrier. Directory fsync is not supported uniformly on Windows, so it is
+    // best-effort after the target itself has been flushed.
+    const targetHandle = await open(target, "r+");
+    try {
+      await targetHandle.sync();
+    } finally {
+      await targetHandle.close();
+    }
+    const directoryHandle = await open(dir, "r").catch(() => null);
+    if (directoryHandle) {
+      try {
+        await directoryHandle.sync().catch(() => undefined);
+      } finally {
+        await directoryHandle.close();
+      }
+    }
+    return true;
   } catch {
-    // best-effort
+    return false;
+  } finally {
+    await rm(temp, { force: true }).catch(() => undefined);
   }
 }
 
@@ -1285,6 +1863,7 @@ function invalidLeaf(
     role: agent.role,
     phaseId,
     status: degraded ? "completed" : "failed",
+    workStatus: degraded ? "unverified" : "blocked",
     text: reason,
     structured: undefined,
     schemaValid: false,
@@ -1354,10 +1933,13 @@ async function journalFleet(workspace: string, fleetId: string, result: FleetRes
               id: l.agentId,
               role: l.role,
               status: l.status,
+              workStatus: l.workStatus,
               schemaValid: l.schemaValid,
               unresolvedTemplates: l.unresolvedTemplates,
               strippedTools: l.strippedTools,
               transcriptPath: l.transcriptPath,
+              ...(l.deliverables ? { deliverables: l.deliverables } : {}),
+              ...(l.changedFiles ? { changedFiles: l.changedFiles } : {}),
             })),
           })),
         },
@@ -1383,11 +1965,11 @@ function fleetArchitectPrompt(goal: string, toolNames: string[]): string {
     `Output ONLY a JSON object (no prose, no fences) of shape:\n` +
     `{ "goal": string, "concurrency": number, "phases": [ { "id": string, "kind": "parallel"|"pipeline", "build"?: boolean, "reduce"?: "concat"|"first"|"judge", "agents": [ { "role": string, "prompt": string, "tools"?: string[], "schema"?: object } ] } ] }\n\n` +
     `RULES:\n` +
-    `- DECOMPOSE DEEPLY: 4-8 research agents, then plan, then 3-8 build agents, then verify. Aim for 10-20 agents total. A thin 3-4 agent spec is a FAILURE.\n` +
-    `- Phase 1 'research' (kind:parallel, reduce:judge): N agents each investigating ONE angle (stack, networking, mechanics, assets, etc). Whitelist research tools: ["WebSearch","WebFetch","Read","Grep","Glob"].\n` +
-    `- Phase 2 'plan' (kind:pipeline): 1 agent that turns {{research.reduced}} into a concrete file-by-file build plan. Give it a schema like {"files":["..."],"steps":["..."]}.\n` +
-    `- Phase 3 'build' (kind:pipeline, build:true): one agent PER module/file-group, each FILE-DISJOINT, run serially so they don't clobber. Whitelist ["Read","Write","Edit","Bash","Grep","Glob"]. Each prompt must be self-contained and reference {{plan.reduced}}.\n` +
-    `- Phase 4 'verify' (kind:pipeline, build:true): 1 agent that installs+builds+runs the project via Bash, reports failures, and FIXES them. Whitelist ["Bash","Read","Edit","Write","Grep"].\n` +
+    `- ADAPTIVE SIZE: use the fewest agents that create independent evidence or file-disjoint implementation. Default to 3-8 total. Exceed 8 only for that many genuine ownership boundaries; never add agents to hit a quota.\n` +
+    `- Research (kind:parallel, reduce:judge): 1-3 agents, each answering a distinct question that changes the plan. Prefer repository evidence via ["Read","Grep","Glob"]; use WebSearch/WebFetch only for required external/current facts. Skip broad research when local code already answers the task.\n` +
+    `- Plan (kind:pipeline): 1 integration owner turns evidence into dependency order, explicit file ownership, acceptance checks, and a concrete build plan. Use a schema like {"files":["..."],"steps":["..."],"checks":["..."]}.\n` +
+    `- Build (build:true): partition by subsystem, not arbitrary file count. ONE writer owns a file for the entire fleet; overlapping writers are forbidden. Parallelize only disjoint groups, otherwise pipeline them. Whitelist ["Read","Write","Edit","Bash","Grep","Glob"]. Each prompt states owned files and acceptance criteria.\n` +
+    `- Verify (kind:pipeline, build:true): 1 independent integration agent runs affected checks first, then the broadest practical regression suite; it may fix failures but must report exact commands and unresolved evidence. Whitelist ["Bash","Read","Edit","Write","Grep"].\n` +
     `- Every prompt is STATELESS and self-contained (a leaf sees none of your context). Use {{phaseId.reduced}} / {{prev.field}} to pass work forward.\n` +
     `- Only whitelist tools from this catalog: ${toolNames.join(", ")}.\n` +
     `Return the JSON now.`
@@ -1411,7 +1993,16 @@ async function planFleet(
       attempt === 0
         ? fleetArchitectPrompt(goal, toolNames)
         : `${fleetArchitectPrompt(goal, toolNames)}\n\nYour previous output was REJECTED: ${lastErr}\nReturn ONLY the corrected JSON FleetSpec.`;
-    const r = await run({ role: "fleet-architect", prompt, tools: [], maxTurns: 2, signal: deps.signal });
+    const plannerSessionId = graphSessionId(deps, "planner", "plan", attempt, "fleet-architect");
+    const r = await run({
+      sessionId: plannerSessionId,
+      inputId: graphInputId(plannerSessionId),
+      role: "fleet-architect",
+      prompt,
+      tools: [],
+      maxTurns: 2,
+      signal: deps.signal,
+    });
     ledger.usage = addUsage(ledger.usage, r.usage);
     const parsed = extractFirstJson(r.finalText);
     if (!parsed.ok) {
@@ -1450,16 +2041,46 @@ function repairPhase(phase: FleetPhaseSpec, last: PhaseResult, round: number): F
 }
 
 export async function runFleet(spec: FleetSpec, deps: ConductorDeps): Promise<FleetResult> {
-  const fleetId = newId("fleet");
-  const run = deps.runAgent ?? defaultRunAgent(deps);
+  const identity = fleetIdentity(spec, deps);
+  const fleetId = identity.id;
+  const deferredBranchCleanup = new Map<string, Set<Worktree>>();
+  const checkpointEligibleCleanup = new Set<string>();
+  const branchLifecycle: NonNullable<ConductorDeps["branchLifecycle"]> = {
+    deferUntilCheckpoint(checkpointKey, worktree) {
+      const pending = deferredBranchCleanup.get(checkpointKey) ?? new Set<Worktree>();
+      pending.add(worktree);
+      deferredBranchCleanup.set(checkpointKey, pending);
+    },
+  };
+  const cleanupCheckpointedBranches = async (checkpointKey: string): Promise<void> => {
+    const pending = deferredBranchCleanup.get(checkpointKey);
+    if (!pending) return;
+    deferredBranchCleanup.delete(checkpointKey);
+    await Promise.allSettled([...pending].map((worktree) => worktree.cleanup()));
+  };
+  const invocationDeps: ConductorDeps = {
+    ...deps,
+    fleetId,
+    executionKey: "initial",
+    branchLifecycle,
+  };
+  const run = deps.runAgent ?? defaultRunAgent(invocationDeps);
   const ledger = { usage: { inputTokens: 0, outputTokens: 0 } as Usage };
   // PLANNER: a one-line `plan` (and no explicit phases) is expanded by an architect
   // fork into a wide research→plan→build→verify spec, so a weak model gets an
   // ultracode-grade fleet from a single sentence. The expanded spec is validated.
   if (spec.plan && (!spec.phases || spec.phases.length === 0)) {
-    deps.emitProgress?.({ kind: "fleet_activity", event: "planning", fleetId, role: "fleet-architect", phase: "plan" });
-    const expanded = await planFleet(spec.plan, deps, run, ledger);
-    spec = { ...expanded, goal: expanded.goal ?? spec.plan, maxTotalTokens: spec.maxTotalTokens ?? expanded.maxTotalTokens, maxWallClockMs: spec.maxWallClockMs ?? expanded.maxWallClockMs, resumeFleetId: spec.resumeFleetId };
+    // agentId present so the desktop board (which keys rows on agentId) renders
+    // the architect as a live agent instead of dropping the payload.
+    deps.emitProgress?.({ kind: "fleet_activity", event: "planning", fleetId, agentId: "fleet-architect", role: "fleet-architect", phase: "plan" });
+    try {
+      const expanded = await planFleet(spec.plan, invocationDeps, run, ledger);
+      spec = { ...expanded, goal: expanded.goal ?? spec.plan, maxTotalTokens: spec.maxTotalTokens ?? expanded.maxTotalTokens, maxWallClockMs: spec.maxWallClockMs ?? expanded.maxWallClockMs, resumeFleetId: spec.resumeFleetId };
+      deps.emitProgress?.({ kind: "fleet_activity", event: "done", fleetId, agentId: "fleet-architect", role: "fleet-architect", phase: "plan", status: "completed" });
+    } catch (error) {
+      deps.emitProgress?.({ kind: "fleet_activity", event: "done", fleetId, agentId: "fleet-architect", role: "fleet-architect", phase: "plan", status: "failed" });
+      throw error;
+    }
   }
   // ISOLATION BY DEFAULT: a parallel build phase with 2+ writers is isolated in
   // worktrees unless it explicitly opts out (isolation:'none', which validateSpec
@@ -1478,11 +2099,15 @@ export async function runFleet(spec: FleetSpec, deps: ConductorDeps): Promise<Fl
   }
   validateSpec(spec, deps.parentTools);
 
-  // Announce the fleet (carries the id the desktop needs to offer "resume").
-  deps.emitProgress?.({ kind: "fleet_activity", event: "fleet_start", fleetId });
-  // Resume: load the prior fleet's completed leaves so they're reused, not re-run.
-  const resume = spec.resumeFleetId
-    ? await loadResume(deps.workspace, spec.resumeFleetId)
+  // Announce the fleet (carries the id the desktop needs to offer "resume",
+  // plus the goal text so surfaces can label the board).
+  const goalLabel = (spec.goal ?? spec.plan ?? "").slice(0, 200);
+  deps.emitProgress?.({ kind: "fleet_activity", event: "fleet_start", fleetId, ...(goalLabel ? { goal: goalLabel } : {}) });
+  // Explicit resume and replay of the same provider tool-use id both reconnect
+  // to settled phase state. A crash before that phase boundary still falls
+  // through to the deterministic child session/input identity below.
+  const resume = identity.replayable
+    ? await loadResume(deps.workspace, fleetId)
     : undefined;
   const reqC = Number(spec.concurrency);
   const concurrency = Math.max(
@@ -1540,7 +2165,7 @@ export async function runFleet(spec: FleetSpec, deps: ConductorDeps): Promise<Fl
   }, wallClockMs);
   // Forks see the chained signal so the budget abort cascades to in-flight leaves
   // (they cooperatively check the signal at their own await points).
-  const fleetDeps: ConductorDeps = { ...deps, signal: controller.signal, resume };
+  const fleetDeps: ConductorDeps = { ...invocationDeps, signal: controller.signal, resume };
 
   const phases: PhaseResult[] = [];
   // Cross-phase template context: each completed phase is exposed under its id.
@@ -1575,17 +2200,49 @@ export async function runFleet(spec: FleetSpec, deps: ConductorDeps): Promise<Fl
     return Promise.race([phaseRun, deadline]);
   };
 
+  // PHASE lifecycle for the fleet board. agentId is present (phase:<id>) so old
+  // clients that key rows on agentId render these harmlessly; the new UI keys on
+  // the event names phase_start/phase_end.
+  const emitPhaseStart = (ph: FleetPhaseSpec) =>
+    deps.emitProgress?.({
+      kind: "fleet_activity",
+      event: "phase_start",
+      fleetId,
+      agentId: `phase:${ph.id}`,
+      role: `phase ${ph.id}`,
+      phase: ph.id,
+      phaseKind: ph.kind,
+      build: ph.build === true,
+    });
+  const emitPhaseEnd = (ph: FleetPhaseSpec, status: PhaseResult["status"], failureReason?: string, leaves?: readonly LeafResult[]) => {
+    const deliverables = (leaves ?? []).flatMap((l) => l.deliverables ?? []);
+    deps.emitProgress?.({
+      kind: "fleet_activity",
+      event: "phase_end",
+      fleetId,
+      agentId: `phase:${ph.id}`,
+      role: `phase ${ph.id}`,
+      phase: ph.id,
+      phaseKind: ph.kind,
+      build: ph.build === true,
+      status,
+      ...(failureReason ? { failureReason } : {}),
+      ...(deliverables.length > 0 ? { contract: { deliverables } } : {}),
+    });
+  };
+
   try {
     for (const phase of specPhases) {
       if (controller.signal.aborted) {
         aborted = true;
         break;
       }
+      emitPhaseStart(phase);
       let raced = await executePhase(phase, fleetDeps);
+      let settledExecutionKey = fleetDeps.executionKey ?? "initial";
       // SELF-REPAIR (god mode): re-run a failed phase with the failure injected,
       // up to repairRounds — "verify → fix → re-verify until green". Resume is off
       // for repair rounds so they actually re-execute.
-      const repairDeps: ConductorDeps = { ...fleetDeps, resume: undefined };
       let round = 0;
       while (
         raced !== ABORT_SENTINEL &&
@@ -1594,11 +2251,30 @@ export async function runFleet(spec: FleetSpec, deps: ConductorDeps): Promise<Fl
         !controller.signal.aborted
       ) {
         round++;
+        const repairAgentId = `${phase.id}-repair-${round}`;
+        const repairRole = `repair round ${round}`;
+        // Legacy "repair" tick kept for existing surfaces; the agentId-bearing
+        // start/done pair is what the desktop board actually renders.
         deps.emitProgress?.({ kind: "fleet_activity", event: "repair", phase: phase.id, role: `repair-round-${round}` });
-        raced = await executePhase(repairPhase(phase, raced, round), repairDeps);
+        deps.emitProgress?.({ kind: "fleet_activity", event: "start", agentId: repairAgentId, role: repairRole, phase: phase.id });
+        settledExecutionKey = `repair-${round}`;
+        raced = await executePhase(repairPhase(phase, raced, round), {
+          ...fleetDeps,
+          resume: undefined,
+          executionKey: settledExecutionKey,
+        });
+        deps.emitProgress?.({
+          kind: "fleet_activity",
+          event: "done",
+          agentId: repairAgentId,
+          role: repairRole,
+          phase: phase.id,
+          status: raced === ABORT_SENTINEL ? "aborted" : raced.status,
+        });
       }
       if (raced === ABORT_SENTINEL) {
         aborted = true;
+        const failureReason = "fleet wall-clock backstop fired (a fork likely hung); phase not run";
         phases.push({
           id: phase.id,
           kind: phase.kind,
@@ -1607,12 +2283,32 @@ export async function runFleet(spec: FleetSpec, deps: ConductorDeps): Promise<Fl
           structured: undefined,
           unresolvedTemplates: 0,
           status: "aborted",
-          failureReason: "fleet wall-clock backstop fired (a fork likely hung); phase not run",
+          failureReason,
         });
+        emitPhaseEnd(phase, "aborted", failureReason);
+        // Crash resume is only real when settled state is durable before the
+        // fleet returns. Persist at every phase boundary, including aborts.
+        await persistLeaves(deps.workspace, fleetId, phases);
         break;
       }
       const result = raced;
       phases.push(result);
+      const selectedCheckpointKey = `${settledExecutionKey}\0${phase.id}`;
+      checkpointEligibleCleanup.add(selectedCheckpointKey);
+      const phaseCheckpointed = await persistLeaves(deps.workspace, fleetId, phases);
+      if (phaseCheckpointed) {
+        await cleanupCheckpointedBranches(selectedCheckpointKey);
+      } else {
+        result.status = "failed";
+        result.failureReason = [
+          result.failureReason,
+          "durable phase checkpoint could not be committed; integrated branch state was retained for recovery",
+        ].filter(Boolean).join("; ");
+        failed = true;
+        emitPhaseEnd(phase, result.status, result.failureReason, result.leaves);
+        break;
+      }
+      emitPhaseEnd(phase, result.status, result.failureReason, result.leaves);
       if (result.status === "aborted") aborted = true;
       pipelineCtx[phase.id] = {
         reduced: result.reduced,
@@ -1659,7 +2355,16 @@ export async function runFleet(spec: FleetSpec, deps: ConductorDeps): Promise<Fl
   };
   partial.manifestPath = await journalFleet(deps.workspace, fleetId, partial);
   // Persist every leaf (with index) so `resumeFleetId: <this fleetId>` can reuse
-  // the completed ones after a crash/abort and only re-run what failed.
-  await persistLeaves(deps.workspace, fleetId, phases);
+  // the completed ones after a crash/abort and only re-run what failed. If an
+  // earlier phase-boundary write failed but this final checkpoint succeeds, it
+  // now durably represents every selected phase result and may release their
+  // successfully-integrated branches. Superseded repair-attempt branches are
+  // intentionally absent from checkpointEligibleCleanup and remain recoverable.
+  const finalCheckpointed = await persistLeaves(deps.workspace, fleetId, phases);
+  if (finalCheckpointed) {
+    for (const checkpointKey of checkpointEligibleCleanup) {
+      await cleanupCheckpointedBranches(checkpointKey);
+    }
+  }
   return partial;
 }

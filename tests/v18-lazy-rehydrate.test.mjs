@@ -25,7 +25,7 @@ const WebSocket = wsModule.default ?? wsModule.WebSocket;
 
 function makeFactory(home) {
   return ({ sessionId, model, signal, requestPermission }) => ({
-    engine: new QueryEngine(
+    engine: QueryEngine.forTesting(
       { provider: new MockEchoProvider(), model: model ?? "mock", systemPrompt: "t", tools: [], workspace: home, signal, requestPermission },
       sessionId,
     ),

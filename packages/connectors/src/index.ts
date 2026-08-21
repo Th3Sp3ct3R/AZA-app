@@ -16,13 +16,14 @@ export { MockBrowser, type MockPage } from "./mockBrowser.js";
 
 export { Filmstrip, type FilmstripEntry } from "./filmstrip.js";
 
-export { navigateEffect, fillEffect, clickEffect, type BrowserEffectOptions } from "./effects.js";
+export { browserActionEffect, navigateEffect, fillEffect, clickEffect, type BrowserEffectOptions } from "./effects.js";
 
 export {
   createPlaywrightBrowser,
   acquireBrowserPage,
   browserLaunchAttempts,
   findInstalledChromium,
+  linuxChromiumCandidates,
   parseCdpPorts,
   type PlaywrightOptions,
   type LaunchAttempt,

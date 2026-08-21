@@ -108,6 +108,12 @@ export class SubagentJournal {
     } else if (ev.type === "tool_error") {
       const entry = this.pending.get(ev.id);
       const msg = trim(ev.error, ERROR_CHARS);
+      // Shell-like tools may write files before returning a non-zero exit. The
+      // protocol carries that partial mutation scope on tool_error; retain it
+      // in the factual handoff just like a successful tool_end.
+      for (const f of ev.touchedFiles ?? []) {
+        if (this.filesTouched.size < MAX_FILES) this.filesTouched.add(f);
+      }
       if (entry) {
         entry.ok = false;
         entry.error = msg;
@@ -120,7 +126,7 @@ export class SubagentJournal {
       while (this.errors.length > MAX_ERRORS) this.errors.shift();
       this.flush();
     } else if (ev.type === "error") {
-      if (ev.error.code === "max_turns_exceeded") this.turnLimitHit = true;
+      if (ev.error.code === "max_turns_exceeded" || ev.error.code === "loop_detected") this.turnLimitHit = true;
       else {
         this.errors.push(trim(ev.error.message, ERROR_CHARS));
         while (this.errors.length > MAX_ERRORS) this.errors.shift();

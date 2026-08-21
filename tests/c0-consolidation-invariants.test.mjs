@@ -112,7 +112,7 @@ test("C0: parallel tools complete out of order but results pair+order to tool_us
     { id: "b", name: "SlowEcho", input: { id: "b", ms: 45 } },
     { id: "c", name: "SlowEcho", input: { id: "c", ms: 5 } },
   ];
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider: toolThenDoneProvider(calls), model: "m", systemPrompt: "s", tools: [slowEcho], workspace: WS, maxTurns: 2 },
     "sess_c0_order",
   );
@@ -141,7 +141,7 @@ test("C0: a failing tool still yields exactly one ordered, error-flagged result 
     { id: "bad", name: "MaybeFail", input: { id: "bad", fail: true } },
     { id: "ok2", name: "MaybeFail", input: { id: "ok2", fail: false } },
   ];
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider: toolThenDoneProvider(calls), model: "m", systemPrompt: "s", tools: [maybeFail], workspace: WS, maxTurns: 2 },
     "sess_c0_mixed",
   );
@@ -166,7 +166,7 @@ test("C0: every tool_use block in history has exactly one matching tool_result (
     { id: "x", name: "SlowEcho", input: { id: "x", ms: 10 } },
     { id: "y", name: "SlowEcho", input: { id: "y", ms: 10 } },
   ];
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider: toolThenDoneProvider(calls), model: "m", systemPrompt: "s", tools: [slowEcho], workspace: WS, maxTurns: 2 },
     "sess_c0_orphan",
   );

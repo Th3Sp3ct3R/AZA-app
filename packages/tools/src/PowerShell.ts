@@ -3,34 +3,20 @@
 // Windows-first tool. Uses pwsh.exe if available (PowerShell 7+),
 // otherwise falls back to powershell.exe (Windows PowerShell 5.1).
 
-import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   buildTool,
   describeShellActivity,
   destructiveShellDecision,
+  irrecoverableShellRefusal,
   resolveWorkspacePath,
+  shellInputSchema,
+  shellRepositoryInstructionDecision,
 } from "./_shared.js";
 import { runShell } from "./Bash.js";
 
-const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_TIMEOUT_MS = 600_000;
-
-const inputSchema = z
-  .object({
-    command: z.string().min(1).describe("PowerShell command line."),
-    description: z.string().describe("5-10 word active-voice summary."),
-    timeout: z.number().int().positive().max(MAX_TIMEOUT_MS).default(DEFAULT_TIMEOUT_MS),
-    cwd: z.string().optional(),
-    run_in_background: z
-      .boolean()
-      .default(false)
-      .describe(
-        "When true, the shell runs in the background and the tool returns a shell_id. Poll output with BashOutput, terminate with KillShell.",
-      ),
-  })
-  .strict();
+const inputSchema = shellInputSchema("PowerShell command line.");
 
 export const PowerShellTool = buildTool({
   name: "PowerShell",
@@ -44,12 +30,21 @@ export const PowerShellTool = buildTool({
   activityDescription: (i) => describeShellActivity(i.command, i.run_in_background === true),
   commandFor: (i) => i.command,
   async checkPermissions(i, ctx) {
+    const instructionDecision = await shellRepositoryInstructionDecision(ctx, i.cwd, i.target_paths);
+    if (instructionDecision) return instructionDecision;
     const configured = ctx.commandPermissions?.decide("PowerShell", i.command);
-    if (configured && configured.kind !== "allow") return configured;
-    return destructiveShellDecision(i.command) ?? configured ?? { kind: "allow" };
+    // An explicit persisted/user grant is authoritative. Without this early
+    // return the generic destructive heuristic could silently override an
+    // "allow always" decision on every subsequent PowerShell invocation.
+    if (configured) return configured;
+    return destructiveShellDecision(i.command) ?? { kind: "allow" };
   },
 
   async call(i, ctx) {
+    // See Bash.call — refused at execution because bypass mode auto-allows
+    // every permission prompt, and this loss cannot be undone.
+    const refusal = irrecoverableShellRefusal(i.command);
+    if (refusal) throw new Error(refusal);
     const cwd = await resolveWorkspacePath(ctx, i.cwd, "cwd", "execute");
     const pwsh = (await which("pwsh")) ?? (await which("powershell"));
     if (!pwsh) throw new Error("Neither pwsh nor powershell found on PATH");
@@ -67,13 +62,17 @@ export const PowerShellTool = buildTool({
         args,
         cwd,
         description: i.description,
+        sessionId: ctx.sessionId,
+        invocationKey: ctx.toolUseId ?? `legacy_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`,
       });
       const output: unknown = {
         shell_id: snap.id,
         command: snap.command,
-        status: "running",
+        status: snap.status,
         description: snap.description,
         cwd: snap.cwd,
+        exitCode: snap.exitCode,
+        ...(snap.outputPath ? { outputPath: snap.outputPath } : {}),
       };
       return {
         output,
@@ -81,12 +80,21 @@ export const PowerShellTool = buildTool({
       };
     }
 
+    const captureDir = path.join(ctx.workspace, ".ares", "shell-output", ctx.sessionId);
+    await fs.mkdir(captureDir, { recursive: true });
+    const capturePath = path.join(captureDir, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}.log`);
     const result = await runShell(pwsh, args, cwd, i.timeout, ctx.signal, (stream, text) => {
       ctx.emitProgress?.({ kind: "shell_output", stream, text });
-    });
+    }, capturePath);
     const output: unknown = result;
+    const failure = result.timedOut
+      ? `PowerShell timed out after ${i.timeout}ms`
+      : result.exitCode === 0
+        ? undefined
+        : `PowerShell exited with code ${result.exitCode ?? "unknown"}`;
     return {
       output,
+      ...(failure ? { failure } : {}),
       display: result.timedOut
         ? `PowerShell timed out after ${i.timeout}ms`
         : result.exitCode === 0

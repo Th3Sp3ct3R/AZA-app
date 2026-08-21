@@ -65,7 +65,11 @@ export function stallErrorEvent(): StreamEvent {
   return {
     type: "error",
     error: {
-      code: "stream_stalled",
+      // "stream_stall" — NOT "stream_stalled" — because that exact code is what
+      // isStallError / frictionLog / reliabilityTriage match. The old "-ed"
+      // spelling made provider-level stalls invisible to the shrink ladder, so
+      // an oversized prompt was re-sent at the same size four more times.
+      code: "stream_stall",
       message: `provider stream stalled — no data received for ${Math.round(streamStallMs() / 1000)}s. The connection or model hung; retrying is safe.`,
       retriable: true,
     },

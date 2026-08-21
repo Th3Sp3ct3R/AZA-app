@@ -16,6 +16,15 @@ export interface SchedulerOptions {
   onError?: (err: unknown) => void;
 }
 
+/**
+ * Ceiling on the wake queue. The loop parks whole ticks (a live user turn, the
+ * kill switch, a remote /pause) while producers keep enqueueing, so an unbounded
+ * array is a slow leak on a daemon that runs for weeks. When the ceiling is hit
+ * the OLDEST wake is dropped: the queue is a "what just happened" buffer, and
+ * the freshest events are the ones worth a tick.
+ */
+export const MAX_QUEUED_EVENTS = 256;
+
 export class Scheduler {
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly events: unknown[] = [];
@@ -44,6 +53,9 @@ export class Scheduler {
   /** Wake the loop now; the event is queued for the loop to drain. */
   enqueueEvent(event: unknown): void {
     this.events.push(event);
+    if (this.events.length > MAX_QUEUED_EVENTS) {
+      this.events.splice(0, this.events.length - MAX_QUEUED_EVENTS);
+    }
     void this.fire("event");
   }
 

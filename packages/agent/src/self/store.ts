@@ -128,7 +128,8 @@ export interface RecordOutcomeInput {
 }
 
 /**
- * The feedback signal. Upserts the capability if it's new (status "have"),
+ * The feedback signal. Upserts a successfully demonstrated capability as
+ * "have" and an unsuccessful first attempt as "acquiring",
  * then folds one run into its rolling outcome stats. Never pulses — the
  * acting tool already emits its own lifecycle event.
  */
@@ -140,7 +141,7 @@ export async function recordOutcome(home: string, input: RecordOutcomeInput, now
     id: input.id,
     name: input.name ?? input.id,
     kind: input.kind,
-    status: "have",
+    status: input.ok ? "have" : "acquiring",
     provenance: input.provenance,
     createdAt: iso,
     updatedAt: iso,
@@ -148,8 +149,10 @@ export async function recordOutcome(home: string, input: RecordOutcomeInput, now
   };
   if (input.name !== undefined) cap.name = input.name;
   if (input.provenance !== undefined && !cap.provenance) cap.provenance = input.provenance;
-  // A capability we have an outcome for is, by definition, one we have.
-  if (cap.status === "want" || cap.status === "acquiring") cap.status = "have";
+  // Only demonstrated success promotes intent/acquisition to possession. A
+  // failed placeholder or malformed provider receipt is evidence that the
+  // capability is not ready yet, not proof that we have it.
+  if (input.ok && (cap.status === "want" || cap.status === "acquiring")) cap.status = "have";
 
   cap.outcomes = foldOutcome(cap.outcomes, input, iso);
   cap.updatedAt = iso;

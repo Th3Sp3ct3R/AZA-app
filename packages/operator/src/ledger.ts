@@ -3,7 +3,7 @@
 // Before this file there were two: the JSON capability graph (what the planner
 // reads) and a hand-maintained CAPABILITIES.md (what the model narrates to
 // itself). They diverged — the markdown claimed skills the graph had never
-// heard of and still pointed at the dead ~/.crix home. Divergent ledgers are
+// heard of and pointed at a home that no longer existed. Divergent ledgers are
 // poison: the entity believes one thing and plans on another.
 //
 // Resolution: the JSON graph is authoritative. CAPABILITIES.md is GENERATED

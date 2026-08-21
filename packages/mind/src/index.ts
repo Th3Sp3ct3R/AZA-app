@@ -28,6 +28,7 @@ export {
   type SkipReason,
 } from "./memory/router.js";
 export { withConsolidationLock, type ConsolidationLockOptions } from "./memory/consolidationLock.js";
+export { isOperationalNoise } from "./memory/noise.js";
 export { diagnoseMemory, type MemoryDoctorReport, type DuplicateMemoryGroup } from "./memory/doctor.js";
 export { recall, type RecallResult, type RecallOptions, type RecallVectors } from "./memory/recall.js";
 export {
@@ -104,14 +105,7 @@ export {
   type ReflectStoreLike,
   type MergeFactsResult,
 } from "./memory/conversationReflect.js";
-export {
-  mindPaths,
-  aresHome,
-  migrateLegacyHome,
-  bridgeLegacyEnv,
-  __resetHomeMigrationForTests,
-  type MindPaths,
-} from "./paths.js";
+export { mindPaths, aresHome, type MindPaths } from "./paths.js";
 export { MEMORY_SCHEMA_VERSION } from "./memory/types.js";
 export type { MemoryNode, MemoryKind, HypothesisStatus, CrucibleCheck, EvidenceEntry, ReflectionSurface, ReflectionResult } from "./memory/types.js";
 

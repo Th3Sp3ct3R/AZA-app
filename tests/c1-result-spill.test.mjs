@@ -74,7 +74,7 @@ function toolResultFor(engine, id) {
 }
 
 async function runOne(ws, sessionId, tool, id) {
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider: toolThenDone([{ id, name: tool.schema.name }]), model: "m", systemPrompt: "s", tools: [tool], workspace: ws, maxTurns: 2 },
     sessionId,
   );

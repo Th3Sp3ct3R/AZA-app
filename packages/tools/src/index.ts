@@ -6,6 +6,7 @@ export * from "./_shared.js";
 export { ReadTool } from "./Read.js";
 export { WriteTool } from "./Write.js";
 export { EditTool, nearMissHint, looksLineNumberPrefixed } from "./Edit.js";
+export { ApplyPatchTool, type ApplyPatchOutput } from "./ApplyPatch.js";
 export { ApplyIntentTool, type ApplyIntentOutput } from "./ApplyIntent.js";
 export { safeOverwrite, assessShrink, type SafeOverwriteOptions, type SafeOverwriteResult, type ShrinkVerdict } from "./safeWrite.js";
 export { GlobTool } from "./Glob.js";
@@ -14,7 +15,16 @@ export { BashTool } from "./Bash.js";
 export { PowerShellTool } from "./PowerShell.js";
 export { LspTool, type LspOutput, type LspLocation } from "./LSP.js";
 export { TodoStore, makeTodoWriteTool, type TodoWriteOutput } from "./TodoWrite.js";
-export { makeTaskTool, type SubagentRunner, type TaskOutput } from "./Task.js";
+export {
+  makeTaskTool,
+  makeTaskOutputTool,
+  makeKillTaskTool,
+  type SubagentRunner,
+  type TaskOutput,
+  type TaskBackgroundOutput,
+  type BackgroundTaskSnapshot,
+  type BackgroundTaskStatus,
+} from "./Task.js";
 export {
   makeCodingBackendTool,
   buildAresHarnessPrompt,
@@ -34,6 +44,7 @@ export {
 export {
   makeWebFetchTool,
   htmlToText,
+  assertPublicHost,
   type WebFetchOutput,
   type Summarizer,
 } from "./WebFetch.js";
@@ -42,9 +53,32 @@ export {
   discoverCdpEndpoint,
   renderOverCdp,
   cdpRenderer,
+  CdpClient,
   type JsRenderer,
   type CdpRenderOptions,
 } from "./cdpRender.js";
+export {
+  makeAgentComputerTools,
+  getAgentComputer,
+  guiInputRefusal,
+  vmPlatformBlocked,
+  chooseDistroDir,
+  driveFreeBytes,
+  formatGb,
+  WslSandbox,
+  SANDBOX_DISTRO,
+  machineCardPromptBlock,
+  appendJournal,
+  journalTail,
+  updateFacts,
+  type JournalEntry,
+  type MachineFacts,
+  type WslRunner,
+  type SandboxExecResult,
+  type SandboxStatus,
+  type DisplayLease,
+  type AgentComputerToolsOptions,
+} from "./AgentComputer.js";
 export {
   makeWebSearchTool,
   duckDuckGoLite,
@@ -79,23 +113,43 @@ export {
 } from "./ShellRegistry.js";
 export { makeBashOutputTool, type BashOutputResult } from "./BashOutput.js";
 export { makeKillShellTool, type KillShellOutput } from "./KillShell.js";
-export { McpListToolsTool, McpCallTool, HttpMcpClient, type McpListOutput, type McpCallOutput } from "./Mcp.js";
+export { makeBackgroundTasksTool, type BackgroundTasksOutput } from "./BackgroundTasks.js";
+export { McpListToolsTool, McpCallTool, HttpMcpClient, listMcpServerTools, type McpListOutput, type McpCallOutput } from "./Mcp.js";
 export { SkillsListTool, SkillReadTool, type SkillsListOutput, type SkillReadOutput, type SkillSummary } from "./Skills.js";
-export { MemoryTool, type MemoryOutput, type MemoryItem } from "./Memory.js";
+export {
+  MemoryTool,
+  makeMemoryTool,
+  memoryContentVersion,
+  MemoryConflictError,
+  MemoryLockTimeoutError,
+  type MemoryOutput,
+  type MemoryItem,
+  type MemoryCommitContext,
+  type MemoryToolOptions,
+} from "./Memory.js";
 export {
   ComputerUseTool,
   makeComputerUseTool,
   mapImageToVirtual,
   shotScale,
+  normalizeActionCoords,
   type ComputerActionRunner,
   type ComputerUseOutput,
+  type RunnerInput,
   type ShotMeta,
 } from "./ComputerUse.js";
 export { DeployTool, type DeployOutput } from "./Deploy.js";
 export { StripeTool, type StripeOutput } from "./Stripe.js";
 export { EmailTool, type EmailOutput } from "./Email.js";
 export { RequestUserActionTool, type RequestUserActionOutput } from "./RequestUserAction.js";
-export { makeEnterPlanModeTool, makeExitPlanModeTool, type PlanModeState } from "./PlanMode.js";
+export { SetUiEffectTool, type SetUiEffectOutput } from "./SetUiEffect.js";
+export {
+  makeEnterPlanModeTool,
+  makeUpdatePlanDraftTool,
+  makeExitPlanModeTool,
+  type PlanModeState,
+  type PlanModeStateSource,
+} from "./PlanMode.js";
 export { WeatherTool, getWeatherText, type WeatherOutput, type WeatherCondition, type WeatherForecast } from "./Weather.js";
 export { RemindTool, setRemindScheduler, type RemindOutput, type SchedulerLike } from "./Remind.js";
 export { ConnectTool, type ConnectOutput } from "./Connect.js";
@@ -106,6 +160,7 @@ export { SpotifyTool, type SpotifyOutput } from "./Spotify.js";
 import { ReadTool } from "./Read.js";
 import { WriteTool } from "./Write.js";
 import { EditTool } from "./Edit.js";
+import { ApplyPatchTool } from "./ApplyPatch.js";
 import { ApplyIntentTool } from "./ApplyIntent.js";
 import { GlobTool } from "./Glob.js";
 import { GrepTool } from "./Grep.js";
@@ -123,6 +178,7 @@ import { DeployTool } from "./Deploy.js";
 import { StripeTool } from "./Stripe.js";
 import { EmailTool } from "./Email.js";
 import { RequestUserActionTool } from "./RequestUserAction.js";
+import { SetUiEffectTool } from "./SetUiEffect.js";
 import { WeatherTool } from "./Weather.js";
 import { RemindTool } from "./Remind.js";
 import { ConnectTool } from "./Connect.js";
@@ -136,6 +192,7 @@ export const DEFAULT_TOOLS = process.platform === "win32"
       ReadTool,
       WriteTool,
       EditTool,
+      ApplyPatchTool,
       ApplyIntentTool,
       GlobTool,
       GrepTool,
@@ -155,6 +212,7 @@ export const DEFAULT_TOOLS = process.platform === "win32"
       StripeTool,
       EmailTool,
       RequestUserActionTool,
+      SetUiEffectTool,
       WeatherTool,
       RemindTool,
       ConnectTool,
@@ -166,6 +224,7 @@ export const DEFAULT_TOOLS = process.platform === "win32"
       ReadTool,
       WriteTool,
       EditTool,
+      ApplyPatchTool,
       ApplyIntentTool,
       GlobTool,
       GrepTool,
@@ -184,6 +243,7 @@ export const DEFAULT_TOOLS = process.platform === "win32"
       StripeTool,
       EmailTool,
       RequestUserActionTool,
+      SetUiEffectTool,
       WeatherTool,
       RemindTool,
       ConnectTool,

@@ -85,8 +85,14 @@ function runCommand(
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<{ code: number; out: string }> {
+  // Probes judge reality with a clean slate. Under a node:test parent the
+  // inherited NODE_TEST_CONTEXT turns a grandchild `node --test` into a
+  // reporter-less child that exits 0 regardless of failures — a false-green
+  // oracle that let an unsolved gauntlet fixture score 100% in CI.
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith("NODE_TEST_")) delete env[key];
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, windowsHide: true, shell: false });
+    const child = spawn(cmd, args, { cwd, windowsHide: true, shell: false, env });
     let out = "";
     let done = false;
     const finish = (code: number) => {

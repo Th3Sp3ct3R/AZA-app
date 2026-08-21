@@ -10,8 +10,14 @@
 //
 // Behavior-preserving by construction: each channel's policy IS the policy its
 // writer enforced locally before the consolidation — same inputs, same nodes.
+// ONE deliberate global exception: the operational-noise gate. No channel may
+// store harness failure output (tool errors, provider errors, stack traces) as
+// memory — that content buried a field user's index under 24 error entries
+// against 5 real ones (2026-08-06). Failure signal belongs to friction
+// telemetry, not the memory store.
 
 import { jaccard, tokenizeSalient } from "./idf.js";
+import { isOperationalNoise } from "./noise.js";
 import type { AddInput } from "./store.js";
 
 /** Where a write comes from. Each channel carries the dedupe/gating policy its
@@ -42,7 +48,10 @@ export interface ChannelPolicy {
 /** The single policy table — dedupe + salience gating for every channel. */
 export const MEMORY_CHANNEL_POLICIES: Record<MemoryChannel, ChannelPolicy> = {
   conversation: { dedupe: { kind: "similar", threshold: 0.55 }, minSalience: 0.4, minContentChars: 6 },
-  witness: { dedupe: { kind: "exact" } },
+  // similar, not exact: the Witness phrases the same lesson slightly
+  // differently each turn ("Bash fails on X" / "Bash failed on X in ws2"),
+  // and exact-match let every rewording pile up as a new node.
+  witness: { dedupe: { kind: "similar", threshold: 0.7 } },
   dream: { dedupe: { kind: "none" } },
   card: { dedupe: { kind: "source-tag", tag: "learning-card" } },
   "v4-migration": { dedupe: { kind: "tag-prefix", prefix: "v4-hash:" } },
@@ -52,7 +61,7 @@ export const MEMORY_CHANNEL_POLICIES: Record<MemoryChannel, ChannelPolicy> = {
 /** An AddInput plus an optional 0..1 salience for channels that gate on it. */
 export type RoutedWrite = AddInput & { salience?: number };
 
-export type SkipReason = "empty" | "below-salience" | "duplicate";
+export type SkipReason = "empty" | "below-salience" | "duplicate" | "operational-noise";
 
 export interface RouteReport<N = unknown> {
   /** Accepted writes, in input order, with the node the store returned. */
@@ -90,6 +99,10 @@ export class MemoryRouter<N = unknown> {
       const content = (write.content ?? "").trim();
       if (!content || (policy.minContentChars !== undefined && content.length < policy.minContentChars)) {
         skipped.push({ content, reason: "empty" });
+        continue;
+      }
+      if (isOperationalNoise(content)) {
+        skipped.push({ content, reason: "operational-noise" });
         continue;
       }
       if (policy.minSalience !== undefined && (write.salience ?? 0) < policy.minSalience) {

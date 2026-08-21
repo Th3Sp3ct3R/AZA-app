@@ -104,7 +104,25 @@ export function UpdateBanner(): React.ReactElement | null {
     }
   }, []);
 
-  if (phase === "idle" || dismissed) return null;
+  if (phase === "idle") return null;
+
+  // "Later" must not mean invisible: a ready update collapses to a compact,
+  // softly glowing chip (slow breathing ember — photosensitive-safe, nothing
+  // flashes) that stays until installed. Field request: users simply never
+  // realized an update existed once the banner was dismissed.
+  if (dismissed && phase === "available") {
+    return (
+      <button
+        className="updateChip"
+        onClick={() => setDismissed(false)}
+        title={`Update v${version} is ready — click to install`}
+        aria-label={`Update v${version} ready`}
+      >
+        <span aria-hidden="true">⬆</span> v{version}
+      </button>
+    );
+  }
+  if (dismissed) return null;
 
   const busy = phase === "downloading" || phase === "installing";
 

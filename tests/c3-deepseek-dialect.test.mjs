@@ -117,7 +117,23 @@ test("C3: DeepSeek dialect enables thinking without budget_tokens and does NOT i
   });
   await drive(provider, reqWithUnsignedThinking("deepseek-v4-flash"));
   assert.deepEqual(captured.body.thinking, { type: "enabled" });
+  assert.deepEqual(captured.body.output_config, { effort: "high" });
   assert.equal(captured.body.max_tokens, 8192, "max_tokens stays at the default, not budget-inflated");
   // No Claude-Code identity block leaks on the x-api-key path.
   assert.equal(captured.body.system[0].text, "SYSTEM PROMPT");
+});
+
+test("C3: DeepSeek Off explicitly disables its default-on thinking mode", async () => {
+  const captured = {};
+  const provider = new AnthropicProvider({
+    apiKey: "sk-deepseek-test",
+    endpointUrl: "https://api.deepseek.com/anthropic",
+    dialect: "deepseek",
+    fetchImpl: captureFetch(captured),
+  });
+  const req = reqWithUnsignedThinking("deepseek-v4-flash");
+  req.reasoningLevel = "off";
+  await drive(provider, req);
+  assert.deepEqual(captured.body.thinking, { type: "disabled" });
+  assert.equal(Object.hasOwn(captured.body, "output_config"), false);
 });

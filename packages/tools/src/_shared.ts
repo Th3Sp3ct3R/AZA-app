@@ -3,6 +3,7 @@
 // Every tool owns its schema, permission check, execution, and display text.
 
 import path from "node:path";
+import os from "node:os";
 import { promises as fs } from "node:fs";
 import { createHash } from "node:crypto";
 import { z } from "zod";
@@ -15,7 +16,11 @@ import type {
   PermissionDecision,
   PermissionMode,
 } from "@ares/protocol";
-import type { ToolCallContext, EngineToolResult } from "@ares/core";
+import type { ToolCallContext, EngineToolEffectPolicy, EngineToolResult } from "@ares/core";
+import {
+  renderRepositoryInstructions,
+  type ResolvedRepositoryInstruction,
+} from "@ares/core";
 
 export interface FileReadStamp {
   mtimeMs: number;
@@ -24,15 +29,11 @@ export interface FileReadStamp {
    *  coarse-granularity filesystems (Windows mtime can be ~16ms); the hash is
    *  the exact "did this change since I last saw it" check Edit/Write use. */
   hash?: string;
-  /** Total line count at Read time, so the re-read guard can report the real
-   *  size instead of returning something indistinguishable from an empty file. */
+  /** Total line count at Read time, used for early offset validation. */
   lines?: number;
-  /** Set by an edit tool (Edit/FindAndEdit/ApplyIntent/CodeMode.write) when it
-   *  stamps a file it WROTE. The stamp still exists so a follow-up edit's
-   *  read-before-write + staleness checks pass, but the model never actually
-   *  read the post-edit bytes — so Read's whole-file re-read guard must do a
-   *  REAL read instead of pointing at content "already in context". A real Read
-   *  re-stamps without this flag, clearing it. */
+  /** Legacy provenance bit set by mutation tools when the stamp describes
+   *  bytes they wrote rather than bytes returned by Read. Read now always
+   *  returns requested bytes, but older integrations may still inspect it. */
   writtenNotRead?: boolean;
 }
 
@@ -51,6 +52,108 @@ export interface RichToolContext extends ToolCallContext {
   shellRegistry?: import("./ShellRegistry.js").ShellRegistry;
   /** Optional todo store — used by TodoWrite. */
   todoStore?: import("./TodoWrite.js").TodoStore;
+}
+
+export const SHELL_DEFAULT_TIMEOUT_MS = 120_000;
+export const SHELL_MAX_TIMEOUT_MS = 600_000;
+
+/** One model-facing command contract for every platform shell. Bash and
+ * PowerShell differ only in interpreter selection; cwd, timeout, detached-job
+ * behavior, permission semantics, and output recovery stay identical. */
+export function shellInputSchema(commandDescription: string) {
+  return z
+    .object({
+      command: z.string().min(1).describe(commandDescription),
+      description: z.string().describe("5-10 word active-voice summary."),
+      timeout: z
+        .number()
+        .int()
+        .positive()
+        .max(SHELL_MAX_TIMEOUT_MS)
+        .default(SHELL_DEFAULT_TIMEOUT_MS)
+        .describe(`Timeout in milliseconds (max ${SHELL_MAX_TIMEOUT_MS}, foreground only).`),
+      cwd: z.string().optional().describe("Working directory. Defaults to workspace."),
+      target_paths: z
+        .array(z.string().min(1))
+        .max(64)
+        .default([])
+        .describe(
+          "Concrete files/directories the command will access outside cwd. Declare them so nested repository rules and path permissions load before execution.",
+        ),
+      run_in_background: z
+        .boolean()
+        .default(false)
+        .describe(
+          "When true, run as a durable background job and return a shell_id immediately. Poll with BashOutput and stop with KillShell.",
+        ),
+    })
+    .strict();
+}
+
+/** Resolve and atomically claim path-scoped repository instructions in target
+ * order. The resolver itself serializes concurrent calls within one Session. */
+export async function repositoryInstructionsForTargets(
+  ctx: RichToolContext,
+  targets: readonly string[],
+): Promise<ResolvedRepositoryInstruction[]> {
+  if (!ctx.repositoryInstructions) return [];
+  const instructions: ResolvedRepositoryInstruction[] = [];
+  const seenTargets = new Set<string>();
+  for (const target of targets) {
+    const absolute = path.resolve(ctx.workspace, target);
+    const key = process.platform === "win32" ? absolute.toLowerCase() : absolute;
+    if (seenTargets.has(key)) continue;
+    seenTargets.add(key);
+    instructions.push(...await ctx.repositoryInstructions.resolve(absolute));
+  }
+  return instructions;
+}
+
+/** A newly encountered rule must be model-visible before any mutation. Return
+ * a correctable pre-effect denial; because the files are now claimed, retrying
+ * after reviewing the rules proceeds without a deny loop. */
+export async function mutationInstructionBlock(
+  ctx: RichToolContext,
+  targets: readonly string[],
+): Promise<string | null> {
+  const instructions = await repositoryInstructionsForTargets(ctx, targets);
+  if (instructions.length === 0) return null;
+  return [
+    "Repository instructions were loaded before this mutation. No files were changed.",
+    "Review the broad-to-specific rules below, adjust the change if needed, then retry the mutation.",
+    renderRepositoryInstructions(instructions),
+  ].join("\n\n");
+}
+
+/** Discover cwd-scoped repository rules before a shell process can start.
+ * Returning a permission denial makes the adapter mark this as a known
+ * pre-effect correction; the next call proceeds because the exact rule hashes
+ * are now claimed in the Session context. */
+export async function shellRepositoryInstructionDecision(
+  ctx: RichToolContext,
+  cwdInput: string | undefined,
+  targetInputs: readonly string[] = [],
+): Promise<PermissionDecision | null> {
+  const cwd = await resolveWorkspacePath(ctx, cwdInput, "cwd", "execute");
+  const targets = [cwd];
+  for (const [index, target] of targetInputs.entries()) {
+    // target_paths describe what the command will touch, so their relative
+    // base is the command's effective cwd—not the Session's original
+    // workspace. Passing an absolute candidate through resolveWorkspacePath
+    // preserves the normal approved/bypass authority checks.
+    const candidate = path.isAbsolute(target) ? target : path.resolve(cwd, target);
+    targets.push(await resolveWorkspacePath(ctx, candidate, `target_paths[${index}]`, "all"));
+  }
+  const instructions = await mutationInstructionBlock(ctx, targets);
+  return instructions ? { kind: "deny", reason: instructions } : null;
+}
+
+export function appendRepositoryInstructions(
+  content: string,
+  instructions: readonly ResolvedRepositoryInstruction[],
+): string {
+  const rendered = renderRepositoryInstructions(instructions);
+  return rendered ? `${content}\n\n${rendered}` : content;
 }
 
 export type PathAccess = "read" | "write" | "execute" | "all";
@@ -94,6 +197,13 @@ export type ToolInputValidation = { ok: true } | { ok: false; message: string };
 
 export interface Tool<I extends z.ZodTypeAny = z.ZodTypeAny, O = unknown> {
   readonly schema: ToolSchema;
+  /** Whether any valid input can resolve above read-only. This is explicit
+   * host-composition metadata; `classifyInput` existing by itself says nothing
+   * because every adapted tool exposes that function. */
+  readonly mayHaveEffects: boolean;
+  /** Optional observational recovery contract for non-file effects. Ares never
+   * treats this as authority to replay an ambiguous call automatically. */
+  readonly effectPolicy?: EngineToolEffectPolicy;
   readonly inputZod: I;
   /** Optional semantic check run AFTER zod parse, BEFORE call(). See {@link ToolInputValidation}.
    *  Method syntax (not an arrow property) so the parameter stays bivariant —
@@ -104,6 +214,9 @@ export interface Tool<I extends z.ZodTypeAny = z.ZodTypeAny, O = unknown> {
   activityDescription(input: z.infer<I>): string;
   /** Command string for `allow_always` persistence (Bash/PowerShell); see ToolDef. */
   commandFor?(input: z.infer<I>): string | undefined;
+  /** Effective per-call safety shared by scheduling, plan gating, durable
+   * admission, permission checks, checkpoints, and effect recovery. */
+  effectiveSafety(input: z.infer<I>): SafetyClass;
 }
 
 export interface ToolDef<I extends z.ZodTypeAny, O> {
@@ -119,6 +232,9 @@ export interface ToolDef<I extends z.ZodTypeAny, O> {
   /** Max chars of result kept inline before the engine spills to disk (Phase 4). */
   maxResultSizeChars?: number;
   inputZod: I;
+  /** Observational crash reconciliation and explicit retry guidance for
+   * remote/external effects. Transactional file tools normally omit this. */
+  effectPolicy?: EngineToolEffectPolicy;
   /** Optional semantic input check (Phase 4). See {@link ToolInputValidation}. */
   validateInput?: (input: z.infer<I>, ctx: RichToolContext) => Promise<ToolInputValidation>;
   /** Per-INPUT effective safety for the permission decision (e.g. ComputerUse's
@@ -165,12 +281,15 @@ export function buildTool<I extends z.ZodTypeAny, O>(def: ToolDef<I, O>): Tool<I
 
   return {
     schema,
+    mayHaveEffects: def.safety !== "read-only" || def.dynamicSafety !== undefined,
+    effectPolicy: def.effectPolicy,
     inputZod: def.inputZod,
     validateInput: def.validateInput,
     checkPermissions,
     call: def.call,
     activityDescription: def.activityDescription,
     commandFor: def.commandFor,
+    effectiveSafety: (input) => def.dynamicSafety?.(input) ?? def.safety,
   };
 }
 
@@ -193,9 +312,61 @@ export function parseToolInputLenient<S extends z.ZodTypeAny>(schema: S, input: 
     const stripped = stripUnknownKeys(input, unknownKeyIssues);
     const retry = schema.safeParse(stripped);
     if (retry.success) return retry.data;
-    return throwToolInputError(retry.error, toolName);
+    return retryWithParsedJsonStrings(schema, stripped, retry.error, toolName);
   }
-  return throwToolInputError(first.error, toolName);
+  return retryWithParsedJsonStrings(schema, input, first.error, toolName);
+}
+
+/**
+ * Second repair pass: weaker models emit structured args as JSON-ENCODED
+ * STRINGS ("todos": "[{...}]") — zod reports invalid_type expected array/object,
+ * received string. Parse the string at each such path and retry once. Only
+ * fields the SCHEMA declares non-scalar are touched, so free-text params that
+ * happen to start with "[" are never mangled.
+ */
+function retryWithParsedJsonStrings<S extends z.ZodTypeAny>(
+  schema: S,
+  input: unknown,
+  error: z.ZodError,
+  toolName: string,
+): z.infer<S> {
+  const coercible = error.issues.filter(
+    (i) =>
+      i.code === "invalid_type" &&
+      (i as { expected?: string }).expected !== undefined &&
+      ["array", "object"].includes((i as { expected: string }).expected) &&
+      (i as { received?: string }).received === "string",
+  );
+  if (coercible.length === 0 || input === null || typeof input !== "object") {
+    return throwToolInputError(error, toolName);
+  }
+  const clone: unknown = structuredClone(input);
+  let repaired = false;
+  for (const issue of coercible) {
+    let node: unknown = clone;
+    for (const seg of issue.path.slice(0, -1)) {
+      if (node && typeof node === "object") node = (node as Record<string | number, unknown>)[seg];
+    }
+    const leaf = issue.path[issue.path.length - 1];
+    if (!node || typeof node !== "object" || leaf === undefined) continue;
+    const value = (node as Record<string | number, unknown>)[leaf];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === "object") {
+        (node as Record<string | number, unknown>)[leaf] = parsed;
+        repaired = true;
+      }
+    } catch {
+      // not valid JSON — leave it; the original error stands
+    }
+  }
+  if (!repaired) return throwToolInputError(error, toolName);
+  const retry = schema.safeParse(clone);
+  if (retry.success) return retry.data;
+  return throwToolInputError(retry.error, toolName);
 }
 
 function stripUnknownKeys(input: unknown, issues: Array<{ path: (string | number)[]; keys: string[] }>): unknown {
@@ -232,12 +403,54 @@ export function toolError(message: string): Error {
   return new Error(`<tool_use_error>${message}</tool_use_error>`);
 }
 
+/** Adapter-only form. Exported tool implementations must use toolError(),
+ * which deliberately carries no effect-phase claim because a runtime caller
+ * may already have committed bytes before discovering a correctable problem. */
+function preEffectToolError(message: string): Error {
+  return markPreEffectError(toolError(message));
+}
+
+/**
+ * Mark a failure that is known to have happened before the wrapped tool's
+ * implementation was entered. QueryEngine uses this narrow, non-enumerable
+ * signal to distinguish a correctable validation/permission rejection from a
+ * writer that threw after an effect may already have happened.
+ */
+function markPreEffectError(error: unknown): Error {
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  Object.defineProperty(normalized, "aresToolEffectPhase", {
+    value: "pre-effect",
+    configurable: true,
+  });
+  return normalized;
+}
+
+/** Tool names the user clicked "Allow always" on this process run. Backs the
+ *  non-command allow_always path in adaptToolForEngine — session-scoped on
+ *  purpose (a fresh daemon starts guarded again). */
+const toolAlwaysGrants = new Set<string>();
+
 export function adaptToolForEngine(
   tool: Tool<z.ZodTypeAny, unknown>,
   enrich: (base: ToolCallContext) => RichToolContext,
-): { schema: ToolSchema; call: (input: unknown, ctx: ToolCallContext) => Promise<EngineToolResult> } {
+): {
+  schema: ToolSchema;
+  mayHaveEffects: boolean;
+  effectPolicy?: EngineToolEffectPolicy;
+  classifyInput: (input: unknown) => { safety: SafetyClass };
+  call: (input: unknown, ctx: ToolCallContext) => Promise<EngineToolResult>;
+} {
   return {
     schema: tool.schema,
+    mayHaveEffects: tool.mayHaveEffects,
+    effectPolicy: tool.effectPolicy,
+    classifyInput(input) {
+      try {
+        return { safety: tool.effectiveSafety(input as z.infer<typeof tool.inputZod>) };
+      } catch {
+        return { safety: tool.schema.safety };
+      }
+    },
     async call(input, ctx) {
       // Two-stage input validation BEFORE the tool runs (CC pattern). Bad model
       // input becomes a recognizable, correctable <tool_use_error> the model fixes
@@ -249,52 +462,86 @@ export function adaptToolForEngine(
         // type/required errors with a readable, field-level message.
         parsed = parseToolInputLenient(tool.inputZod, input, tool.schema.name);
       } catch (e) {
-        throw toolError(e instanceof Error ? e.message : String(e));
+        throw preEffectToolError(e instanceof Error ? e.message : String(e));
       }
-      const rich = enrich(ctx);
+      let rich: RichToolContext;
+      try {
+        rich = enrich(ctx);
+      } catch (error) {
+        throw markPreEffectError(error);
+      }
       // Stage 2 — semantics: optional tool-specific check (e.g. "old_string not
       // found", "path escapes workspace") AFTER parse, BEFORE permission/exec.
       if (tool.validateInput) {
-        const verdict = await tool.validateInput(parsed, rich);
-        if (!verdict.ok) throw toolError(verdict.message);
+        let verdict: Awaited<ReturnType<NonNullable<typeof tool.validateInput>>>;
+        try {
+          verdict = await tool.validateInput(parsed, rich);
+        } catch (error) {
+          throw markPreEffectError(error);
+        }
+        if (!verdict.ok) throw preEffectToolError(verdict.message);
       }
-      const decision = await tool.checkPermissions(parsed, rich);
+      let decision: PermissionDecision;
+      try {
+        decision = await tool.checkPermissions(parsed, rich);
+      } catch (error) {
+        throw markPreEffectError(error);
+      }
+      // "Allow always" for non-command tools (ComputerUse, Browser, …) grants
+      // the TOOL for the rest of the process. Before this, allow_always was a
+      // silent no-op for any tool without commandFor — the user clicked Always
+      // and got re-prompted on the very next action (mid-automation, moving
+      // their mouse to the dialog and wrecking the run).
+      if (decision.kind === "ask" && toolAlwaysGrants.has(tool.schema.name)) {
+        decision = { kind: "allow" };
+      }
       if (decision.kind === "deny") {
         // A policy deny ("Read the file first", "disabled in plan mode") is a
         // correctable signal — envelope it like the validation gate so the model
         // treats it as "fix the call", not an opaque crash.
-        throw toolError(decision.reason);
+        throw preEffectToolError(decision.reason);
       }
       if (decision.kind === "ask") {
         if (!ctx.requestPermission) {
-          throw new Error(`permission required: ${decision.prompt}`);
+          throw markPreEffectError(new Error(`permission required: ${decision.prompt}`));
         }
-        const answer = await ctx.requestPermission({
-          toolName: tool.schema.name,
-          input: parsed,
-          reason: decision.prompt,
-          suggestion: decision.suggestion,
-        });
+        let answer: Awaited<ReturnType<NonNullable<typeof ctx.requestPermission>>>;
+        try {
+          answer = await ctx.requestPermission({
+            toolName: tool.schema.name,
+            input: parsed,
+            reason: decision.prompt,
+            suggestion: decision.suggestion,
+          });
+        } catch (error) {
+          throw markPreEffectError(error);
+        }
         if (answer === "deny") {
           const err = new Error(`permission denied: ${tool.schema.name}`);
           err.name = "PermissionDeniedError";
-          throw err;
+          throw markPreEffectError(err);
         }
         // Persist an explicit "always allow this command" so the next session
         // doesn't re-ask. Path tools self-persist inside call() via
         // resolveWorkspacePath; command tools (Bash/PowerShell) route through
-        // here. No-op when the host store is read-only or the tool isn't
-        // command-shaped — i.e. exactly the old behavior in those cases.
+        // here. Non-command tools get a process-lifetime tool-name grant.
         if (answer === "allow_always") {
           const command = tool.commandFor?.(parsed);
           if (command !== undefined) {
-            await rich.commandPermissions?.grant?.(tool.schema.name, command, "always");
+            try {
+              await rich.commandPermissions?.grant?.(tool.schema.name, command, "always");
+            } catch (error) {
+              throw markPreEffectError(error);
+            }
+          } else {
+            toolAlwaysGrants.add(tool.schema.name);
           }
         }
       }
       const result = await tool.call(parsed, rich);
       return {
         output: result.output,
+        failure: result.failure,
         touchedFiles: result.touchedFiles,
         display: result.display,
         images: result.images,
@@ -357,6 +604,59 @@ export function describeShellActivity(rawCommand: string, background: boolean): 
   return lead(`Running ${program}`);
 }
 
+/**
+ * Commands whose damage git CANNOT undo, refused outright — regardless of
+ * permission mode, including bypass/YOLO.
+ *
+ * Everything else in the destructive list is recoverable in principle: a
+ * `reset --hard` or `checkout --` throws away work git still has objects for,
+ * and the owner accepted that risk when they turned prompting off. `git clean`
+ * with -x/-X is different in kind: it deletes IGNORED files, i.e. exactly the
+ * files git never tracked and therefore cannot restore. In a repo that keeps
+ * local-only state behind .gitignore — env files, vault databases, an
+ * untracked docs tree — that is unrecoverable data loss, and the ignore rule
+ * that protects those files from being published is precisely what leaves
+ * them unprotected here.
+ *
+ * This is not hypothetical: an agent run cleaning up 16 test artifacts reached
+ * for `git clean -fdX`, destroyed 197 local-only files including the .env, the
+ * vault DBs and the entire docs corpus (plus the backup directory that existed
+ * to survive this exact accident), and then — after detecting and reporting
+ * the loss — ran the same command again.
+ *
+ * A preview (-n/--dry-run) is always allowed: seeing the kill list first is
+ * the whole remedy. Deleting a known set of files by name is also unaffected.
+ * Returns a refusal message, or null when the command is fine.
+ */
+export function irrecoverableShellRefusal(command: string): string | null {
+  const normalized = command.replace(/\s+/g, " ").trim();
+  // every `git clean` invocation in the line, including chained ones
+  // Pre-subcommand git options may take a VALUE (`git -C <path> clean …`,
+  // `git --git-dir=… clean …`), so a flag may be followed by a bare argument
+  // before `clean` appears. Missing that form would leave the most explicit
+  // spelling — the one that names another repository — unguarded.
+  const cleans = normalized.match(/(?:^|[;&|]\s*)git\s+(?:-[^\s]+\s+(?:[^-\s][^\s]*\s+)?)*clean\b[^;&|]*/gi);
+  if (!cleans) return null;
+  for (const clean of cleans) {
+    const flags = clean.slice(clean.toLowerCase().indexOf("clean") + 5);
+    // -x / -X anywhere in a short cluster (-fdX) or as a long option
+    const removesIgnored = /(?:^|\s)-[a-wyz]*x[a-wyz]*(?:\s|$)/i.test(flags) || /--(?:force-)?x\b/.test(flags);
+    if (!removesIgnored) continue;
+    const isPreview = /(?:^|\s)-[a-z]*n[a-z]*(?:\s|$)/i.test(flags) || /--dry-run\b/.test(flags);
+    if (isPreview) continue;
+    return (
+      "Refused: `git clean` with -x/-X deletes IGNORED files, which git cannot restore — " +
+      "in this kind of repository that usually means .env files, local databases, and untracked " +
+      "documentation. This refusal holds even in bypass/YOLO mode because the loss is permanent.\n\n" +
+      "Do one of these instead:\n" +
+      "  1. Preview it first: `git clean -ndX` — read the list, then delete what you actually meant to.\n" +
+      "  2. Delete the files you created BY NAME (`rm path/a path/b`). If you made them, you have the list.\n" +
+      "  3. Write throwaway/probe files to a scratch directory OUTSIDE the repo, so cleanup can never touch it."
+    );
+  }
+  return null;
+}
+
 /** Commands that can erase data or discard uncommitted work. */
 export function destructiveShellDecision(command: string): PermissionDecision | null {
   const normalized = command.replace(/\s+/g, " ").trim();
@@ -388,6 +688,14 @@ function defaultPermissionDecision<I extends z.ZodTypeAny, O>(
   safetyOverride?: SafetyClass,
 ): PermissionDecision {
   const safety = safetyOverride ?? def.safety;
+  // The living plan artifact is the one narrowly scoped write admitted while
+  // planning. It cannot edit user files: the tool delegates only to the
+  // Session-owned SQLite revision + .ares/plans projection.
+  if (def.name === "UpdatePlanDraft") {
+    return ctx.permissionMode === "plan"
+      ? { kind: "allow" }
+      : { kind: "deny", reason: "UpdatePlanDraft is available only in plan mode." };
+  }
   if (safety === "read-only") return { kind: "allow" };
 
   if (ctx.permissionMode === "plan") {
@@ -443,9 +751,8 @@ export async function resolveWorkspacePath(
     // Unleashed (bypass): the owner runs Ares on their own machine and points it
     // wherever they like (their Desktop, home dir, another repo). No
     // out-of-workspace permission ritual — that's exactly the friction the owner
-    // posture drops. Workspace checkpoints only cover files under the workspace,
-    // so out-of-workspace targets rely on safeOverwrite's per-file pre-write
-    // backup (.ares/backups) to stay reversible — plus the effects ledger.
+    // posture drops. Mutation tools choose the target project's own transaction
+    // root, so they edit there directly while retaining CAS/journal recovery.
     if (ctx.permissionMode === "bypass") return candidate;
     if (!ctx.requestPermission) {
       throw permissionDenied(`${label} escapes workspace and no permission prompt is available: ${candidate}`);
@@ -476,6 +783,97 @@ export async function resolveWorkspacePath(
     }
   }
   return candidate;
+}
+
+const MUTATION_ROOT_MARKERS = [
+  ".git",
+  ".hg",
+  "package.json",
+  "pnpm-workspace.yaml",
+  "pyproject.toml",
+  "Cargo.toml",
+  "go.mod",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+] as const;
+
+/** Choose the journal root for concrete files. Explicitly approved absolute
+ * paths resolve to their own nearest project, so Ares mutates that project in
+ * place instead of writing in one workspace and copying elsewhere. */
+export async function mutationWorkspaceForPaths(
+  activeWorkspace: string,
+  targets: readonly string[],
+): Promise<string> {
+  if (targets.length === 0) return path.resolve(activeWorkspace);
+  const active = path.resolve(activeWorkspace);
+  const resolved = targets.map((target) => path.resolve(target));
+  if (resolved.every((target) => containsMutationPath(active, target))) return active;
+
+  const discovered = await Promise.all(resolved.map((target) => nearestMutationProjectRoot(target)));
+  const markedRoots = [...new Set(
+    discovered.filter((root): root is string => Boolean(root)).map(normalizeMutationRootKey),
+  )];
+  if (markedRoots.length === 1) {
+    const root = discovered.find(
+      (candidate) => candidate && normalizeMutationRootKey(candidate) === markedRoots[0],
+    )!;
+    if (resolved.every((target) => containsMutationPath(root, target))) return root;
+  }
+  if (markedRoots.length > 1) {
+    throw new Error(
+      `One atomic mutation cannot span multiple projects (${[...new Set(discovered.filter(Boolean))].join(", ")}). ` +
+        "Run one edit/patch per project so each has its own recovery journal.",
+    );
+  }
+
+  const common = commonMutationDirectory(resolved.map((target) => path.dirname(target)));
+  if (!common || common === path.parse(common).root) {
+    throw new Error("One atomic mutation cannot span unrelated filesystem roots. Run one edit per target project.");
+  }
+  return common;
+}
+
+async function nearestMutationProjectRoot(target: string): Promise<string | null> {
+  const info = await fs.stat(target).catch(() => null);
+  let current = info?.isDirectory() ? target : path.dirname(target);
+  const home = path.resolve(os.homedir());
+  for (let depth = 0; depth <= 4; depth++) {
+    // A package/config marker in the owner's home does not make every Desktop
+    // or temp file part of one giant project. Explicit files fall back to their
+    // containing directory when no nearby repository marker exists.
+    if (depth > 0 && normalizeMutationRootKey(current) === normalizeMutationRootKey(home)) return null;
+    for (const marker of MUTATION_ROOT_MARKERS) {
+      if (await fs.lstat(path.join(current, marker)).then(() => true, () => false)) return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+function commonMutationDirectory(directories: readonly string[]): string | null {
+  if (directories.length === 0) return null;
+  const roots = new Set(directories.map((directory) => normalizeMutationRootKey(path.parse(directory).root)));
+  if (roots.size !== 1) return null;
+  let candidate = path.resolve(directories[0]);
+  while (!directories.every((directory) => containsMutationPath(candidate, path.resolve(directory)))) {
+    const parent = path.dirname(candidate);
+    if (parent === candidate) return candidate;
+    candidate = parent;
+  }
+  return candidate;
+}
+
+function normalizeMutationRootKey(candidate: string): string {
+  const normalized = path.resolve(candidate);
+  return process.platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized;
+}
+
+function containsMutationPath(root: string, candidate: string): boolean {
+  return normalizeMutationRootKey(root) === normalizeMutationRootKey(candidate) ||
+    isInsideWorkspace(root, candidate);
 }
 
 async function grantRootFor(candidate: string, access: PathAccess): Promise<string> {

@@ -44,7 +44,7 @@ jobs:
         run: pnpm build
 
       - name: Test
-        run: node --test tests/*.test.mjs
+        run: node --import ./tests/_isolate-home.mjs --test tests/*.test.mjs
 
   coverage:
     name: Coverage (Node built-in)
@@ -73,17 +73,44 @@ jobs:
       # --experimental-test-coverage is a Node 22 feature; the matrix job above
       # already pins node-version 22, so this flag is safe to use here.
       - name: Test with coverage
-        run: node --test --experimental-test-coverage tests/*.test.mjs
+        run: node --import ./tests/_isolate-home.mjs --test --experimental-test-coverage tests/*.test.mjs
 
   rust:
-    name: Build (Rust desktop shell)
-    # The Tauri crate is Windows-first (windows-sys / WebView2). Building on a
-    # Windows runner matches the real target and avoids the Linux webkit2gtk
-    # system-dependency dance. Packaging the installer is intentionally skipped
-    # here — this just proves the shell compiles.
-    runs-on: windows-latest
+    name: Build (Rust desktop shell, ${{ matrix.os }})
+    # The Tauri crate is Windows-first (windows-sys / WebView2), and Windows
+    # stays the job that matches the real release target. Linux is added because
+    # nothing here compiled the crate for Linux at all, so a Linux-only build
+    # break would have reached a release unnoticed. The webkit2gtk "dance" this
+    # job used to avoid is four apt packages, below, and the crate needs no
+    # Cargo.toml change to build.
+    #
+    # What this does NOT catch, stated plainly so the job is not trusted for
+    # more than it does: runtime defects. The startup abort in #3 is a GTK
+    # window-realization rule that only fires when the app runs and a window is
+    # mapped. `cargo build` and the crate's unit tests — pure path helpers, no
+    # display server — both stay green while the desktop aborts on launch.
+    # Catching that class needs a Linux smoke test that actually launches the
+    # shell and checks it survives; this job is the prerequisite for one, not a
+    # substitute.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # webkit2gtk and its friends are the Tauri Linux system dependencies; the
+      # Windows runner carries WebView2 already and needs none of this.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -124,3 +151,8 @@ jobs:
 
       - name: cargo build
         run: cargo build --manifest-path tauri/src-tauri/Cargo.toml
+
+      # The crate's unit tests are pure helpers (path resolution and the like),
+      # no window and no display server involved, so they run on both runners.
+      - name: cargo test
+        run: cargo test --manifest-path tauri/src-tauri/Cargo.toml

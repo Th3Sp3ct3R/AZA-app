@@ -163,6 +163,10 @@ export class TelegramScheduler {
     this.schedule = await loadSchedule(this.home);
     this.lastDay = this.now().getDate();
     this.timer = setInterval(() => this.tick(), this.tickMs);
+    // A forgotten/failed caller must not pin a daemon or test worker forever.
+    // The scheduler is ambient maintenance; active sessions/process owners keep
+    // the runtime alive, not this minute tick.
+    this.timer.unref?.();
     this.log(`scheduler started with ${this.schedule.alarms.length} alarm(s)`);
   }
 

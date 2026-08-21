@@ -17,11 +17,21 @@ import { exists, writeFileAtomic } from "../files.js";
 import { emitLifecycle } from "../lifecycle/bus.js";
 import { gainForTarget } from "../voice.js";
 import { dropCapability, upsertCapability } from "../self/store.js";
+import {
+  CAPABILITY_MANIFEST_FILE,
+  SKILL_NAME,
+  canonicalCapabilityManifest,
+  capabilityManifestSchema,
+  readCapabilityManifest,
+  type CapabilityManifest,
+  type CapabilityScope,
+} from "../skills/manifest.js";
+import { resolveSkill, skillRoots } from "../skills/registry.js";
 
 // Exported so RunSkill (runtime.ts) can validate `name` before ever touching
 // disk — path.join does NOT clamp ".." segments, so an unvalidated name walks
 // straight out of skillsDir.
-export const SKILL_NAME = /^[a-z0-9][a-z0-9_-]{1,63}$/;
+export { SKILL_NAME };
 
 const inputSchema = z
   .object({
@@ -32,6 +42,10 @@ const inputSchema = z
       .string()
       .optional()
       .describe("Skill name. Lowercase, snake_case or kebab-case. Required for create/update/remove/read."),
+    scope: z
+      .enum(["user", "workspace"])
+      .optional()
+      .describe("Where the skill lives. user = ~/.ares/skills (default); workspace = <workspace>/.ares/skills."),
     description: z
       .string()
       .optional()
@@ -44,50 +58,89 @@ const inputSchema = z
       .string()
       .optional()
       .describe("Optional handler.js code. For create/update."),
+    capability_manifest: capabilityManifestSchema
+      .optional()
+      .describe("Strict capability.json provider contract. Its scope must match the requested skill scope."),
     reason: z
       .string()
       .optional()
       .describe("Why this skill is being crafted. Logged for traceability."),
+    provides: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Capabilities this skill SUPPLIES to Ares, so a toggled-on skill can override a built-in. Currently 'tts' (text-to-speech). THE TTS PROVIDER CONTRACT (stable — build any voice engine against it): the handler answers two ops. (1) input {op:'voices'} → {ok:true, voices:[{id,label,gender?,description?}], default?}. (2) input {op:'tts', text, voice, speed} → {ok:true, audio:'<base64>', mime:'<container>'}. `audio` is base64 of a WHOLE encoded audio file in ANY standard container — audio/wav (any sample rate/bit depth), audio/mpeg (mp3), audio/ogg (opus/vorbis), audio/flac, audio/webm. The desktop decodes it with the Web Audio API, so you do NOT resample, do NOT hand-patch WAV headers, and do NOT match a specific rate — just return the engine's native bytes + the right mime. On error return {ok:false, error}. This works identically for a local binary (Piper/Kokoro/Coqui) or an HTTP API (ElevenLabs/OpenAI/Azure) — fetch/spawn, base64 the response bytes, set mime. When enabled, Ares speaks through this instead of the built-in voice. ALSO 'stt' (speech-to-text) — THE STT PROVIDER CONTRACT: the handler answers input {op:'transcribe', audio:'<base64>', mime:'<container>'} → {ok:true, text:'<transcript>'}; audio is a whole recorded clip (typically audio/webm opus from the mic). Works for whisper.cpp, Deepgram, any engine. When enabled, Ares transcribes the mic through it.",
+      ),
+    surfaces: z
+      .array(z.object({ id: z.string(), label: z.string(), icon: z.string().optional(), input: z.unknown().optional(), hint: z.string().optional() }))
+      .optional()
+      .describe(
+        "UI buttons this skill contributes to the active-skills tray. Each button, when clicked, runs THIS skill's handler with its `input` (a surface can only invoke its own skill). e.g. [{id:'brief', label:'Daily brief', icon:'📋', input:{op:'brief'}}].",
+      ),
   })
   .strict();
 
 export interface SkillCraftOutput {
   action: string;
   name?: string;
+  scope?: CapabilityScope;
   skillDir?: string;
   files?: string[];
-  list?: Array<{ name: string; description: string }>;
+  list?: Array<{ name: string; description: string; scope: CapabilityScope; manifestId?: string }>;
   skillMd?: string;
   handlerJs?: string | null;
+  capabilityManifest?: CapabilityManifest | null;
 }
 
 export const SkillCraftTool = buildTool({
   name: "SkillCraft",
   description:
-    "Forge your own skills under ~/.ares/skills/. When you notice a capability gap — something you'll need to do that you don't have a clean path for yet — scaffold a skill instead of asking. A skill is just SKILL.md (description, usage, examples) plus optional handler.js. `create` scaffolds a contract-correct starter handler.js for you (ESM default export `async (input, ctx) => result`, tolerant input parsing) — fill it in rather than re-deriving the shape; `import` and `require` both work, and `input` is whatever JSON you pass to RunSkill. After crafting, append the skill name to CAPABILITIES.md via SelfEvolve. You can also update / remove / list / read your own skills. This is part of your self-extension: you grow your own body.",
+    "Forge project-local skills under <workspace>/.ares/skills or user-global skills under ~/.ares/skills. When you notice a capability gap, build and validate a reusable provider instead of hard-coding one engine into Ares. A skill is SKILL.md plus handler.js; capability providers also carry a strict capability.json contract. `create` without handler_js intentionally creates a failing placeholder, not a working capability. Fill it in, run it, and let a successful contract-valid RunSkill receipt prove readiness. Project-local skills shadow same-named global skills. `import` and `require` both work, and handlers receive the selected workspace/target/session context. " +
+    "HARD RULES for skills that spawn OS processes/windows: (1) any window/app the skill opens (Edge --app, Start-Process, etc.) MUST be tracked (record the PID) and closed by the skill's stop/cleanup action — a fire-and-forget window orphans a dead grey rectangle on the user's screen when its backing server dies; (2) any local server the skill starts must have a stop action that ALSO closes windows pointing at it; (3) web UIs a skill serves must render a visible error state when their backend is unreachable, never a blank page.",
   safety: "workspace-write",
   concurrency: "exclusive",
   inputZod: inputSchema,
   activityDescription: (i) => `SkillCraft ${i.action}${i.name ? ` ${i.name}` : ""}`,
 
-  async call(input, _ctx): Promise<{ output: SkillCraftOutput; touchedFiles?: string[]; display: string }> {
+  async call(input, ctx): Promise<{ output: SkillCraftOutput; touchedFiles?: string[]; display: string }> {
     const home = aresAgentHome(process.env.ARES_HOME);
     const paths = agentPaths(home);
-    await fs.mkdir(paths.skillsDir, { recursive: true });
 
     if (input.action === "list") {
-      const entries = await listSkills(paths.skillsDir);
+      const roots = skillRoots({ home, workspace: ctx.workspace })
+        .filter((root) => !input.scope || root.scope === input.scope);
+      const entries = (await Promise.all(roots.map((root) => listSkills(root.root, root.scope)))).flat();
+      const seen = new Set<string>();
+      const visible = entries.filter((entry) => {
+        if (seen.has(entry.name)) return false;
+        seen.add(entry.name);
+        return true;
+      });
       return {
-        output: { action: "list", list: entries },
-        display: `${entries.length} skill(s) on file`,
+        output: { action: "list", list: visible },
+        display: `${visible.length} skill(s) on file`,
       };
     }
 
     if (!input.name) throw new Error(`SkillCraft.${input.action} requires name`);
     if (!SKILL_NAME.test(input.name)) throw new Error(`SkillCraft: invalid name '${input.name}'. Use lowercase letters, digits, _ or -.`);
-    const skillDir = path.join(paths.skillsDir, input.name);
+    const existing = input.action === "create" || input.scope || input.capability_manifest
+      ? null
+      : await resolveSkill(input.name, { home, workspace: ctx.workspace });
+    const scope: CapabilityScope = input.scope ?? input.capability_manifest?.scope ?? existing?.scope ?? "user";
+    if (input.capability_manifest && input.capability_manifest.scope !== scope) {
+      throw new Error(
+        `SkillCraft: capability_manifest.scope '${input.capability_manifest.scope}' does not match requested scope '${scope}'`,
+      );
+    }
+    const skillsDir = scope === "workspace"
+      ? path.join(path.resolve(ctx.workspace), ".ares", "skills")
+      : paths.skillsDir;
+    await fs.mkdir(skillsDir, { recursive: true });
+    const skillDir = path.join(skillsDir, input.name);
     const skillMdPath = path.join(skillDir, "SKILL.md");
     const handlerPath = path.join(skillDir, "handler.js");
+    const manifestPath = path.join(skillDir, CAPABILITY_MANIFEST_FILE);
 
     if (input.action === "remove") {
       await fs.rm(skillDir, { recursive: true, force: true });
@@ -99,7 +152,7 @@ export const SkillCraftTool = buildTool({
       const gain = gainForTarget("SKILL", -1, "removed");
       emitLifecycle({ type: "skill_crafted", name: input.name, action: "removed", gain });
       return {
-        output: { action: "remove", name: input.name, skillDir },
+        output: { action: "remove", name: input.name, scope, skillDir },
         display: `-1 SKILL — removed ${input.name}`,
       };
     }
@@ -109,8 +162,12 @@ export const SkillCraftTool = buildTool({
       const skillMd = await fs.readFile(skillMdPath, "utf8");
       let handlerJs: string | null = null;
       if (await exists(handlerPath)) handlerJs = await fs.readFile(handlerPath, "utf8");
+      let capabilityManifest: CapabilityManifest | null = null;
+      if (await exists(manifestPath)) {
+        capabilityManifest = await readCapabilityManifest(manifestPath);
+      }
       return {
-        output: { action: "read", name: input.name, skillDir, skillMd, handlerJs },
+        output: { action: "read", name: input.name, scope, skillDir, skillMd, handlerJs, capabilityManifest },
         display: `read skill ${input.name}`,
       };
     }
@@ -125,7 +182,7 @@ export const SkillCraftTool = buildTool({
     }
 
     await fs.mkdir(skillDir, { recursive: true });
-    const skillMdBody = input.skill_md ?? defaultSkillMd(input.name, input.description ?? "");
+    const skillMdBody = input.skill_md ?? defaultSkillMd(input.name, input.description ?? "", scope, input.provides, input.surfaces);
     await writeFileAtomic(skillMdPath, ensureTrailingNewline(skillMdBody));
     const touched: string[] = [skillMdPath];
     // On create, scaffold a contract-correct starter handler when none is given —
@@ -136,6 +193,10 @@ export const SkillCraftTool = buildTool({
     if (handlerBody !== undefined) {
       await writeFileAtomic(handlerPath, ensureTrailingNewline(handlerBody));
       touched.push(handlerPath);
+    }
+    if (input.capability_manifest) {
+      await writeFileAtomic(manifestPath, canonicalCapabilityManifest(input.capability_manifest));
+      touched.push(manifestPath);
     }
 
     // Auto-log to capabilities ledger so the agent's body of work is visible.
@@ -148,10 +209,16 @@ export const SkillCraftTool = buildTool({
         id: `skill/${input.name}`,
         kind: "skill",
         name: input.name,
-        status: "have",
+        // Authoring is not proof. A successful, contract-valid RunSkill outcome
+        // is what promotes this capability to `have`.
+        status: "acquiring",
         provenance: "SkillCraft",
         description: input.description,
-        tags: handlerBody !== undefined ? ["runnable"] : undefined,
+        tags: input.action === "create" && input.handler_js === undefined
+          ? ["placeholder"]
+          : handlerBody !== undefined
+            ? ["runnable"]
+            : undefined,
       });
     } catch {
       // self-model is best-effort
@@ -162,17 +229,20 @@ export const SkillCraftTool = buildTool({
     emitLifecycle({ type: "skill_crafted", name: input.name, action: lifecycleAction, gain });
 
     return {
-      output: { action: input.action, name: input.name, skillDir, files: touched },
+      output: { action: input.action, name: input.name, scope, skillDir, files: touched },
       touchedFiles: touched,
       display: `+1 SKILL — ${input.action} ${input.name}`,
     };
   },
 });
 
-async function listSkills(dir: string): Promise<Array<{ name: string; description: string }>> {
+async function listSkills(
+  dir: string,
+  scope: CapabilityScope,
+): Promise<Array<{ name: string; description: string; scope: CapabilityScope; manifestId?: string }>> {
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
-    const out: Array<{ name: string; description: string }> = [];
+    const out: Array<{ name: string; description: string; scope: CapabilityScope; manifestId?: string }> = [];
     for (const e of entries) {
       if (!e.isDirectory()) continue;
       const md = path.join(dir, e.name, "SKILL.md");
@@ -188,7 +258,16 @@ async function listSkills(dir: string): Promise<Array<{ name: string; descriptio
       } catch {
         // SKILL.md missing or unreadable — keep default
       }
-      out.push({ name: e.name, description: desc });
+      let manifestId: string | undefined;
+      try {
+        const manifest = capabilityManifestSchema.parse(
+          JSON.parse(await fs.readFile(path.join(dir, e.name, CAPABILITY_MANIFEST_FILE), "utf8")),
+        );
+        manifestId = manifest.id;
+      } catch {
+        manifestId = undefined;
+      }
+      out.push({ name: e.name, description: desc, scope, manifestId });
     }
     return out.sort((a, b) => a.name.localeCompare(b.name));
   } catch {
@@ -196,10 +275,20 @@ async function listSkills(dir: string): Promise<Array<{ name: string; descriptio
   }
 }
 
-function defaultSkillMd(name: string, description: string): string {
+function defaultSkillMd(
+  name: string,
+  description: string,
+  scope: CapabilityScope,
+  provides?: string[],
+  surfaces?: Array<{ id: string; label: string; icon?: string; input?: unknown; hint?: string }>,
+): string {
+  const providesLine = provides && provides.length ? `\nprovides: ${provides.join(", ")}` : "";
+  // surfaces MUST be a single JSON line — the frontmatter reader is line-based.
+  const surfacesLine = surfaces && surfaces.length ? `\nsurfaces: ${JSON.stringify(surfaces)}` : "";
   return `---
 name: ${name}
 description: ${description}
+scope: ${scope}${providesLine}${surfacesLine}
 ---
 
 # ${name}
@@ -241,8 +330,12 @@ function defaultHandlerJs(name: string): string {
 //   • Export a DEFAULT async function, called as:  handler(input, ctx)
 //       input = whatever JSON you pass to RunSkill's \`input\` field — it may be a
 //               bare string, an object, or undefined, so parse defensively below.
-//       ctx   = { home, name }  (your Ares home dir + this skill's name)
+//       ctx   = { home, name, skillDir, workspace, targetRoot, sessionId,
+//                 host, port }
 //   • Return any JSON-serializable value — it becomes RunSkill's \`result\`.
+//   • Network skills must bind ctx.host + ctx.port (also ARES_SKILL_HOST /
+//     ARES_SKILL_PORT and HOST / PORT). Ares leases that loopback port from the
+//     OS for this run; never hardcode a service port.
 //   • Heavy work (image/video/model calls): pass a generous \`timeout_ms\` to
 //     RunSkill (it self-caps on that — a too-small value is the only early abort).
 
@@ -261,7 +354,12 @@ export default async function handler(input, ctx) {
   //   });
   //   return await res.json();
 
-  return { ok: true, skill: ctx?.name ?? "${name}", received: arg, note: "handler not implemented yet" };
+  return {
+    ok: false,
+    skill: ctx?.name ?? "${name}",
+    received: arg,
+    error: "handler not implemented yet",
+  };
 }
 `;
 }

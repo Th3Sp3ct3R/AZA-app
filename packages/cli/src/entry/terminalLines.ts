@@ -419,24 +419,71 @@ export async function saveTheme(name: string): Promise<void> {
 export async function contentFromUserInput(text: string, workspace: string): Promise<ContentBlock[]> {
   const content: ContentBlock[] = [];
   const seen = new Set<string>();
-  const dataUrlRe = /data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/=]+)/gi;
+  const maxImageCount = 8;
+  const maxImageBase64Chars = 2_000_000;
+  const maxTotalImageBase64Chars = 4_000_000;
+  let imageCount = 0;
+  let totalImageBase64Chars = 0;
+  const reserveImage = (dataChars: number, label: string): void => {
+    if (dataChars > maxImageBase64Chars) {
+      throw new Error(`${label} is too large; each image must be about 1.5 MB or smaller after encoding`);
+    }
+    if (imageCount >= maxImageCount) {
+      throw new Error(`too many image attachments; send at most ${maxImageCount} images in one message`);
+    }
+    if (totalImageBase64Chars + dataChars > maxTotalImageBase64Chars) {
+      throw new Error("image attachments exceed the safe request budget; send fewer or smaller images");
+    }
+    imageCount++;
+    totalImageBase64Chars += dataChars;
+  };
+
+  // Never silently turn an unsupported image into a giant text prompt. The
+  // provider wire supports these four MIME types; Desktop mirrors this set.
+  const supportedMediaTypes = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
+  const anyImageDataUrlRe = /data:(image\/[a-z0-9.+-]+)[^,\r\n]*;base64,/gi;
+  const imageDataUrlHeaders = [...text.matchAll(anyImageDataUrlRe)];
+  for (const match of imageDataUrlHeaders) {
+    const mediaType = match[1].toLowerCase();
+    if (!supportedMediaTypes.has(mediaType)) {
+      throw new Error(`unsupported image type ${mediaType}; use PNG, JPEG, WebP, or GIF`);
+    }
+  }
+  const dataUrlRe = /data:(image\/(?:png|jpe?g|webp|gif))[^,\r\n]*;base64,([A-Za-z0-9+/=]+)/gi;
+  let parsedImageDataUrls = 0;
   for (const match of text.matchAll(dataUrlRe)) {
-    const key = match[0].slice(0, 80);
+    parsedImageDataUrls++;
+    // Similar screenshots commonly share a long base64 prefix. The old
+    // 80-character key silently collapsed distinct frames into one image.
+    const key = match[0];
     if (seen.has(key)) continue;
+    reserveImage(match[2].length, `inline ${match[1].toLowerCase()} image`);
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(match[2])) {
+      throw new Error(`malformed base64 for inline ${match[1].toLowerCase()} image`);
+    }
     seen.add(key);
-    content.push({ type: "image", source: { kind: "base64", mediaType: match[1].toLowerCase(), data: match[2] } });
+    const mediaType = match[1].toLowerCase() === "image/jpg" ? "image/jpeg" : match[1].toLowerCase();
+    content.push({ type: "image", source: { kind: "base64", mediaType, data: match[2] } });
+  }
+  if (parsedImageDataUrls !== imageDataUrlHeaders.length) {
+    throw new Error("malformed image data URL; use a complete base64-encoded PNG, JPEG, WebP, or GIF");
   }
 
   for (const candidate of imagePathCandidates(text)) {
     const resolved = path.resolve(workspace, candidate);
     if (seen.has(resolved)) continue;
     const info = await stat(resolved).catch(() => null);
-    if (!info?.isFile() || info.size > 15 * 1024 * 1024) continue;
+    if (!info?.isFile()) continue;
+    if (info.size > 15 * 1024 * 1024) {
+      throw new Error(`image ${path.basename(resolved)} is larger than 15 MB; resize it and try again`);
+    }
     const mediaType = mediaTypeForPath(resolved);
     if (!mediaType) continue;
     const bytes = await readFile(resolved);
+    const encoded = bytes.toString("base64");
+    reserveImage(encoded.length, `image ${path.basename(resolved)}`);
     seen.add(resolved);
-    content.push({ type: "image", source: { kind: "base64", mediaType, data: bytes.toString("base64") } });
+    content.push({ type: "image", source: { kind: "base64", mediaType, data: encoded } });
   }
 
   const stripped = text.replace(dataUrlRe, "[attached image]").trim();

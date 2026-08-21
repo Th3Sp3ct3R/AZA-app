@@ -14,9 +14,9 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
-use tauri::{Emitter, Listener, Manager, State};
+use tauri::{Emitter, Manager, State};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -24,6 +24,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 
 #[cfg(windows)]
@@ -47,9 +48,92 @@ struct DaemonState {
 }
 
 /// The local Kokoro voice sidecar (voice_service/server.py) — auto-started with
-/// the app so spoken replies "just work", and killed on close.
+/// the app so spoken replies "just work", and killed on close. First run
+/// self-provisions the Python venv + deps so "Hey Ares" needs zero manual setup.
 struct VoiceState {
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
+    /// (phase, detail) — "idle" | "setup" | "starting" | "running" | "error" | "missing".
+    phase: Arc<Mutex<(String, String)>>,
+    setup_running: Arc<Mutex<bool>>,
+    /// Bumped on every stop/restart so stale exit-watchers stand down.
+    generation: Arc<AtomicU64>,
+    /// Consecutive unexpected exits. The supervisor restarts a transient crash
+    /// automatically, but stops after a small bounded burst instead of looping.
+    crash_count: Arc<AtomicU64>,
+    /// Per-launch shared secret the sidecar requires on every WS/HTTP request.
+    /// Without it, any web page could reach ws://127.0.0.1:8765 and drive the
+    /// mic/TTS; the webview learns the token via ares_voice_status.
+    token: String,
+    /// Per-launch loopback port. A fixed 8765 collided with plugin sidecars
+    /// (notably image generation), making Repair deterministically fail.
+    port: u16,
+}
+
+/// Presentation-only state for the click-through, monitor-sized voice overlay.
+/// Keeping the latest snapshot in Rust means a newly-created overlay cannot
+/// miss the first event while its WebView is still booting.
+struct PresenceState {
+    snapshot: Mutex<PresenceSnapshot>,
+}
+
+/// Session handoff for the experimental renderer. Passing this through a hash
+/// made WebView2 intermittently leave dynamically-created windows at
+/// `about:blank`; the renderer now reads it over the trusted Tauri bridge after
+/// loading a plain, deterministic asset URL.
+struct LivingSurfaceState {
+    session_id: Mutex<Option<String>>,
+    /// The staged generated document, served over the ares-surface:// scheme.
+    /// A srcdoc iframe INHERITS the app CSP (whose build-time style hashes and
+    /// script-src 'self' silently strip every generated <style>/<script> in
+    /// packaged builds); a scheme-served document owns its headers instead.
+    document: Mutex<Option<String>>,
+    doc_seq: AtomicU64,
+}
+
+/// The generated surface's entire authority. Inline script/style may run, but
+/// every network request — fetch, XHR, imports, css url(), beacons — is refused.
+const LIVING_SURFACE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:;";
+
+#[derive(Clone, Serialize)]
+struct PresenceSnapshot {
+    visible: bool,
+    mode: String,
+    caption: String,
+    detail: String,
+}
+
+impl Default for PresenceSnapshot {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            mode: "idle".into(),
+            caption: String::new(),
+            detail: String::new(),
+        }
+    }
+}
+
+/// A random 128-bit hex token. RandomState is seeded from the OS CSPRNG on each
+/// construction, so hashing distinct values yields unpredictable output — enough
+/// to gate a loopback service against a blind same-machine web attacker.
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mk = || {
+        let state = std::collections::hash_map::RandomState::new();
+        let mut h = state.build_hasher();
+        std::time::SystemTime::now().hash(&mut h);
+        std::process::id().hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        h.finish()
+    };
+    format!("{:016x}{:016x}", mk(), mk())
+}
+
+fn available_loopback_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .unwrap_or(8765)
 }
 
 struct AresRuntime {
@@ -186,6 +270,23 @@ fn ares_restart_daemon(
     start_daemon(app, state.inner(), provider, model)
 }
 
+/// The Node heap ceiling for our long-lived children.
+///
+/// Left unset, V8 derives the limit from system memory — so the same build
+/// aborts at ~2 GB on an 8 GB laptop and ~4 GB on a workstation, and "exit code
+/// 134" reproduced for some coworkers and not others. Setting it explicitly
+/// makes the ceiling the same everywhere, and gives the in-process heap watch
+/// (packages/core/src/memoryGuard.ts) a fixed number to measure against so it
+/// can shed idle sessions BEFORE V8 aborts. Override with ARES_DAEMON_HEAP_MB.
+fn node_heap_arg() -> String {
+    let mb = std::env::var("ARES_DAEMON_HEAP_MB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|mb| (512..=32768).contains(mb))
+        .unwrap_or(4096);
+    format!("--max-old-space-size={mb}")
+}
+
 fn start_daemon(
     app: tauri::AppHandle,
     state: &DaemonState,
@@ -216,11 +317,24 @@ fn start_daemon(
     }
 
     let runtime = resolve_ares_runtime(Some(&app)).ok_or_else(|| {
-        "Could not find Ares runtime. Rebuild the desktop runtime before launching the app."
-            .to_string()
+        // "Not found" and "found but broken" are different failures and need
+        // different fixes. A truncated or half-written runtime used to look
+        // exactly like a missing one.
+        match bundled_runtime_defect(&app) {
+            Some(defect) => format!(
+                "Ares runtime is installed but unusable: {defect}. Reinstall the app or rebuild the desktop runtime.",
+            ),
+            None => "Could not find Ares runtime. Rebuild the desktop runtime before launching the app."
+                .to_string(),
+        }
     })?;
     fs::create_dir_all(&runtime.workspace)
         .map_err(|error| format!("failed to create Ares workspace: {error}"))?;
+    // One vault, not two: adopt any pre-split desktop home before anything
+    // creates an empty one at the documented path.
+    if let Some(note) = converge_desktop_vault() {
+        eprintln!("ares: {note}");
+    }
     if let Some(home) = desktop_ares_home() {
         fs::create_dir_all(&home)
             .map_err(|error| format!("failed to create Ares home: {error}"))?;
@@ -233,6 +347,7 @@ fn start_daemon(
     let model = clean_optional(model);
     let mut command = Command::new(&runtime.node);
     command
+        .arg(node_heap_arg())
         .arg(&runtime.cli_entry)
         .arg("daemon")
         .arg("--json")
@@ -313,7 +428,11 @@ fn start_daemon(
         let mut garrison_guard = state.garrison.lock().map_err(|_| "daemon garrison lock failed")?;
         if garrison_guard.is_none() {
             let mut garrison_cmd = Command::new(&runtime.node);
-            garrison_cmd.arg(&runtime.cli_entry).arg("garrison").arg("serve");
+            garrison_cmd
+                .arg(node_heap_arg())
+                .arg(&runtime.cli_entry)
+                .arg("garrison")
+                .arg("serve");
             #[cfg(windows)]
             {
                 garrison_cmd.creation_flags(CREATE_NO_WINDOW);
@@ -391,7 +510,13 @@ fn start_daemon(
 }
 
 #[tauri::command]
-fn ares_send(goal: String, session_id: Option<String>, state: State<DaemonState>) -> Result<(), String> {
+fn ares_send(
+    goal: String,
+    session_id: Option<String>,
+    voice: Option<bool>,
+    input_id: Option<String>,
+    state: State<DaemonState>,
+) -> Result<(), String> {
     let trimmed = goal.trim();
     if trimmed.is_empty() {
         return Err("message is empty".to_string());
@@ -399,7 +524,13 @@ fn ares_send(goal: String, session_id: Option<String>, state: State<DaemonState>
 
     write_daemon_command(
         state.inner(),
-        json!({ "type": "send", "goal": trimmed, "sessionId": session_id }),
+        json!({
+            "type": "send",
+            "goal": trimmed,
+            "sessionId": session_id,
+            "voice": voice.unwrap_or(false),
+            "inputId": input_id,
+        }),
     )
 }
 
@@ -416,8 +547,8 @@ fn ares_interrupt(session_id: Option<String>, state: State<DaemonState>) -> Resu
 #[tauri::command]
 fn ares_set_reasoning(level: String, state: State<DaemonState>) -> Result<(), String> {
     let level = level.trim().to_ascii_lowercase();
-    if !matches!(level.as_str(), "low" | "medium" | "high" | "max") {
-        return Err("reasoning level must be low, medium, high, or max".to_string());
+    if !matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
+        return Err("reasoning level must be off, minimal, low, medium, high, xhigh, or max".to_string());
     }
 
     write_daemon_command(
@@ -440,6 +571,41 @@ fn ares_set_routing(routing: Value, state: State<DaemonState>) -> Result<(), Str
 /// Used by the desktop for the read-model commands: sessions_list,
 /// session_history, engine_config, skills_list, skill_toggle, usage_stats,
 /// operator_status. The daemon replies asynchronously on the event stream.
+/// Spawn a SYSTEM helper with the bundle's library environment scrubbed.
+///
+/// An AppImage exports LD_LIBRARY_PATH (and friends) so OUR binaries find the
+/// libraries packed beside them. Every process we spawn inherits those exports,
+/// including host helpers that have nothing to do with the bundle — and then
+/// `kde-open` loads the bundle's libcurl against the host's nghttp2 and dies
+/// with `undefined symbol: nghttp2_option_set_no_rfc9113_...`, which is what
+/// "open link" failing on Linux actually was.
+///
+/// AppRun saves each pre-launch value as `<VAR>_ORIG` for exactly this purpose:
+/// restore it where it exists, and remove the variable entirely where it does
+/// not. Outside an AppImage none of these are set and this is a no-op.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn host_command(program: &str) -> Command {
+    const BUNDLE_VARS: [&str; 9] = [
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_SYSTEM_PATH_1_0",
+        "GI_TYPELIB_PATH",
+        "GSETTINGS_SCHEMA_DIR",
+        "QT_PLUGIN_PATH",
+    ];
+    let mut command = Command::new(program);
+    for var in BUNDLE_VARS {
+        match env::var(format!("{var}_ORIG")) {
+            Ok(original) => command.env(var, original),
+            Err(_) => command.env_remove(var),
+        };
+    }
+    command
+}
+
 /// Open a URL in the user's default browser (used for the Anthropic OAuth
 /// sign-in flow). Validated to http(s) so a daemon event can't open arbitrary
 /// programs.
@@ -481,17 +647,83 @@ fn ares_open_url(url: String) -> Result<(), String> {
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
-        Command::new("xdg-open").arg(&url).spawn().map_err(|e| format!("failed to open browser: {e}"))?;
+        host_command("xdg-open").arg(&url).spawn().map_err(|e| format!("failed to open browser: {e}"))?;
         Ok(())
     }
 }
+
+/// Open a forged artifact in the user's default browser. Only existing files
+/// are accepted; arguments are passed directly to the OS (never through a shell).
+#[tauri::command]
+fn ares_open_path(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    if !target.is_file() {
+        return Err("artifact does not exist".to_string());
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide: Vec<u16> = target.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        let result = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), wide.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL as i32) };
+        if result as isize <= 32 { return Err("failed to launch artifact".to_string()); }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    { Command::new("open").arg(&target).spawn().map_err(|e| format!("failed to launch artifact: {e}"))?; Ok(()) }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    { host_command("xdg-open").arg(&target).spawn().map_err(|e| format!("failed to launch artifact: {e}"))?; Ok(()) }
+}
+
+/// Every command `type` the daemon's loop actually handles. The webview can
+/// only ask for one of these — an unknown/forged type is rejected here instead
+/// of being piped into daemon stdin verbatim (defense in depth: the webview is
+/// trusted, but a compromised page or injected artifact script shouldn't get a
+/// raw line into the engine).
+const ALLOWED_DAEMON_COMMANDS: &[&str] = &[
+    "anthropic_login_finish", "anthropic_login_start", "bug_report",
+    "openai_login_start", "openai_auth_status",
+    "consciousness_cancel", "consciousness_disable", "consciousness_enable",
+    "consciousness_killswitch", "consciousness_look_away", "consciousness_resume",
+    "consciousness_status", "discover_custom_models", "engine_config", "exit",
+    "gateway_connect", "gateway_signin", "gateway_status", "interrupt",
+    "kimi_login_start", "kimi_auth_status",
+    "computer_status", "computer_setup", "computer_screen", "computer_mode",
+    "mcp_connect", "mcp_disconnect", "mcp_list", "mcp_search", "mcp_set_token",
+    "mcp_toggle", "mcp_tools", "model_catalog", "model_switch", "oauth_disconnect",
+    "oauth_set_credentials", "oauth_start", "oauth_status", "ollama_pull",
+    "openrouter_key", "operator_autotick", "operator_control", "operator_status",
+    "permission", "permission_response", "provider_key", "reasoning", "routing",
+    "routing_mode", "session_delete", "session_history", "session_rename",
+    "sessions_list", "set_permissions", "skill_invoke", "skill_toggle",
+    "skillhub_install", "skillhub_list", "skillhub_publish", "skills_list",
+    "steer", "undo", "usage_stats", "webview_result",
+    // The roster + workflow surfaces. These were MISSING for their whole
+    // lifetime: the UI sent them, this list rejected them with a Result::Err
+    // the frontend discards, and every one of those buttons was silently dead
+    // in the packaged app — the persona gallery, "Wear <persona>", the
+    // Plan/Build pill, and the Mind cockpit's state read. A test now diffs the
+    // UI's command vocabulary against this list so a new button cannot ship
+    // unroutable again.
+    "cognitive_state", "persona_adopt", "persona_delete", "persona_style",
+    "persona_write", "roster_list", "workflow_mode",
+    // Background jobs: what is running, stop one, resume a suspended one.
+    "background_list", "background_stop", "background_resume",
+    // Agent visibility: HELM's fleet history + durable background subagents.
+    "fleets_list", "subagents_list",
+];
 
 #[tauri::command]
 fn ares_daemon_command(command: Value, state: State<DaemonState>) -> Result<(), String> {
     if !command.is_object() {
         return Err("daemon command must be an object".to_string());
     }
-    write_daemon_command(state.inner(), command)
+    match command.get("type").and_then(Value::as_str) {
+        Some(t) if ALLOWED_DAEMON_COMMANDS.contains(&t) => write_daemon_command(state.inner(), command),
+        Some(t) => Err(format!("unknown daemon command: {t}")),
+        None => Err("daemon command requires a string 'type'".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -676,6 +908,9 @@ fn ares_window_toggle_maximize(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn ares_window_close(app: tauri::AppHandle, state: State<DaemonState>) -> Result<(), String> {
     let _ = stop_existing_daemon(state.inner());
+    if let Some(overlay) = app.get_webview_window("presence-overlay") {
+        let _ = overlay.close();
+    }
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window unavailable".to_string())?;
@@ -791,74 +1026,773 @@ fn stop_existing_daemon(state: &DaemonState) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn voice_python(root: &Path) -> std::ffi::OsString {
-    let venv = root
-        .join(".ares")
-        .join("voice-venv")
-        .join("Scripts")
-        .join("python.exe");
-    if venv.exists() {
-        venv.into_os_string()
+fn voice_venv_python(root: &Path) -> PathBuf {
+    let venv = root.join(".ares").join("voice-venv");
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
     } else {
-        std::ffi::OsString::from("python")
+        venv.join("bin").join("python")
     }
 }
 
-#[cfg(not(windows))]
-fn voice_python(root: &Path) -> std::ffi::OsString {
-    let venv = root
-        .join(".ares")
-        .join("voice-venv")
-        .join("bin")
-        .join("python");
-    if venv.exists() {
-        venv.into_os_string()
+fn voice_log_path(root: &Path) -> PathBuf {
+    root.join(".ares").join("voice-sidecar.log")
+}
+
+/// Update the voice phase and push it to the webview so the dock can narrate
+/// setup progress live ("installing the voice engine…") instead of the old
+/// dead-silent Stdio::null() spawn.
+fn voice_emit(
+    app: &tauri::AppHandle,
+    phase_arc: &Arc<Mutex<(String, String)>>,
+    phase: &str,
+    detail: &str,
+) {
+    if let Ok(mut guard) = phase_arc.lock() {
+        *guard = (phase.to_string(), detail.to_string());
+    }
+    let _ = app.emit("ares:voice-status", json!({ "phase": phase, "detail": detail }));
+}
+
+/// Find a usable system Python for bootstrapping the venv. Kokoro (the TTS
+/// engine) requires >=3.10,<3.13, so interpreters in that band are tried
+/// FIRST — the newest system python (3.13+) installs everything except the
+/// premium voice, which is exactly the crash-looped venv we're avoiding.
+fn find_system_python() -> Option<(String, Vec<String>)> {
+    let candidates: &[(&str, &[&str])] = if cfg!(windows) {
+        &[
+            ("py", &["-3.12"] as &[&str]),
+            ("py", &["-3.11"]),
+            ("py", &["-3.10"]),
+            ("py", &["-3"]),
+            ("python", &[]),
+            ("python3", &[]),
+        ]
     } else {
-        std::ffi::OsString::from("python3")
+        &[
+            ("python3.12", &[] as &[&str]),
+            ("python3.11", &[]),
+            ("python3.10", &[]),
+            ("python3", &[]),
+            ("python", &[]),
+        ]
+    };
+    for (bin, args) in candidates {
+        let mut cmd = Command::new(bin);
+        cmd.args(*args)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        if matches!(cmd.status(), Ok(s) if s.success()) {
+            return Some((bin.to_string(), args.iter().map(|a| a.to_string()).collect()));
+        }
+    }
+    None
+}
+
+/// Run a bootstrap step with stdout/stderr appended to voice-sidecar.log so
+/// failures are diagnosable (the old path discarded everything).
+fn voice_run_logged(mut cmd: Command, log_path: &Path) -> bool {
+    if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        if let Ok(clone) = f.try_clone() {
+            cmd.stdout(Stdio::from(f)).stderr(Stdio::from(clone));
+        }
+    }
+    cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// A hard app crash can leave Python alive after Rust loses its Child handle.
+/// The next launch then reports a healthy venv, starts another server, and dies
+/// with WSAEADDRINUSE forever — Repair used to repeat that exact cycle. Reclaim
+/// only a listener whose command line is recognizably Ares's voice server; an
+/// unrelated process on the same port is never touched.
+fn reclaim_orphan_voice_server(port: u16) {
+    #[cfg(windows)]
+    {
+        let script = format!(r#"$owners = Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; foreach ($ownerPid in $owners) {{ $p = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue; if ($p.CommandLine -match 'voice_service[\\/]+server\.py') {{ Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue }} }}"#, port);
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.status();
+        thread::sleep(Duration::from_millis(180));
     }
 }
 
-/// Spawn voice_service/server.py headlessly. Best-effort: if Python / the venv /
-/// the script is missing, or the port is already taken by a manual sidecar, the
-/// child simply exits and chat is unaffected.
-fn start_voice_sidecar(app: &tauri::AppHandle, state: &VoiceState) {
-    if let Ok(guard) = state.child.lock() {
+/// Spawn voice_service/server.py with output captured to the log, and watch
+/// for unexpected exits so the UI can say "the engine died" instead of the
+/// wake toggle silently sitting at offline forever.
+fn spawn_voice_server(
+    app: &tauri::AppHandle,
+    child_arc: &Arc<Mutex<Option<Child>>>,
+    phase_arc: &Arc<Mutex<(String, String)>>,
+    gen_arc: &Arc<AtomicU64>,
+    crash_arc: &Arc<AtomicU64>,
+    root: &Path,
+    port: u16,
+) {
+    if let Ok(guard) = child_arc.lock() {
         if guard.is_some() {
             return;
         }
     }
-    let Some(runtime) = resolve_ares_runtime(Some(app)) else {
-        return;
+    reclaim_orphan_voice_server(port);
+    let script = root.join("voice_service").join("server.py");
+    let _ = fs::create_dir_all(root.join(".ares"));
+    let log_path = voice_log_path(root);
+    let venv_py = voice_venv_python(root);
+    let python: std::ffi::OsString = if venv_py.exists() {
+        venv_py.into_os_string()
+    } else if cfg!(windows) {
+        std::ffi::OsString::from("python")
+    } else {
+        std::ffi::OsString::from("python3")
     };
-    let script = runtime.app_root.join("voice_service").join("server.py");
-    if !script.exists() {
-        return;
-    }
-    let mut command = Command::new(voice_python(&runtime.app_root));
-    command.arg(&script).current_dir(&runtime.app_root);
+    let mut command = Command::new(python);
+    command.arg(&script).current_dir(root).env("ARES_TTS_PORT", port.to_string());
     #[cfg(windows)]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.stdin(Stdio::null());
+    match fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(f) => {
+            match f.try_clone() {
+                Ok(clone) => {
+                    command.stdout(Stdio::from(f)).stderr(Stdio::from(clone));
+                }
+                Err(_) => {
+                    command.stdout(Stdio::null()).stderr(Stdio::from(f));
+                }
+            };
+        }
+        Err(_) => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
     }
-    command
+    match command.spawn() {
+        Ok(child) => {
+            if let Ok(mut guard) = child_arc.lock() {
+                *guard = Some(child);
+            }
+            voice_emit(app, phase_arc, "starting", "Warming up local speech…");
+            let generation = gen_arc.load(Ordering::SeqCst);
+            let child_watch = child_arc.clone();
+            let phase_watch = phase_arc.clone();
+            let gen_watch = gen_arc.clone();
+            let crash_watch = crash_arc.clone();
+            let app_watch = app.clone();
+            let root_watch = root.to_path_buf();
+            thread::spawn(move || {
+              let mut healthy_since: Option<Instant> = None;
+              loop {
+                thread::sleep(Duration::from_millis(250));
+                if gen_watch.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                let exit_code = {
+                    let mut guard = match child_watch.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    match guard.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(status)) => {
+                                *guard = None;
+                                Some(status.code())
+                            }
+                            Ok(None) => None,
+                            Err(_) => return,
+                        },
+                        None => return,
+                    }
+                };
+                if let Some(code) = exit_code {
+                    if gen_watch.load(Ordering::SeqCst) == generation {
+                        let attempt = crash_watch.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt <= 3 {
+                            voice_emit(
+                                &app_watch,
+                                &phase_watch,
+                                "starting",
+                                &format!("Voice engine restarted automatically ({attempt}/3)…"),
+                            );
+                            thread::sleep(Duration::from_millis(650 * attempt));
+                            if gen_watch.load(Ordering::SeqCst) == generation {
+                                spawn_voice_server(
+                                    &app_watch,
+                                    &child_watch,
+                                    &phase_watch,
+                                    &gen_watch,
+                                    &crash_watch,
+                                    &root_watch,
+                                    port,
+                                );
+                            }
+                        } else {
+                            voice_emit(
+                                &app_watch,
+                                &phase_watch,
+                                "error",
+                                &format!("The voice engine stopped repeatedly (exit {}). Repair will restart it without reinstalling.", code.map_or_else(|| "unknown".into(), |value| value.to_string())),
+                            );
+                        }
+                    }
+                    return;
+                }
+
+                // Do not call the engine "running" merely because Python was
+                // spawned. Wait until its dynamic loopback port is actually
+                // accepting connections, which prevents the wake UI flicker.
+                if healthy_since.is_none() && TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    healthy_since = Some(Instant::now());
+                    voice_emit(&app_watch, &phase_watch, "running", "");
+                }
+                if healthy_since.is_some_and(|at| at.elapsed() >= Duration::from_secs(30)) {
+                    crash_watch.store(0, Ordering::SeqCst);
+                }
+              }
+            });
+        }
+        Err(err) => {
+            voice_emit(
+                app,
+                phase_arc,
+                "error",
+                &format!("Couldn't launch the voice engine ({err}). Hit Repair to rebuild it."),
+            );
+        }
+    }
+}
+
+/// Quick venv sanity: can it import the CORE deps the server needs to boot?
+/// (kokoro is deliberately not checked — TTS degrades, the server still runs.)
+fn voice_venv_healthy(root: &Path) -> bool {
+    voice_import_ok(root, "import fastapi, uvicorn, numpy, faster_whisper, sounddevice")
+}
+
+/// Deep check used by Repair: is the premium TTS (kokoro) actually importable?
+/// Slower (imports torch) — only run on an explicit Repair, never at startup.
+fn voice_kokoro_ok(root: &Path) -> bool {
+    voice_import_ok(root, "import kokoro")
+}
+
+fn voice_import_ok(root: &Path, import_line: &str) -> bool {
+    let py = voice_venv_python(root);
+    if !py.exists() {
+        return false;
+    }
+    let mut cmd = Command::new(py);
+    cmd.args(["-c", import_line])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(child) = command.spawn() {
-        if let Ok(mut guard) = state.child.lock() {
-            *guard = Some(child);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// Make voice work with zero manual steps: healthy venv → start the sidecar;
+/// missing OR BROKEN venv → (re)provision in the background (venv + pip),
+/// narrating progress to the UI, then start it. `force` wipes the venv first
+/// (the Repair button) — a venv that half-installed (e.g. built with Python
+/// 3.13, which kokoro refuses) used to crash-loop forever; now it rebuilds.
+fn ensure_voice_ready(app: &tauri::AppHandle, state: &VoiceState, force: bool) {
+    let Some(runtime) = resolve_ares_runtime(Some(app)) else {
+        voice_emit(app, &state.phase, "missing", "Ares runtime not found — voice is unavailable.");
+        return;
+    };
+    let root = runtime.app_root;
+    let script = root.join("voice_service").join("server.py");
+    if !script.exists() {
+        voice_emit(
+            app,
+            &state.phase,
+            "missing",
+            "The voice service files aren't included in this install.",
+        );
+        return;
+    }
+    {
+        let Ok(mut running) = state.setup_running.lock() else { return };
+        if *running {
+            return;
+        }
+        *running = true;
+    }
+    let app2 = app.clone();
+    let child_arc = state.child.clone();
+    let phase_arc = state.phase.clone();
+    let gen_arc = state.generation.clone();
+    let crash_arc = state.crash_count.clone();
+    let setup_flag = state.setup_running.clone();
+    let port = state.port;
+    // Everything (including the health probe — it launches python) runs off
+    // the main thread so app startup never blocks on the voice stack.
+    thread::spawn(move || {
+        let done = || {
+            if let Ok(mut running) = setup_flag.lock() {
+                *running = false;
+            }
+        };
+        let venv_dir = root.join(".ares").join("voice-venv");
+        let core_ok = voice_venv_healthy(&root);
+        // Startup fast path: core deps present → just start.
+        if !force && core_ok {
+            voice_emit(&app2, &phase_arc, "starting", "Starting the local voice engine…");
+            spawn_voice_server(&app2, &child_arc, &phase_arc, &gen_arc, &crash_arc, &root, port);
+            done();
+            return;
+        }
+        // Repair on an already-complete install (core + kokoro import fine):
+        // the engine just crashed — RESTART it, don't wipe and re-download
+        // gigabytes (the "hit repair → installing forever" the user hit).
+        if force && core_ok && voice_kokoro_ok(&root) {
+            voice_emit(&app2, &phase_arc, "starting", "Restarting the local voice engine…");
+            crash_arc.store(0, Ordering::SeqCst);
+            spawn_voice_server(&app2, &child_arc, &phase_arc, &gen_arc, &crash_arc, &root, port);
+            done();
+            return;
+        }
+        let _ = fs::create_dir_all(root.join(".ares"));
+        let log_path = voice_log_path(&root);
+        if venv_dir.exists() {
+            voice_emit(&app2, &phase_arc, "setup", "Repairing the voice engine's Python environment…");
+            if fs::remove_dir_all(&venv_dir).is_err() {
+                voice_emit(
+                    &app2,
+                    &phase_arc,
+                    "error",
+                    "Couldn't remove the broken voice environment (.ares/voice-venv) — close anything using it, then hit Repair.",
+                );
+                done();
+                return;
+            }
+        }
+        voice_emit(&app2, &phase_arc, "setup", "Checking for Python (3.10–3.12 preferred)…");
+        let Some((py_bin, py_args)) = find_system_python() else {
+            voice_emit(
+                &app2,
+                &phase_arc,
+                "error",
+                "Python 3 isn't installed. Grab 3.12 from python.org (check “Add to PATH”), then hit Repair — Ares handles the rest.",
+            );
+            done();
+            return;
+        };
+        voice_emit(&app2, &phase_arc, "setup", "Creating the voice engine's Python environment…");
+        let mut venv_cmd = Command::new(&py_bin);
+        venv_cmd.args(&py_args).args(["-m", "venv"]).arg(&venv_dir).current_dir(&root);
+        if !voice_run_logged(venv_cmd, &log_path) {
+            voice_emit(
+                &app2,
+                &phase_arc,
+                "error",
+                "Couldn't create the Python environment — see .ares/voice-sidecar.log, then hit Repair.",
+            );
+            done();
+            return;
+        }
+        let mut pip_cmd = Command::new(voice_venv_python(&root));
+        pip_cmd.args(["-m", "pip", "install", "--upgrade", "pip"]).current_dir(&root);
+        let _ = voice_run_logged(pip_cmd, &log_path);
+        // CPU-only PyTorch FIRST. kokoro depends on torch; the default index
+        // pulls the ~2.5GB CUDA build (the "installing forever" the user hit).
+        // The CPU wheel is ~200MB and plenty for real-time TTS on this hardware.
+        // Honor ARES_VOICE_CUDA=1 for users who want the GPU build.
+        if env::var("ARES_VOICE_CUDA").as_deref() != Ok("1") {
+            voice_emit(&app2, &phase_arc, "setup", "Downloading the voice runtime (CPU PyTorch, ~200 MB — first run only)…");
+            let mut torch_cmd = Command::new(voice_venv_python(&root));
+            torch_cmd
+                .args(["-m", "pip", "install", "--index-url", "https://download.pytorch.org/whl/cpu", "torch"])
+                .current_dir(&root);
+            let _ = voice_run_logged(torch_cmd, &log_path); // non-fatal; kokoro will pull torch if this fails
+        }
+        // Core (wake word + dictation + the server itself), then the premium
+        // TTS separately: kokoro requires Python >=3.10,<3.13, and one refused
+        // wheel must not take down the entire voice stack.
+        voice_emit(
+            &app2,
+            &phase_arc,
+            "setup",
+            "Installing the voice engine (Whisper + server)…",
+        );
+        let mut core_cmd = Command::new(voice_venv_python(&root));
+        core_cmd
+            .args(["-m", "pip", "install", "fastapi>=0.115", "uvicorn[standard]>=0.30", "numpy>=1.26", "soundfile>=0.12", "faster-whisper>=1.0", "sounddevice>=0.4"])
+            .current_dir(&root);
+        if !voice_run_logged(core_cmd, &log_path) {
+            voice_emit(
+                &app2,
+                &phase_arc,
+                "error",
+                "Installing the voice engine failed — see .ares/voice-sidecar.log, then hit Repair to retry.",
+            );
+            done();
+            return;
+        }
+        voice_emit(&app2, &phase_arc, "setup", "Installing the premium voice (Kokoro TTS)…");
+        let mut tts_cmd = Command::new(voice_venv_python(&root));
+        tts_cmd.args(["-m", "pip", "install", "kokoro>=0.9"]).current_dir(&root);
+        if !voice_run_logged(tts_cmd, &log_path) {
+            // Non-fatal: wake word + dictation work; replies use the fallback voice.
+            let _ = fs::OpenOptions::new().create(true).append(true).open(&log_path).map(|mut f| {
+                use std::io::Write as _;
+                let _ = writeln!(f, "[setup] kokoro install failed (needs Python 3.10-3.12) - continuing without premium TTS");
+            });
+        }
+        voice_emit(&app2, &phase_arc, "starting", "Starting the local voice engine…");
+        crash_arc.store(0, Ordering::SeqCst);
+        spawn_voice_server(&app2, &child_arc, &phase_arc, &gen_arc, &crash_arc, &root, port);
+        done();
+    });
+}
+
+/// Never launch cut off: if the window is bigger than the monitor's usable
+/// area (small laptop, heavy DPI scaling) shrink it to fit, and if any edge
+/// ended up offscreen re-center it. Runs once at startup.
+fn clamp_window_to_monitor(window: &tauri::WebviewWindow) {
+    let Ok(Some(monitor)) = window.current_monitor() else { return };
+    let scale = monitor.scale_factor();
+    let mon_pos = *monitor.position();
+    let mon_size = *monitor.size();
+    // Leave room for the Windows taskbar (~48 logical px) — Monitor::size()
+    // is the full panel, not the work area.
+    let margin = (48.0 * scale) as i32;
+    let avail_w = mon_size.width as i32;
+    let avail_h = mon_size.height as i32 - margin;
+    if avail_w <= 0 || avail_h <= 0 {
+        return;
+    }
+    let Ok(mut size) = window.outer_size() else { return };
+    let mut resized = false;
+    if size.width as i32 > avail_w {
+        size.width = avail_w as u32;
+        resized = true;
+    }
+    if size.height as i32 > avail_h {
+        size.height = avail_h as u32;
+        resized = true;
+    }
+    if resized {
+        let _ = window.set_size(tauri::PhysicalSize::new(size.width, size.height));
+    }
+    if let Ok(pos) = window.outer_position() {
+        let out = pos.x < mon_pos.x
+            || pos.y < mon_pos.y
+            || pos.x + size.width as i32 > mon_pos.x + avail_w
+            || pos.y + size.height as i32 > mon_pos.y + avail_h;
+        if out || resized {
+            let cx = mon_pos.x + ((avail_w - size.width as i32) / 2).max(0);
+            let cy = mon_pos.y + ((avail_h - size.height as i32) / 2).max(0);
+            let _ = window.set_position(tauri::PhysicalPosition::new(cx, cy));
         }
     }
 }
 
 fn stop_voice_sidecar(state: &VoiceState) {
+    // Bump the generation FIRST so the exit-watcher knows this death is ours.
+    state.generation.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut guard) = state.child.lock() {
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
+}
+
+#[tauri::command]
+fn ares_voice_status(app: tauri::AppHandle, state: State<VoiceState>) -> Value {
+    let running = {
+        match state.child.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => false,
+            },
+            Err(_) => false,
+        }
+    };
+    let (phase, detail) = state
+        .phase
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| ("idle".into(), String::new()));
+    let (venv, log_path) = match resolve_ares_runtime(Some(&app)) {
+        Some(runtime) => (
+            voice_venv_python(&runtime.app_root).exists(),
+            voice_log_path(&runtime.app_root).to_string_lossy().to_string(),
+        ),
+        None => (false, String::new()),
+    };
+    json!({
+        "running": running,
+        "phase": phase,
+        "detail": detail,
+        "venv": venv,
+        "logPath": log_path,
+        // The per-launch secret the webview must attach to every sidecar
+        // request — the loopback-service auth gate.
+        "token": state.token,
+        "port": state.port,
+    })
+}
+
+/// "Repair voice" — kill whatever is there, WIPE the venv, and re-provision
+/// from scratch. (Respawning a half-installed venv just crash-loops again.)
+#[tauri::command]
+fn ares_voice_setup(app: tauri::AppHandle, state: State<VoiceState>) {
+    stop_voice_sidecar(state.inner());
+    ensure_voice_ready(&app, state.inner(), true);
+}
+
+fn presence_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window("presence-overlay") {
+        return Ok(window);
+    }
+
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        "presence-overlay",
+        tauri::WebviewUrl::App("index.html?presence=1".into()),
+    )
+    .title("Ares presence")
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .visible(false)
+    .build()
+    .map_err(|error| format!("failed to create presence overlay: {error}"))?;
+
+    // Click-through is applied once the overlay is actually shown, not here: on
+    // GTK a window built `visible(false)` has no underlying GdkWindow yet, and
+    // the input-shape request aborts the process on that None. See
+    // `ares_presence_update`. A hidden window intercepts nothing meanwhile.
+
+    // Cover the monitor containing the Ares pill. Physical coordinates avoid
+    // DPI seams that leave one unlit edge on mixed-scale multi-monitor setups.
+    let monitor = app
+        .get_webview_window("main")
+        .and_then(|main| main.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    if let Some(monitor) = monitor {
+        let _ = window.set_position(tauri::PhysicalPosition::new(
+            monitor.position().x,
+            monitor.position().y,
+        ));
+        let _ = window.set_size(tauri::PhysicalSize::new(
+            monitor.size().width,
+            monitor.size().height,
+        ));
+    }
+
+    #[cfg(windows)]
+    hide_windows_accent_border(&window);
+    Ok(window)
+}
+
+#[tauri::command]
+fn ares_presence_status(state: State<PresenceState>) -> PresenceSnapshot {
+    state
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn ares_presence_update(
+    app: tauri::AppHandle,
+    state: State<PresenceState>,
+    mode: String,
+    caption: String,
+    detail: String,
+) -> Result<(), String> {
+    let snapshot = PresenceSnapshot {
+        visible: true,
+        mode,
+        caption,
+        detail,
+    };
+    if let Ok(mut current) = state.snapshot.lock() {
+        *current = snapshot.clone();
+    }
+    let window = presence_window(&app)?;
+    // Re-evaluate the monitor each time the overlay wakes in case the user
+    // dragged the pill to a different display since the last voice turn.
+    if let Some(monitor) = app
+        .get_webview_window("main")
+        .and_then(|main| main.current_monitor().ok().flatten())
+    {
+        let _ = window.set_position(tauri::PhysicalPosition::new(
+            monitor.position().x,
+            monitor.position().y,
+        ));
+        let _ = window.set_size(tauri::PhysicalSize::new(
+            monitor.size().width,
+            monitor.size().height,
+        ));
+    }
+    window
+        .show()
+        .map_err(|error| format!("failed to show presence overlay: {error}"))?;
+
+    // The overlay is visual presence only. Mouse and keyboard input must pass
+    // straight through so the user can keep working in every app underneath.
+    // This has to run after `show()`: the request needs a realized window, which
+    // GTK only creates when the window is mapped. Re-applying it on every wake is
+    // harmless — the flag is idempotent, and the overlay may have been hidden and
+    // shown again since it was last set.
+    window
+        .set_ignore_cursor_events(true)
+        .map_err(|error| format!("failed to make presence overlay click-through: {error}"))?;
+
+    let _ = app.emit_to("presence-overlay", "ares:presence-state", snapshot);
+    Ok(())
+}
+
+#[tauri::command]
+fn ares_presence_hide(app: tauri::AppHandle, state: State<PresenceState>) {
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        *snapshot = PresenceSnapshot::default();
+    }
+    if let Some(window) = app.get_webview_window("presence-overlay") {
+        let _ = window.hide();
+    }
+}
+
+/// Open Ares's experimental self-generating UI in its own unprivileged window.
+/// The generated document itself lives in an inert iframe; this outer window
+/// only owns the normal daemon/voice bridge and never exposes extra authority.
+#[tauri::command]
+async fn ares_living_surface_open(
+    app: tauri::AppHandle,
+    session_id: String,
+    state: State<'_, LivingSurfaceState>,
+) -> Result<(), String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("invalid Living Surface session id".to_string());
+    }
+    if let Ok(mut current) = state.session_id.lock() {
+        *current = Some(session_id.to_string());
+    }
+    if let Some(existing) = app.get_webview_window("living-surface") {
+        existing
+            .set_focus()
+            .map_err(|error| format!("failed to focus Living Surface: {error}"))?;
+        return Ok(());
+    }
+    // Keep the asset URL deterministic and transfer the session through
+    // LivingSurfaceState. On Windows this command must stay async: WebView2 can
+    // otherwise create the native window but strand its renderer at about:blank.
+    let webview_url = tauri::WebviewUrl::App("living.html".into());
+    let window = tauri::WebviewWindowBuilder::new(
+        &app,
+        "living-surface",
+        webview_url,
+    )
+    .title("Ares — Living Surface (Beta)")
+    .inner_size(1380.0, 860.0)
+    .min_inner_size(900.0, 620.0)
+    .center()
+    .background_color(tauri::utils::config::Color(5, 6, 5, 255))
+    // Beta safety rail: native close/minimize controls remain available even
+    // if the experimental React surface fails before its trusted chrome mounts.
+    .decorations(true)
+    .shadow(true)
+    .resizable(true)
+    .build()
+    .map_err(|error| format!("failed to open Living Surface: {error}"))?;
+
+    #[cfg(windows)]
+    hide_windows_accent_border(&window);
+    let close_handle = app.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+            let _ = close_handle.emit_to("main", "ares:living-surface-closed", ());
+        }
+    });
+    window
+        .set_focus()
+        .map_err(|error| format!("failed to focus Living Surface: {error}"))?;
+    Ok(())
+}
+
+/// Stage the composed surface document and return the scheme URL the iframe
+/// should load. The sequence number only busts the WebView's navigation cache;
+/// the handler always serves the latest staged document.
+#[tauri::command]
+fn ares_living_surface_stage(
+    document: String,
+    state: State<LivingSurfaceState>,
+) -> Result<String, String> {
+    if document.len() > 600_000 {
+        return Err("surface document exceeds the size limit".to_string());
+    }
+    *state
+        .document
+        .lock()
+        .map_err(|_| "Living Surface document state is unavailable".to_string())? = Some(document);
+    let seq = state.doc_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    // Windows and Android serve custom schemes over http://<scheme>.localhost.
+    #[cfg(any(windows, target_os = "android"))]
+    return Ok(format!("http://ares-surface.localhost/doc/{seq}"));
+    #[cfg(not(any(windows, target_os = "android")))]
+    Ok(format!("ares-surface://localhost/doc/{seq}"))
+}
+
+#[tauri::command]
+fn ares_living_surface_context(state: State<LivingSurfaceState>) -> Result<String, String> {
+    state
+        .session_id
+        .lock()
+        .map_err(|_| "Living Surface session state is unavailable".to_string())?
+        .clone()
+        .ok_or_else(|| "Living Surface session has not been initialized".to_string())
+}
+
+#[tauri::command]
+fn ares_living_surface_close(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("living-surface") {
+        window
+            .close()
+            .map_err(|error| format!("failed to close Living Surface: {error}"))?;
+    }
+    let _ = app.emit_to("main", "ares:living-surface-closed", ());
+    Ok(())
+}
+
+/// Renderer handshake. Classic does not collapse into the pill until this
+/// arrives, so a failed surface bootstrap can never strand the owner.
+#[tauri::command]
+fn ares_living_surface_ready(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("missing Living Surface session id".to_string());
+    }
+    app.emit_to(
+        "main",
+        "ares:living-surface-ready",
+        json!({ "sessionId": session_id }),
+    )
+    .map_err(|error| format!("failed to acknowledge Living Surface: {error}"))
 }
 
 fn main() {
@@ -892,7 +1826,47 @@ fn main() {
             generation: Arc::new(AtomicU64::new(0)),
         })
         .manage(VoiceState {
-            child: Mutex::new(None),
+            child: Arc::new(Mutex::new(None)),
+            phase: Arc::new(Mutex::new(("idle".into(), String::new()))),
+            setup_running: Arc::new(Mutex::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            crash_count: Arc::new(AtomicU64::new(0)),
+            token: random_token(),
+            port: available_loopback_port(),
+        })
+        .manage(PresenceState {
+            snapshot: Mutex::new(PresenceSnapshot::default()),
+        })
+        .manage(LivingSurfaceState {
+            session_id: Mutex::new(None),
+            document: Mutex::new(None),
+            doc_seq: AtomicU64::new(0),
+        })
+        // The Living Surface's generated document. Serving it over a dedicated
+        // scheme gives it its OWN Content-Security-Policy header — a srcdoc
+        // iframe would inherit the app CSP and lose every generated style and
+        // script in packaged builds. The window's sandbox attribute (scripts
+        // without same-origin) still applies on top.
+        .register_uri_scheme_protocol("ares-surface", |ctx, _request| {
+            let staged = ctx
+                .app_handle()
+                .state::<LivingSurfaceState>()
+                .document
+                .lock()
+                .ok()
+                .and_then(|doc| doc.clone());
+            match staged {
+                Some(html) => tauri::http::Response::builder()
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .header("Content-Security-Policy", LIVING_SURFACE_CSP)
+                    .header("Cache-Control", "no-store")
+                    .body(html.into_bytes())
+                    .unwrap_or_else(|_| tauri::http::Response::new(Vec::new())),
+                None => tauri::http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap_or_else(|_| tauri::http::Response::new(Vec::new())),
+            }
         })
         .setup(|app| {
             let handle = app.handle().clone();
@@ -900,20 +1874,52 @@ fn main() {
             if let Some(window) = app.get_webview_window("main") {
                 hide_windows_accent_border(&window);
             }
-            // Auto-start the local voice sidecar so spoken replies work out of the box.
-            if let Some(voice) = app.try_state::<VoiceState>() {
-                start_voice_sidecar(&handle, voice.inner());
+            if let Some(window) = app.get_webview_window("main") {
+                clamp_window_to_monitor(&window);
             }
-            app.listen("tauri://close-requested", move |_| {
-                // Reap the daemon AND the Garrison gateway/bridge (stop_existing_daemon
-                // now tree-kills both) so nothing outlives the window.
-                if let Some(state) = handle.try_state::<DaemonState>() {
-                    let _ = stop_existing_daemon(state.inner());
-                }
-                if let Some(voice) = handle.try_state::<VoiceState>() {
-                    stop_voice_sidecar(voice.inner());
-                }
-            });
+            // Warm the transparent voice-presence surface while hidden. Its
+            // first listening pulse can then appear instantly without a WebView
+            // boot flash over the user's desktop.
+            let _ = presence_window(app.handle());
+            // Auto-start the local voice sidecar so spoken replies work out of
+            // the box — provisioning the Python venv + deps itself on first
+            // run, and rebuilding a broken venv automatically. The per-launch
+            // auth token goes into our env so the spawned sidecar inherits it
+            // and the webview can read it back via ares_voice_status.
+            if let Some(voice) = app.try_state::<VoiceState>() {
+                env::set_var("ARES_VOICE_TOKEN", &voice.token);
+                ensure_voice_ready(&handle, voice.inner(), false);
+            }
+            // Only the MAIN window owns app shutdown. A global
+            // `tauri://close-requested` listener also fires for the transparent
+            // presence surface; closing/recreating that helper window used to
+            // kill voice while the visible Ares window stayed open.
+            if let Some(main) = app.get_webview_window("main") {
+                let close_handle = handle.clone();
+                let chrome_window = main.clone();
+                main.on_window_event(move |event| {
+                    // Windows can restore its active-window accent after focus
+                    // or a resize (including pill mode). Reassert the frameless
+                    // chrome on every focus transition so no green top strip
+                    // flashes when Ares is clicked.
+                    #[cfg(windows)]
+                    if matches!(event, tauri::WindowEvent::Focused(_)) {
+                        hide_windows_accent_border(&chrome_window);
+                    }
+                    if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                        if let Some(state) = close_handle.try_state::<DaemonState>() {
+                            let _ = stop_existing_daemon(state.inner());
+                        }
+                        if let Some(voice) = close_handle.try_state::<VoiceState>() {
+                            stop_voice_sidecar(voice.inner());
+                        }
+                        if let Some(overlay) = close_handle.get_webview_window("presence-overlay") {
+                            let _ = overlay.close();
+                        }
+                        close_handle.exit(0);
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -934,6 +1940,7 @@ fn main() {
             ares_set_provider_key,
             ares_daemon_command,
             ares_open_url,
+            ares_open_path,
             ares_permission_response,
             ares_forge_write,
             ares_export_log,
@@ -941,7 +1948,17 @@ fn main() {
             ares_stop_daemon,
             ares_window_minimize,
             ares_window_toggle_maximize,
-            ares_window_close
+            ares_window_close,
+            ares_voice_status,
+            ares_voice_setup,
+            ares_presence_status,
+            ares_presence_update,
+            ares_presence_hide,
+            ares_living_surface_open,
+            ares_living_surface_close,
+            ares_living_surface_ready,
+            ares_living_surface_context,
+            ares_living_surface_stage
         ])
         .build(tauri::generate_context!())
         .expect("error while building Ares Tauri app")
@@ -965,20 +1982,41 @@ fn main() {
 #[cfg(windows)]
 fn hide_windows_accent_border(window: &tauri::WebviewWindow) {
     if let Ok(hwnd) = window.hwnd() {
-        let color = DWMWA_COLOR_NONE;
-        // Suppress BOTH the window border and the top caption edge. On Win11 a
-        // frameless + transparent window otherwise bleeds the system accent
-        // colour as a line across the very top — clearing only the border
-        // leaves that top sliver, so we clear the caption colour too.
-        for attr in [DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR] {
-            unsafe {
-                let _ = DwmSetWindowAttribute(
-                    hwnd.0 as _,
-                    attr as u32,
-                    &color as *const _ as *const core::ffi::c_void,
-                    std::mem::size_of_val(&color) as u32,
-                );
-            }
+        // Suppress the top caption edge. On Win11 a frameless window otherwise
+        // bleeds the system accent colour as a line across the very top.
+        let caption = DWMWA_COLOR_NONE;
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd.0 as _,
+                DWMWA_CAPTION_COLOR as u32,
+                &caption as *const _ as *const core::ffi::c_void,
+                std::mem::size_of_val(&caption) as u32,
+            );
+        }
+        // The border gets an explicit near-black rather than NONE: with no
+        // border at all the razor-edged window visually fused with whatever
+        // sat behind it, reading as Ares "hiding" the other app's controls
+        // (field report, 2026-08-10). COLORREF is 0x00BBGGRR.
+        let border: u32 = 0x000d_0c12;
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd.0 as _,
+                DWMWA_BORDER_COLOR as u32,
+                &border as *const _ as *const core::ffi::c_void,
+                std::mem::size_of_val(&border) as u32,
+            );
+        }
+        // Native Win11 rounded corners. decorations:false loses the system
+        // rounding, shipping a sharp rectangle; DWM clips the window back to
+        // the standard rounded shape (harmless no-op on Win10).
+        let corner: i32 = DWMWCP_ROUND;
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd.0 as _,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                &corner as *const _ as *const core::ffi::c_void,
+                std::mem::size_of_val(&corner) as u32,
+            );
         }
     }
 }
@@ -1042,11 +2080,23 @@ fn push_event_parts(
 ) {
     let seq = next_event_seq.fetch_add(1, Ordering::SeqCst);
     let buffered = BufferedEvent { seq, event };
-    if let Ok(mut buffer) = events.lock() {
-        buffer.push(buffered.clone());
-        let extra = buffer.len().saturating_sub(1200);
-        if extra > 0 {
-            buffer.drain(0..extra);
+    // Live browser frames are transient telemetry: replaying a stale frame
+    // after a reconnect is useless, and each one carries a fat base64 JPEG —
+    // buffering them pinned hundreds of MB in Ares.exe during long automation
+    // runs (the buffer caps by COUNT, not bytes). Emit live, never buffer.
+    let is_transient_frame = buffered
+        .event
+        .get("data")
+        .and_then(|data| data.get("kind"))
+        .and_then(|kind| kind.as_str())
+        == Some("browser_frame");
+    if !is_transient_frame {
+        if let Ok(mut buffer) = events.lock() {
+            buffer.push(buffered.clone());
+            let extra = buffer.len().saturating_sub(1200);
+            if extra > 0 {
+                buffer.drain(0..extra);
+            }
         }
     }
     // The webview listens ONLY to ares:event-buffered (seq carries ordering +
@@ -1777,7 +2827,7 @@ fn resolve_ares_runtime(app: Option<&tauri::AppHandle>) -> Option<AresRuntime> {
     None
 }
 
-fn bundled_runtime(app: &tauri::AppHandle) -> Option<AresRuntime> {
+fn bundled_runtime_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
         push_runtime_candidates(&mut candidates, resource_dir);
@@ -1787,16 +2837,24 @@ fn bundled_runtime(app: &tauri::AppHandle) -> Option<AresRuntime> {
             push_runtime_candidates(&mut candidates, parent.to_path_buf());
         }
     }
-
     let mut seen = HashSet::new();
-    for root in candidates {
-        if seen.insert(root.clone()) {
-            if let Some(runtime) = runtime_at(&root) {
-                return Some(runtime);
-            }
-        }
-    }
-    None
+    candidates.retain(|root| seen.insert(root.clone()));
+    candidates
+}
+
+fn bundled_runtime(app: &tauri::AppHandle) -> Option<AresRuntime> {
+    bundled_runtime_candidates(app)
+        .iter()
+        .find_map(|root| runtime_at(root))
+}
+
+/// The first runtime layout that is PRESENT but unusable, described. Resolution
+/// itself stays a plain Option — this exists only so a dead daemon can say why
+/// instead of leaving every button inert with a bare error.
+fn bundled_runtime_defect(app: &tauri::AppHandle) -> Option<String> {
+    bundled_runtime_candidates(app)
+        .iter()
+        .find_map(|root| runtime_defect(root))
 }
 
 fn push_runtime_candidates(candidates: &mut Vec<PathBuf>, root: PathBuf) {
@@ -1819,13 +2877,39 @@ fn simplify_path(path: &Path) -> PathBuf {
     }
 }
 
+/// A present-but-EMPTY file is worse than a missing one: `exists()` passes,
+/// Node runs the empty module, exits 0, and the daemon is dead with no
+/// diagnostic — every UI button that talks to it goes inert. The packaging
+/// script already refuses to emit zero-byte artifacts
+/// (scripts/package-tauri-runtime.mjs); the probe that consumes them has to
+/// hold the same line, or a truncated download becomes a silent brick.
+fn is_usable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false)
+}
+
+fn runtime_defect(root: &Path) -> Option<String> {
+    let root = simplify_path(root);
+    let cli = root.join("cli").join("ares-cli.mjs");
+    let node = root
+        .join("bin")
+        .join(if cfg!(windows) { "node.exe" } else { "node" });
+    for (label, path) in [("CLI entrypoint", &cli), ("bundled Node", &node)] {
+        if path.exists() && !is_usable_file(path) {
+            return Some(format!("{label} at {} is present but empty", path.display()));
+        }
+    }
+    None
+}
+
 fn runtime_at(root: &Path) -> Option<AresRuntime> {
     let root = simplify_path(root);
     let cli = root.join("cli").join("ares-cli.mjs");
     let node = root
         .join("bin")
         .join(if cfg!(windows) { "node.exe" } else { "node" });
-    if cli.exists() && node.exists() {
+    if is_usable_file(&cli) && is_usable_file(&node) {
         return Some(AresRuntime {
             app_root: root.to_path_buf(),
             cli_entry: cli,
@@ -1842,7 +2926,9 @@ fn cli_in_root(root: &Path) -> Option<AresRuntime> {
         .join("cli")
         .join("dist")
         .join("entry.js");
-    if cli.exists() {
+    // Same rule as the bundled probe: a zero-byte entry.js is a failed build,
+    // not a runtime.
+    if is_usable_file(&cli) {
         Some(AresRuntime {
             app_root: root.to_path_buf(),
             cli_entry: cli,
@@ -1865,13 +2951,128 @@ fn desktop_workspace_dir() -> PathBuf {
         .join("Ares Workspace")
 }
 
+/// The Ares home — `~/.ares`, the SAME vault the CLI uses.
+///
+/// This used to resolve `<config dir>/Ares/home` while the CLI resolved
+/// `~/.ares` (packages/mind/src/paths.ts). They agreed only when ARES_HOME was
+/// set, which meant that on a default install the terminal and the desktop were
+/// two agents over two vaults — different sessions, different memory, different
+/// encrypted keys — while the README promised "the same agent over the same
+/// encrypted ~/.ares vault". This is not a Linux quirk; the same split existed
+/// on Windows between %APPDATA%\Ares\home and %USERPROFILE%\.ares.
+///
+/// Reported as B6 of #5 by @BNHR-dev.
 fn desktop_ares_home() -> Option<PathBuf> {
     if let Ok(value) = env::var("ARES_HOME") {
         return Some(PathBuf::from(value));
     }
+    user_home_dir().map(|home| home.join(".ares"))
+}
+
+/// Where the desktop kept its vault before the split was closed.
+fn legacy_desktop_ares_home() -> Option<PathBuf> {
     user_config_dir()
         .or_else(|| user_home_dir().map(|home| home.join(".config")))
         .map(|dir| dir.join("Ares").join("home"))
+}
+
+/// Dropped in the legacy vault once its contents have been adopted, so a
+/// migration that could not move the directory itself still runs exactly once.
+const VAULT_MIGRATED_MARKER: &str = ".migrated-to-ares-home";
+
+/// What convergence should do, decided purely from the state of the two
+/// directories. Split out from the IO so the rules can be tested directly —
+/// this code moves someone's sessions and keys, and "probably right" is not a
+/// standard that applies to it.
+#[derive(Debug, PartialEq, Eq)]
+enum VaultPlan {
+    /// Nothing to do: an explicit ARES_HOME, or no legacy state to adopt.
+    Nothing,
+    /// The legacy vault holds the only state — adopt it at the documented path.
+    Adopt,
+    /// BOTH hold state. Never merge: use the documented vault and say so
+    /// loudly, leaving the legacy one untouched on disk.
+    Conflict,
+}
+
+fn plan_vault_convergence(explicit_home: bool, legacy_populated: bool, current_populated: bool) -> VaultPlan {
+    if explicit_home || !legacy_populated {
+        return VaultPlan::Nothing;
+    }
+    if current_populated {
+        VaultPlan::Conflict
+    } else {
+        VaultPlan::Adopt
+    }
+}
+
+fn dir_is_populated(path: &Path) -> bool {
+    fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run the one-time convergence. Returns a note worth logging when anything
+/// happened. Never deletes: the worst outcome is a duplicate on disk, which is
+/// recoverable, unlike the alternative.
+fn converge_desktop_vault() -> Option<String> {
+    if env::var_os("ARES_HOME").is_some() {
+        return None;
+    }
+    let current = desktop_ares_home()?;
+    let legacy = legacy_desktop_ares_home()?;
+    if current == legacy || legacy.join(VAULT_MIGRATED_MARKER).exists() {
+        return None;
+    }
+    match plan_vault_convergence(false, dir_is_populated(&legacy), dir_is_populated(&current)) {
+        VaultPlan::Nothing => None,
+        VaultPlan::Conflict => Some(format!(
+            "Ares now uses {} (the same vault as the terminal). Your older desktop-only state is still at {} — nothing was merged or deleted; move anything you want by hand.",
+            current.display(),
+            legacy.display(),
+        )),
+        VaultPlan::Adopt => {
+            // A rename is atomic and duplicates nothing; it only fails when the
+            // two paths sit on different filesystems, and then a copy is the
+            // honest fallback.
+            if let Some(parent) = current.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::rename(&legacy, &current).is_ok() {
+                return Some(format!("Moved the desktop vault to {} — the terminal and the app now share one home.", current.display()));
+            }
+            match copy_dir_all(&legacy, &current) {
+                Ok(()) => {
+                    let _ = fs::write(legacy.join(VAULT_MIGRATED_MARKER), current.display().to_string());
+                    Some(format!(
+                        "Copied the desktop vault to {} — the terminal and the app now share one home. The original is still at {}.",
+                        current.display(),
+                        legacy.display(),
+                    ))
+                }
+                Err(error) => Some(format!(
+                    "Could not move the desktop vault from {} to {}: {error}. Ares is using {} — your older state is untouched.",
+                    legacy.display(),
+                    current.display(),
+                    current.display(),
+                )),
+            }
+        }
+    }
 }
 
 fn desktop_ares_home_string() -> String {
@@ -1881,8 +3082,76 @@ fn desktop_ares_home_string() -> String {
         .to_string()
 }
 
+/// The user's desktop directory.
+///
+/// On Windows and macOS this is `~/Desktop`. On Linux the folder is localized —
+/// `~/Bureau` on a French session, `~/Escritorio` on a Spanish one — and the
+/// authoritative answer is XDG's `XDG_DESKTOP_DIR`, the same thing
+/// `xdg-user-dir DESKTOP` reads.
+///
+/// A hardcoded `~/Desktop` is not merely a missed lookup here:
+/// `desktop_workspace_dir()` creates what this returns, so on a localized
+/// session it plants an English `Desktop/Ares Workspace` beside the real
+/// desktop, and the workspace the user sees in the UI is not the folder they
+/// can find. `ares_export_log` fails the other way — it filters on `is_dir()`,
+/// so the exported log silently lands in the Ares home instead.
 fn user_desktop_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = xdg_desktop_dir() {
+        return Some(dir);
+    }
     user_home_dir().map(|home| home.join("Desktop"))
+}
+
+/// Resolve `XDG_DESKTOP_DIR` the way xdg-user-dir does: an exported variable
+/// wins, otherwise the assignment in `~/.config/user-dirs.dirs`, whose lines
+/// look like `XDG_DESKTOP_DIR="$HOME/Bureau"`. That file is *sourced* by the
+/// shell, so a later assignment overrides an earlier one — hence last match
+/// wins, not first.
+#[cfg(target_os = "linux")]
+fn xdg_desktop_dir() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("XDG_DESKTOP_DIR") {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    let home = user_home_dir()?;
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let text = fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
+    parse_xdg_desktop_dir(&text, &home)
+}
+
+/// Split out from the file read so the quoting and `$HOME` cases are testable
+/// without touching a real `user-dirs.dirs`.
+#[cfg(target_os = "linux")]
+fn parse_xdg_desktop_dir(text: &str, home: &Path) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    for line in text.lines() {
+        // A commented-out assignment starts with '#', so it never matches.
+        let Some(value) = line.trim().strip_prefix("XDG_DESKTOP_DIR=") else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        // The spec's generator only ever writes literal absolute paths or a
+        // $HOME prefix; no general shell expansion is attempted.
+        let expanded = match value {
+            "$HOME" | "${HOME}" => home.to_path_buf(),
+            _ => match value
+                .strip_prefix("$HOME/")
+                .or_else(|| value.strip_prefix("${HOME}/"))
+            {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(value),
+            },
+        };
+        if expanded.is_absolute() {
+            found = Some(expanded);
+        }
+    }
+    found
 }
 
 fn user_config_dir() -> Option<PathBuf> {
@@ -1899,4 +3168,113 @@ fn user_config_dir() -> Option<PathBuf> {
             home.join(".config")
         }
     })
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::{copy_dir_all, plan_vault_convergence, VaultPlan};
+    use std::fs;
+
+    #[test]
+    fn an_explicit_home_is_never_second_guessed() {
+        // Someone who sets ARES_HOME has said where the vault is. Moving
+        // anything under them would be the tool overruling an explicit choice.
+        assert_eq!(plan_vault_convergence(true, true, false), VaultPlan::Nothing);
+        assert_eq!(plan_vault_convergence(true, true, true), VaultPlan::Nothing);
+    }
+
+    #[test]
+    fn nothing_to_adopt_is_nothing_to_do() {
+        assert_eq!(plan_vault_convergence(false, false, false), VaultPlan::Nothing);
+        assert_eq!(plan_vault_convergence(false, false, true), VaultPlan::Nothing);
+    }
+
+    #[test]
+    fn a_desktop_only_install_adopts_its_vault() {
+        assert_eq!(plan_vault_convergence(false, true, false), VaultPlan::Adopt);
+    }
+
+    #[test]
+    fn two_populated_vaults_are_never_merged() {
+        // The one case that could destroy something. Both hold real sessions
+        // and keys; picking a winner per-file is a guess, and a guess here
+        // costs someone their history.
+        assert_eq!(plan_vault_convergence(false, true, true), VaultPlan::Conflict);
+    }
+
+    #[test]
+    fn copying_a_vault_preserves_nested_contents() {
+        let root = std::env::temp_dir().join(format!("ares-vault-copy-{}", std::process::id()));
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(from.join("mind")).unwrap();
+        fs::write(from.join("ui.json"), "{}").unwrap();
+        fs::write(from.join("mind").join("memory.jsonl"), "{\"a\":1}\n").unwrap();
+
+        copy_dir_all(&from, &to).unwrap();
+
+        assert_eq!(fs::read_to_string(to.join("ui.json")).unwrap(), "{}");
+        assert_eq!(fs::read_to_string(to.join("mind").join("memory.jsonl")).unwrap(), "{\"a\":1}\n");
+        assert!(from.join("ui.json").exists(), "the source is never removed by a copy");
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::parse_xdg_desktop_dir;
+    use std::path::{Path, PathBuf};
+
+    fn home() -> &'static Path {
+        Path::new("/home/tester")
+    }
+
+    #[test]
+    fn reads_a_localized_desktop_from_a_home_relative_assignment() {
+        // The shape `xdg-user-dirs-update` actually writes on a French session.
+        let text = "# This file is written by xdg-user-dirs-update\n\
+                    XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n\
+                    XDG_DESKTOP_DIR=\"$HOME/Bureau\"\n";
+        assert_eq!(
+            parse_xdg_desktop_dir(text, home()),
+            Some(PathBuf::from("/home/tester/Bureau"))
+        );
+    }
+
+    #[test]
+    fn accepts_a_literal_absolute_path_and_the_braced_home_form() {
+        assert_eq!(
+            parse_xdg_desktop_dir("XDG_DESKTOP_DIR=\"/srv/desks/tester\"\n", home()),
+            Some(PathBuf::from("/srv/desks/tester"))
+        );
+        assert_eq!(
+            parse_xdg_desktop_dir("XDG_DESKTOP_DIR=\"${HOME}/Escritorio\"\n", home()),
+            Some(PathBuf::from("/home/tester/Escritorio"))
+        );
+    }
+
+    #[test]
+    fn ignores_commented_and_unrelated_assignments() {
+        let text = "#XDG_DESKTOP_DIR=\"$HOME/Commented\"\n\
+                    XDG_DOWNLOAD_DIR=\"$HOME/Téléchargements\"\n";
+        assert_eq!(parse_xdg_desktop_dir(text, home()), None);
+    }
+
+    #[test]
+    fn a_later_assignment_wins_because_the_file_is_sourced() {
+        let text = "XDG_DESKTOP_DIR=\"$HOME/First\"\n\
+                    XDG_DESKTOP_DIR=\"$HOME/Second\"\n";
+        assert_eq!(
+            parse_xdg_desktop_dir(text, home()),
+            Some(PathBuf::from("/home/tester/Second"))
+        );
+    }
+
+    #[test]
+    fn a_desktop_disabled_by_an_empty_value_is_not_a_relative_path() {
+        // `XDG_DESKTOP_DIR=""` means "no desktop directory". Expanding that to
+        // an empty relative path and joining it onto anything would be worse
+        // than falling back to ~/Desktop, so it must not resolve.
+        assert_eq!(parse_xdg_desktop_dir("XDG_DESKTOP_DIR=\"\"\n", home()), None);
+    }
 }

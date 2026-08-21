@@ -143,9 +143,10 @@ test("Anthropic compat: parses message_start → content_block_delta → message
   assert.equal(capturedHeaders["anthropic-version"], "2023-06-01");
   assert.equal(capturedHeaders["x-api-key"], "ollama");
 
-  // Stream event sequence
+  // Stream event sequence — message_start surfaces as stream_heartbeat
+  // (pre-first-token liveness for the stall guard).
   const types = got.map((e) => e.type);
-  assert.deepEqual(types, ["text_delta", "text_delta", "message_done"]);
+  assert.deepEqual(types, ["stream_heartbeat", "text_delta", "text_delta", "message_done"]);
   const done = got.at(-1);
   assert.equal(done.message.role, "assistant");
   assert.equal(done.message.content[0].text, "Hello");
@@ -191,6 +192,7 @@ test("Anthropic compat: parses streaming tool_use with input_json_delta", async 
 
   const types = got.map((e) => e.type);
   assert.deepEqual(types, [
+    "stream_heartbeat",
     "tool_use_start",
     "tool_use_input_delta",
     "tool_use_input_delta",

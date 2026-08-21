@@ -26,6 +26,7 @@ function run(answer, store) {
     { command: "echo hi", description: "say hi" },
     {
       workspace: process.cwd(),
+      sessionId: "sess_command_allow_always",
       signal: new AbortController().signal,
       requestPermission: async () => answer,
     },

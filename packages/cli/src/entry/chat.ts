@@ -3,6 +3,7 @@
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
+import { randomUUID } from "node:crypto";
 import { stdin, stdout } from "node:process";
 import { isReasoningLevel, reasoningLabel, REASONING_LEVELS } from "@ares/protocol";
 import { chatHeader, availableThemes, dim, interactiveHelp, notice, promptLabel, providerError, setTheme, themeChanged, themesList, thinkingPrefix, toolEnd, toolError, toolStart } from "../terminalUi.js";
@@ -12,13 +13,13 @@ import { loadUiSettings, updateUiSettings } from "../uiSettings.js";
 import { onLifecycle } from "@ares/agent";
 import { briefingLines, buildBriefing, buildContinuitySummary, buildWorldGraph, checkpointDiffCommand, checkpointsCommand, continuityLines, doctorCommand, loginCommand, rollbackCommand, worldGraphLines } from "./introspect.js";
 import { ProviderSelection, TERMINAL_PROVIDERS, daemonModelCatalog, defaultTerminalModel, providerFamilyForSelection } from "./providers.js";
-import { ParsedArgs, cliRuntimeContext, printHelp } from "./runtime.js";
-import { LiveSession, createSession, createSessionWithSelection, handleReasoningCommand } from "./sessionFactory.js";
+import { ParsedArgs, cliRuntimeContext, printHelp, transitionPermissionMode } from "./runtime.js";
+import { LiveSession, createSession, createSessionWithSelection, guardVisionForTurn, handleReasoningCommand } from "./sessionFactory.js";
 import { promptPermission } from "./permissions.js";
 import type { ToolPermissionRequest } from "@ares/core";
 import type { PermissionPromptDecision } from "@ares/protocol";
 import { applyTerminalAutoRouting, applyTerminalRoutingCommand, checkpointDiffLines, checkpointLines, colorUnifiedDiff, contentFromUserInput, doctorSummaryLines, inkHelpLines, legacyProgressText, persistTerminalModelPreference, printResumed, printSessions, requireResumeSessionId, resolveResumeSessionId, resumedLines, rollbackLines, saveTheme, sessionsLines, setTerminalProviderKey, switchTerminalModel, terminalKeyLines, terminalModelCatalogLines, terminalSettingsLines, themeLines, undoLines, usageMeter } from "./terminalLines.js";
-import { finishTurn, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
+import { disposeLiveSession, finishTurn, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
 
 export async function runCommand(args: ParsedArgs): Promise<number> {
   const goal = args.flags.get("goal");
@@ -48,8 +49,10 @@ export async function runCommand(args: ParsedArgs): Promise<number> {
   });
   await prepareUserTurn(live, goal);
   let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-  for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
-    if (event.type === "tool_end" && event.touchedFiles?.length) {
+  const turnContent = await contentFromUserInput(goal, live.context.workspace);
+  guardVisionForTurn(live, turnContent);
+  for await (const event of live.session.sendContent(turnContent)) {
+    if ((event.type === "tool_end" || event.type === "tool_error") && event.touchedFiles?.length) {
       live.verifier.scheduleFor(event.touchedFiles);
     }
     if (event.type === "turn_end") finalStatus = event.status;
@@ -59,8 +62,7 @@ export async function runCommand(args: ParsedArgs): Promise<number> {
   // before the post-turn / session-end hooks fire any additional lifecycle events.
   unsubLifecycle();
   await finishTurn(live, finalStatus);
-  await live.agentRuntime?.sessionEnded();
-  live.agentRuntime?.stop();
+  await disposeLiveSession(live);
   return 0;
 }
 
@@ -108,11 +110,16 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
   // question nobody can see. The TUI registers an in-frame card handler here;
   // until (or unless) it does, fall back to the classic prompt.
   let inkPermissionHandler:
-    | ((req: { toolName: string; reason: string; suggestion?: string }) => Promise<PermissionPromptDecision>)
+    | ((req: { toolName: string; reason: string; suggestion?: string; signal?: AbortSignal }) => Promise<PermissionPromptDecision>)
     | null = null;
   const requestPermission = (req: ToolPermissionRequest): Promise<PermissionPromptDecision> =>
     inkPermissionHandler
-      ? inkPermissionHandler({ toolName: req.toolName, reason: req.reason, suggestion: req.suggestion })
+      ? inkPermissionHandler({
+          toolName: req.toolName,
+          reason: req.reason,
+          suggestion: req.suggestion,
+          signal: req.signal,
+        })
       : promptPermission(req);
 
   let live: LiveSession;
@@ -144,20 +151,34 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
         inkPermissionHandler = handler;
       },
       steer: (text) => {
-        // Same contract as the daemon's steer verb: course-correct the LIVE
-        // turn without restarting it (drained after the current tool round).
-        live.queueSystemReminder(
-          `The user STEERED mid-task: "${text}". Adjust course to honor this, but keep your current objective and everything you've already done — do not restart.`,
-          "instructions",
-        );
+        // A steer is a real durable user input, not an in-memory reminder. Start
+        // the generator so admission crosses SQLite + JSONL immediately; the
+        // active QueryEngine claims it only at a settled model/tool boundary.
+        // Its stable ID makes a crash/reconnect replay idempotent.
+        const correction = text.trim();
+        if (!correction) return;
+        const inputId = `steer_${randomUUID()}`;
+        void (async () => {
+          for await (const _event of live.session.sendContent(
+            [{ type: "text", text: correction }],
+            { inputId, delivery: "steer" },
+          )) {
+            // The already-active turn owns visible output. This generator only
+            // waits for durable acknowledgement of the correction.
+          }
+        })().catch((error) => {
+          process.stderr.write(`steer admission failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        });
       },
       sendMessage: async (goal, onEvent) => {
         await pendingFinish;
         await applyTerminalAutoRouting(live, goal);
         await prepareUserTurn(live, goal);
         let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-        for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
-          if (event.type === "tool_end" && event.touchedFiles?.length) {
+        const turnContent = await contentFromUserInput(goal, live.context.workspace);
+        guardVisionForTurn(live, turnContent);
+        for await (const event of live.session.sendContent(turnContent)) {
+          if ((event.type === "tool_end" || event.type === "tool_error") && event.touchedFiles?.length) {
             live.verifier.scheduleFor(event.touchedFiles);
           }
           if (event.type === "turn_end") finalStatus = event.status;
@@ -168,9 +189,8 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
       handleCommand: async (line): Promise<InkCommandResult> => {
         if (line === "/exit" || line === "/quit") {
           await pendingFinish; // don't lose detached post-turn bookkeeping on exit
-          await live.agentRuntime?.sessionEnded();
+          await disposeLiveSession(live);
           await mindSessionEnded();
-          live.agentRuntime?.stop();
           return { kind: "exit" };
         }
         if (line === "/help") return { kind: "handled", lines: inkHelpLines(), snapshot: snapshot() };
@@ -211,17 +231,20 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
         if (line === "/themes") return { kind: "handled", lines: themeLines(), snapshot: snapshot() };
         if (line === "/sessions") return { kind: "handled", lines: await sessionsLines(20, live.context), snapshot: snapshot() };
         if (line === "/plan") {
-          live.runtime.permissionMode = "plan";
+          await transitionPermissionMode(live.runtime, "plan");
           await updateUiSettings({ dangerousBypass: false });
           return { kind: "handled", lines: ["Plan mode enabled. Writes are blocked."], snapshot: snapshot() };
         }
         if (line === "/code" || line === "/exitplan") {
-          live.runtime.permissionMode = "workspace-write";
+          await transitionPermissionMode(live.runtime, "workspace-write");
           await updateUiSettings({ dangerousBypass: false });
           return { kind: "handled", lines: ["Workspace-write mode restored."], snapshot: snapshot() };
         }
         if (line === "/danger" || line === "/bypass") {
-          live.runtime.permissionMode = live.runtime.permissionMode === "bypass" ? "workspace-write" : "bypass";
+          await transitionPermissionMode(
+            live.runtime,
+            live.runtime.permissionMode === "bypass" ? "workspace-write" : "bypass",
+          );
           await updateUiSettings({ dangerousBypass: live.runtime.permissionMode === "bypass" });
           return {
             kind: "handled",
@@ -256,7 +279,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
         if (line === "/resume" || line.startsWith("/resume ")) {
           const target = line.split(/\s+/, 2)[1] ?? "last";
           const sessionId = await requireResumeSessionId(target, live.context);
-          live.agentRuntime?.stop();
+          await disposeLiveSession(live);
           live = await createSessionWithSelection(args, live.selection, sessionId, requestPermission);
           return { kind: "handled", lines: live.resumed ? resumedLines(live.resumed) : [`Resumed ${sessionId}`], snapshot: snapshot() };
         }
@@ -265,7 +288,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
           const next = path.resolve(live.context.workspace, target);
           const info = await stat(next).catch(() => null);
           if (!info?.isDirectory()) return { kind: "handled", lines: [`Not a directory: ${next}`], snapshot: snapshot() };
-          live.agentRuntime?.stop();
+          await disposeLiveSession(live);
           process.chdir(next);
           live = await createSessionWithSelection(args, live.selection, undefined, requestPermission);
           return { kind: "handled", lines: [`Active workspace is now ${live.context.workspace}`], snapshot: snapshot() };
@@ -306,8 +329,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
     const line = (await askLine(promptLabel(live.selection.model, live.context.workspace, live.runtime.permissionMode))).trim();
     if (!line) continue;
     if (line === "/exit" || line === "exit" || line === "/quit" || line === "quit") {
-      await live.agentRuntime?.sessionEnded();
-      live.agentRuntime?.stop();
+      await disposeLiveSession(live);
       process.stdout.write("bye\n");
       return 0;
     }
@@ -409,19 +431,22 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
       continue;
     }
     if (line === "/plan") {
-      live.runtime.permissionMode = "plan";
+      await transitionPermissionMode(live.runtime, "plan");
       await updateUiSettings({ dangerousBypass: false });
       process.stdout.write(notice("Plan Mode", ["Writes are blocked. Use /code to return to workspace-write mode."], "warn"));
       continue;
     }
     if (line === "/code" || line === "/exitplan") {
-      live.runtime.permissionMode = "workspace-write";
+      await transitionPermissionMode(live.runtime, "workspace-write");
       await updateUiSettings({ dangerousBypass: false });
       process.stdout.write(notice("Plan Mode", ["Workspace-write mode restored."], "success"));
       continue;
     }
     if (line === "/danger" || line === "/bypass") {
-      live.runtime.permissionMode = live.runtime.permissionMode === "bypass" ? "workspace-write" : "bypass";
+      await transitionPermissionMode(
+        live.runtime,
+        live.runtime.permissionMode === "bypass" ? "workspace-write" : "bypass",
+      );
       await updateUiSettings({ dangerousBypass: live.runtime.permissionMode === "bypass" });
       process.stdout.write(
         notice(
@@ -456,7 +481,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
       const target = line.split(/\s+/, 2)[1] ?? "last";
       try {
         const sessionId = await requireResumeSessionId(target, live.context);
-        live.agentRuntime?.stop();
+        await disposeLiveSession(live);
         live = await createSessionWithSelection(args, live.selection, sessionId);
         if (live.resumed) printResumed(live.resumed);
       } catch (err) {
@@ -481,7 +506,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
     }
     if (line.startsWith("/workspace ")) {
       const target = line.slice("/workspace ".length).trim();
-      live.agentRuntime?.stop();
+      await disposeLiveSession(live);
       live = await switchWorkspace(args, live.selection, target);
       continue;
     }
@@ -523,7 +548,9 @@ async function renderTurn(live: LiveSession, goal: string): Promise<void> {
   let wroteText = false;
   let wroteThinking = false;
   let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-  for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
+  const turnContent = await contentFromUserInput(goal, live.context.workspace);
+  guardVisionForTurn(live, turnContent);
+  for await (const event of live.session.sendContent(turnContent)) {
     if (event.type === "text_delta") {
       if (wroteThinking) {
         process.stderr.write("\n");
@@ -572,6 +599,7 @@ async function renderTurn(live: LiveSession, goal: string): Promise<void> {
       continue;
     }
     if (event.type === "tool_error") {
+      if (event.touchedFiles?.length) live.verifier.scheduleFor(event.touchedFiles);
       process.stderr.write(toolError(event));
       continue;
     }
@@ -585,6 +613,13 @@ async function renderTurn(live: LiveSession, goal: string): Promise<void> {
       if (wroteText) process.stdout.write("\n");
       if (event.status !== "completed") {
         process.stderr.write(notice("Turn", [`status ${event.status}`], "warn"));
+      }
+      if (event.workStatus === "unverified" || event.workStatus === "blocked") {
+        process.stderr.write(notice("Work", [
+          event.workStatus === "blocked"
+            ? "BLOCKED — verification checks still failing"
+            : "UNVERIFIED — changes lack a passing post-change verification",
+        ], "warn"));
       }
       process.stderr.write(dim(usageMeter(event.usage, event.durationMs)) + "\n");
       await finishTurn(live, finalStatus);

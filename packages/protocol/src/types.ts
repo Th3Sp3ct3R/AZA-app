@@ -106,6 +106,10 @@ export type StreamEvent =
   | { type: "tool_use_input_delta"; id: string; deltaJson: string }
   | { type: "tool_use_input_done"; id: string; input: unknown }
   | { type: "message_done"; message: Message; usage: Usage; stopReason: StopReason }
+  // Wire keepalive (SSE ping / message_start): proof the provider is alive
+  // before its first token. The stall guard consumes these to arm its idle
+  // timer; they carry no content and never reach turn consumers.
+  | { type: "stream_heartbeat" }
   | { type: "error"; error: StreamError };
 
 export type StopReason =
@@ -120,11 +124,65 @@ export type StopReason =
 
 export type TurnEvent =
   | StreamEvent
+  | {
+      /**
+       * Durable admission record written before provider, recall, or tool work.
+       * `inputId` is an idempotency key: reconnecting clients may safely submit
+       * the same input again without creating a second logical request.
+       */
+      type: "input_admitted";
+      inputId: string;
+      sessionId: string;
+      delivery: "queue" | "steer";
+      userMessage: Message;
+    }
   | { type: "turn_start"; turnId: string; sessionId: string; userMessage: Message }
+  | {
+      /** A disposable provider attempt has begun. Surfaces may remember their
+       * transcript boundary so streamed deltas can be rolled back if a newer
+       * owner correction supersedes this attempt before it settles. */
+      type: "provider_attempt_started";
+      attemptId: string;
+    }
+  | {
+      /** The named provider attempt was intentionally abandoned. Its streamed
+       * deltas/tool drafts are not canonical history and must not be presented
+       * as part of the replacement response. */
+      type: "provider_attempt_superseded";
+      attemptId: string;
+      reason: "steering";
+    }
+  | {
+      /** The assistant message already committed, but steering arrived before
+       * its proposed effects began. Surfaces remove only these never-started
+       * tool drafts; the committed assistant message remains canonical. */
+      type: "provider_attempt_effects_skipped";
+      attemptId: string;
+      reason: "steering";
+      toolUseIds: string[];
+    }
+  | {
+      /** Post-durability steering truth. Session emits this only after the
+       * canonical input admission has flushed and QueryEngine has decided the
+       * actual live boundary at which the correction will take effect. */
+      type: "steer_routed";
+      inputId: string;
+      disposition: "provider_preempting" | "effect_settling" | "boundary_pending" | "idle";
+    }
   | { type: "tool_start"; id: string; name: string; input: unknown; providerHint?: ProviderHint; activityDescription: string }
   | { type: "tool_progress"; id: string; data: unknown }
   | { type: "tool_end"; id: string; output: unknown; touchedFiles?: string[]; durationMs: number; display?: string }
-  | { type: "tool_error"; id: string; error: string; durationMs: number }
+  | {
+      type: "tool_error";
+      id: string;
+      error: string;
+      durationMs: number;
+      /** Completed failure diagnostics. Present for declared failures such as
+       * non-zero/timeout shell results; absent when the tool threw. */
+      output?: unknown;
+      /** Files touched before the completed failure was reported. */
+      touchedFiles?: string[];
+    }
   | { type: "permission_request"; id: string; toolName: string; input: unknown; reason: string; suggestion?: PermissionPromptSuggestion }
   | { type: "permission_response"; id: string; decision: PermissionPromptDecision }
   | { type: "verify_scheduled"; files: string[] }
@@ -150,7 +208,11 @@ export type TurnEvent =
       summarizedMessages: number;
       tokensBefore: number;
       tokensAfter: number;
-      method: "summary" | "ledger";
+      /** `micro` preserves every message while replacing only old,
+       * re-derivable tool-result bodies. It is still a durable projection
+       * boundary: restart must hydrate these exact bytes instead of rebuilding
+       * a different context window from the unpruned source messages. */
+      method: "summary" | "ledger" | "micro";
       /** Exact post-compaction history so restart/resume preserves the same memory. */
       messages?: Message[];
     }
@@ -176,6 +238,8 @@ export type TurnEvent =
   | {
       type: "turn_end";
       status: TurnEndStatus;
+      /** Coding/work truth, independent of transport completion. */
+      workStatus?: WorkStatus;
       usage: Usage;
       durationMs: number;
       /** Added by Session persistence for accurate historical attribution. */
@@ -184,6 +248,12 @@ export type TurnEvent =
     };
 
 export type TurnEndStatus = "completed" | "interrupted" | "failed";
+
+/** Outcome of the requested work, separate from transport/execution status.
+ * A turn can execute normally (`completed`) while its code remains red or has
+ * no post-edit proof. Keeping the axes separate prevents provider failover from
+ * treating an ordinary verification failure as a provider outage. */
+export type WorkStatus = "verified" | "unverified" | "blocked" | "not_applicable";
 
 // ─── Tools (schema-side; implementation lives in @ares/tools) ───────────
 
@@ -273,6 +343,9 @@ export interface SessionMeta {
   workspace: string;
   provider: ProviderInfo;
   createdAt: string;
+  /** Canonical conversation authority. `plan` is inspection/discussion only;
+   * `build` is restored only after an explicit approved plan handoff. */
+  workflowMode?: "plan" | "build";
   parentSessionId?: string;
   parentCheckpointId?: string;
   label?: string;

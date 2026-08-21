@@ -1,4 +1,5 @@
 export { aresAgentHome, agentPaths, workspaceToolsPath, type AgentPaths } from "./paths.js";
+export { addLaw, removeLaw, listLaws, lawsPromptBlock, lawsPath, MAX_LAWS, type Law } from "./laws.js";
 export { exists, readTextIfExists, writeFileAtomic, renderTemplate, nonCommentLines } from "./files.js";
 export { readTemplate, type AgentTemplateName } from "./templates.js";
 export { defaultAgentConfig, loadAgentConfig, expandHomePath, type AresAgentConfig, type SlotConfig } from "./config.js";
@@ -11,7 +12,7 @@ export {
   type BootstrapState,
 } from "./bootstrap/bootstrap.js";
 export { VIBE_RULES, vibeRulesMarkdown } from "./bootstrap/vibeRules.js";
-export { loadAgentSystemContext, composeAgentSystemPrompt, resolveAgentName, type AgentSystemContext, type AgentContextBlock } from "./identity/context.js";
+export { loadAgentSystemContext, composeAgentSystemPrompt, resolveAgentName, type AgentSystemContext, type AgentContextBlock, type ComposeOptions } from "./identity/context.js";
 export { embedText, embedOptionsFromConfig, lexicalEmbedding, type EmbedOptions } from "./memory/embed.js";
 export { createMemoryStore, formatRecallReminder, type MemoryStore } from "./memory/vectorStore.js";
 export type { AddMemoryInput, MemoryCategory, MemoryEntry, MemoryStoreStatus, RecallInput, RecallResult, CanonicalMemoryInput } from "./memory/types.js";
@@ -44,12 +45,78 @@ export {
 export { recordCardMemoryOnce, type CardMemoryInput } from "./memory/cardMemory.js";
 export { beforeAgentFinalizeSignal, reviseReflectionSurface, type ReviseSignal } from "./revise.js";
 export { recordToolPattern, proposeSkills, type ToolPatternObservation, type SkillProposal } from "./skills.js";
+export {
+  listPersonas,
+  readPersona,
+  writePersona,
+  deletePersona,
+  matchPersonas,
+  bestPersonaFor,
+  renderPersonaLayer,
+  personaFromMarkdown,
+  personaToMarkdown,
+  parseFrontmatter,
+  personaSlug,
+  rosterPaths,
+  type PersonaDef,
+  type PersonaAutonomy,
+  type PersonaMatch,
+} from "./roster.js";
 export { prepareAresAgent, AresAgentRuntime, type PreparedAgent } from "./runtime.js";
 export { BootstrapTool, type BootstrapToolOutput } from "./tools/Bootstrap.js";
 export { SelfEvolveTool, type SelfEvolveOutput } from "./tools/SelfEvolve.js";
 export { SkillCraftTool, type SkillCraftOutput } from "./tools/SkillCraft.js";
+export { PersonaTool, type PersonaToolOutput } from "./tools/Persona.js";
 export { RunSkillTool, type RunSkillOutput } from "./tools/RunSkill.js";
+export {
+  makeCapabilityTool,
+  type CapabilityEnsureCallback,
+  type CapabilityEnsureOutcome,
+  type CapabilityEnsureRequest,
+  type CapabilityEnsureStatus,
+  type CapabilityProviderView,
+  type CapabilityToolAction,
+  type CapabilityToolInput,
+  type CapabilityToolOptions,
+  type CapabilityToolOutput,
+} from "./tools/Capability.js";
 export { runSkill, type RunSkillOptions, type SkillRunResult } from "./skills/runtime.js";
+export {
+  CAPABILITY_CONTRACT_VERSION,
+  CAPABILITY_MANIFEST_FILE,
+  SKILL_NAME,
+  CapabilityManifestError,
+  canonicalCapabilityManifest,
+  capabilityManifestHash,
+  capabilityManifestSchema,
+  capabilityReceiptSchema,
+  parseCapabilityManifest,
+  parseCapabilityReceipt,
+  readCapabilityManifest,
+  readCapabilityManifestIfPresent,
+  type CapabilityEffect,
+  type CapabilityManifest,
+  type CapabilityOperation,
+  type CapabilityReceipt,
+  type CapabilityScope,
+} from "./skills/manifest.js";
+export {
+  resolveCapabilityProvider,
+  resolveSkill,
+  scanCapabilityRegistry,
+  skillRoots,
+  type CapabilityProvider,
+  type CapabilityRegistryError,
+  type CapabilityRegistrySnapshot,
+  type ResolvedSkill,
+  type SkillRegistryOptions,
+  type SkillRoot,
+} from "./skills/registry.js";
+export { makeSkillHubTool, type SkillHubOutput } from "./tools/SkillHub.js";
+export {
+  skillHubProbe, skillHubList, skillHubGet, skillHubPublish, installHubSkill, readLocalSkillFiles,
+  skillHubBase, type HubSkillMeta, type HubSkillFiles,
+} from "./skills/hub.js";
 export {
   emptyModel,
   loadSelfModel,

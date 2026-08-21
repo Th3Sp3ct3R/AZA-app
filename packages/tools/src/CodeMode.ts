@@ -8,8 +8,10 @@ import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
-import { buildTool, contentHash, resolveWorkspacePath, workspaceRoot } from "./_shared.js";
+import { buildTool, contentHash, mutationInstructionBlock, mutationWorkspaceForPaths, resolveWorkspacePath, workspaceRoot } from "./_shared.js";
 import type { FileReadStamp } from "./_shared.js";
+import { WorkspaceMutationService, workspaceContentHash, type PostMutationFeedback, type WorkspaceMutationOperation } from "@ares/core";
+import { appendMutationFeedback, collectMutationFeedback } from "./postMutationFeedback.js";
 
 // A post-write stamp carries `writtenNotRead` so Read's re-read guard does a real
 // read afterward. Rides as an optional runtime extension (not on the shared type).
@@ -32,6 +34,8 @@ export interface CodeModeOutput {
   result: unknown;
   logs: string[];
   touchedFiles: string[];
+  /** Immediate formatter/type diagnostics, attributed to the committed SHA-256. */
+  feedback?: PostMutationFeedback;
 }
 
 export const CodeModeTool = buildTool({
@@ -39,16 +43,20 @@ export const CodeModeTool = buildTool({
   description:
     "Execute a tiny async JavaScript batch program over workspace helper functions. Use when 5+ repetitive Read/Glob/Grep calls would waste context. Keep code short and return a compact JSON result.",
   safety: "workspace-write",
+  dynamicSafety: (i) => i.allow_writes ? "workspace-write" : "read-only",
   concurrency: "exclusive",
   // Batches can legitimately churn many files — generous cap, not the 60s default.
   watchdogTimeoutMs: 180_000,
   inputZod: inputSchema,
   activityDescription: () => "Running CodeMode batch",
 
-  async call(i, ctx): Promise<{ output: CodeModeOutput; touchedFiles?: string[]; display: string }> {
+  async call(i, ctx): Promise<{ output: CodeModeOutput; failure?: string; touchedFiles?: string[]; display: string }> {
     const root = workspaceRoot(ctx);
     const touched = new Set<string>();
+    const staged = new Map<string, { content: string; original: string | null }>();
+    const pendingWrites: Promise<string>[] = [];
     const logs: string[] = [];
+    let feedback: PostMutationFeedback | undefined;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), i.timeout_ms);
 
@@ -56,11 +64,12 @@ export const CodeModeTool = buildTool({
       workspace: root,
       async read(filePath: string) {
         const resolved = await resolveWorkspacePath(ctx, filePath, "file_path", "read");
-        const text = await fs.readFile(resolved, "utf8");
+        const stagedWrite = staged.get(resolved);
+        const text = stagedWrite?.content ?? await fs.readFile(resolved, "utf8");
         // Record a real read-stamp so a file read via ares.read can be Edited
         // afterward without a redundant Read ("Read X before editing it").
-        const stat = await fs.stat(resolved).catch(() => null);
-        if (stat) {
+        const stat = stagedWrite ? null : await fs.stat(resolved).catch(() => null);
+        if (stat && !stagedWrite) {
           ctx.fileReadStamps.set(resolved, {
             mtimeMs: stat.mtimeMs,
             size: stat.size,
@@ -70,40 +79,40 @@ export const CodeModeTool = buildTool({
         }
         return text;
       },
-      async write(filePath: string, content: string) {
-        if (!i.allow_writes) throw new Error("ares.write requires allow_writes=true");
-        const resolved = await resolveWorkspacePath(ctx, filePath, "file_path", "write");
-        await fs.mkdir(path.dirname(resolved), { recursive: true });
-        const text = String(content);
-        await fs.writeFile(resolved, text, "utf8");
-        touched.add(resolved);
-        // Stamp the write (writtenNotRead) so the hash is current — a later Edit
-        // won't false-positive "modified on disk" — but a whole-file Read still
-        // does a REAL read since the model never saw the post-write file.
-        const stat = await fs.stat(resolved).catch(() => null);
-        if (stat) {
-          const stamp: WrittenStamp = {
-            mtimeMs: stat.mtimeMs,
-            size: stat.size,
-            hash: contentHash(text),
-            lines: text.split("\n").length,
-            writtenNotRead: true,
-          };
-          ctx.fileReadStamps.set(resolved, stamp);
-        }
-        return resolved;
+      write(filePath: string, content: string) {
+        const pending = (async () => {
+          if (!i.allow_writes) throw new Error("ares.write requires allow_writes=true");
+          const resolved = await resolveWorkspacePath(ctx, filePath, "file_path", "write");
+          const text = String(content);
+          const prior = staged.get(resolved);
+          const original = prior
+            ? prior.original
+            : await fs.readFile(resolved, "utf8").catch((error: NodeJS.ErrnoException) => {
+                if (error.code === "ENOENT") return null;
+                throw error;
+              });
+          staged.set(resolved, { content: text, original });
+          touched.add(resolved);
+          return resolved;
+        })();
+        pendingWrites.push(pending);
+        return pending;
       },
       async json(filePath: string) {
         return JSON.parse(await helpers.read(filePath));
       },
       async glob(pattern: string) {
         const re = globToRegExp(pattern);
-        const files: string[] = [];
+        const files = new Set<string>();
         await walk(root, async (file) => {
           const rel = path.relative(root, file).replace(/\\/g, "/");
-          if (re.test(rel)) files.push(file);
+          if (re.test(rel)) files.add(file);
         });
-        return files;
+        for (const file of staged.keys()) {
+          const rel = path.relative(root, file).replace(/\\/g, "/");
+          if (re.test(rel)) files.add(file);
+        }
+        return [...files];
       },
       async grep(pattern: string, opts?: { files?: string[]; flags?: string; max?: number }) {
         const flags = opts?.flags ?? "g";
@@ -111,7 +120,7 @@ export const CodeModeTool = buildTool({
         const files = opts?.files ?? (await helpers.glob("**/*"));
         const hits: Array<{ path: string; line: number; text: string }> = [];
         for (const file of files) {
-          const text = await fs.readFile(file, "utf8").catch(() => "");
+          const text = staged.get(file)?.content ?? await fs.readFile(file, "utf8").catch(() => "");
           const lines = text.split(/\r?\n/);
           for (let idx = 0; idx < lines.length; idx++) {
             re.lastIndex = 0;
@@ -142,11 +151,55 @@ export const CodeModeTool = buildTool({
           controller.signal.addEventListener("abort", () => reject(new Error(`CodeMode timed out after ${i.timeout_ms}ms`))),
         ),
       ]);
+      // A tiny batch program may omit `await` on its last ares.write. Drain the
+      // helper promises before committing so a successful script cannot report
+      // completion while silently dropping its final staged mutation.
+      await Promise.all(pendingWrites);
+      if (staged.size > 0) {
+        const instructionBlock = await mutationInstructionBlock(ctx, [...staged.keys()]);
+        if (instructionBlock) {
+          const touchedFiles = [...touched];
+          return {
+            output: { result, logs, touchedFiles: [] },
+            failure: instructionBlock,
+            display: `loaded repository rules before committing ${touchedFiles.length} staged file(s)`,
+          };
+        }
+        const operations: WorkspaceMutationOperation[] = [...staged].map(([file, write]) =>
+          write.original === null
+            ? { kind: "add", path: file, content: write.content }
+            : {
+                kind: "update",
+                path: file,
+                content: write.content,
+                expectedHash: workspaceContentHash(write.original),
+              },
+        );
+        // The VM stages intent only. User files change after the script exits
+        // cleanly and the complete batch passes one CAS prevalidation barrier.
+        const mutationWorkspace = await mutationWorkspaceForPaths(root, [...staged.keys()]);
+        const receipt = await new WorkspaceMutationService(mutationWorkspace).apply(operations, {
+          label: "CodeMode",
+          transactionId: ctx.mutationTransactionId,
+        });
+        feedback = await collectMutationFeedback(mutationWorkspace, receipt);
+        for (const [file, write] of staged) {
+          const stat = await fs.stat(file);
+          const stamp: WrittenStamp = {
+            mtimeMs: stat.mtimeMs,
+            size: stat.size,
+            hash: contentHash(write.content),
+            lines: write.content.split("\n").length,
+            writtenNotRead: true,
+          };
+          ctx.fileReadStamps.set(file, stamp);
+        }
+      }
       const touchedFiles = [...touched];
       return {
-        output: { result, logs, touchedFiles },
+        output: { result, logs, touchedFiles, feedback },
         touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
-        display: `CodeMode returned ${brief(result)}${touchedFiles.length ? `, touched ${touchedFiles.length} file(s)` : ""}`,
+        display: appendMutationFeedback(`CodeMode returned ${brief(result)}${touchedFiles.length ? `, touched ${touchedFiles.length} file(s)` : ""}`, feedback),
       };
     } finally {
       clearTimeout(timer);

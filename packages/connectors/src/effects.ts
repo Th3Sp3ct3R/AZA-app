@@ -24,7 +24,7 @@ async function frame(browser: BrowserConnector, opts: BrowserEffectOptions, acti
   await opts.filmstrip.record({ action, url: state.url, screenshot: shot });
 }
 
-function browserEffect<R>(
+export function browserActionEffect<R>(
   kind: string,
   irreversibility: Irreversibility,
   key: string,
@@ -47,7 +47,7 @@ function browserEffect<R>(
 }
 
 export function navigateEffect(browser: BrowserConnector, url: string, opts: BrowserEffectOptions = {}): EffectSpec<BrowserState> {
-  return browserEffect(
+  return browserActionEffect(
     "browser.navigate",
     opts.irreversibility ?? "reversible",
     `nav:${url}`,
@@ -61,7 +61,7 @@ export function navigateEffect(browser: BrowserConnector, url: string, opts: Bro
 }
 
 export function fillEffect(browser: BrowserConnector, label: string, value: string, opts: BrowserEffectOptions = {}): EffectSpec<void> {
-  return browserEffect(
+  return browserActionEffect(
     "browser.fill",
     opts.irreversibility ?? "reversible",
     `fill:${label}`,
@@ -74,7 +74,7 @@ export function fillEffect(browser: BrowserConnector, label: string, value: stri
 }
 
 export function clickEffect(browser: BrowserConnector, role: string, name: string, opts: BrowserEffectOptions = {}): EffectSpec<void> {
-  return browserEffect(
+  return browserActionEffect(
     "browser.click",
     opts.irreversibility ?? "recoverable",
     `click:${role}:${name}`,

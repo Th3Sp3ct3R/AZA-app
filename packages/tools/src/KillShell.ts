@@ -25,8 +25,9 @@ export function makeKillShellTool(registry: ShellRegistry) {
     concurrency: "exclusive",
     inputZod: inputSchema,
     activityDescription: (i) => `KillShell ${i.shell_id}`,
-    async call(i): Promise<{ output: KillShellOutput; display: string }> {
-      if (!registry.has(i.shell_id)) {
+    async call(i, ctx): Promise<{ output: KillShellOutput; display: string }> {
+      const routedRegistry = ctx.shellRegistry ?? registry;
+      if (!routedRegistry.has(i.shell_id, ctx.sessionId)) {
         return {
           output: { shell_id: i.shell_id, killed: false, reason: "unknown shell id" },
           display: `unknown shell: ${i.shell_id}`,
@@ -36,8 +37,8 @@ export function makeKillShellTool(registry: ShellRegistry) {
       // HONESTLY: "already finished" (it wasn't running) vs "kill failed — the
       // process may still be running" (it WAS running and the kill didn't land).
       // Collapsing both into "already finished" would lie about a live process.
-      const wasRunning = registry.get(i.shell_id)?.status === "running";
-      const killed = await registry.kill(i.shell_id, "user");
+      const wasRunning = routedRegistry.get(i.shell_id, ctx.sessionId)?.status === "running";
+      const killed = await routedRegistry.kill(i.shell_id, "user", ctx.sessionId);
       const reason = killed
         ? "killed"
         : wasRunning

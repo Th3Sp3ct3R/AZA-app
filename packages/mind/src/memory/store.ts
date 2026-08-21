@@ -19,6 +19,7 @@ import { currentStrength, reinforce, weaken } from "./strength.js";
 import { recall, type RecallOptions, type RecallResult } from "./recall.js";
 import { contentHash, type EmbedIndex, type Embedder } from "./embedIndex.js";
 import { buildIdf } from "./idf.js";
+import { isOperationalNoise } from "./noise.js";
 import { clusterByConcept, detectRecurringFailures, type Phraser } from "./synthesis.js";
 import { MEMORY_SCHEMA_VERSION, type CrucibleCheck, type HypothesisStatus, type MemoryKind, type MemoryNode, type ReflectionResult, type ReflectionSurface } from "./types.js";
 
@@ -54,19 +55,10 @@ export interface SynthesisReport {
 
 const PRUNE_FLOOR = 0.05;
 const EVIDENCE_CAP = 20;
-const MIN_RECURRENCE = 3;
 const MAX_MEMORY_CONTENT_CHARS = 2_000;
 /** Hard ceiling on how long remember() will wait for a cue embedding. */
 const CUE_EMBED_TIMEOUT_MS = 300;
 const EMBED_BATCH = 64;
-const THEME_STOPWORDS = new Set([
-  "about", "after", "again", "also", "always", "before", "being", "built", "check",
-  "clean", "could", "ares", "data", "directly", "doing", "done", "error", "files",
-  "follows", "found", "have", "homie", "inspect", "issue", "just", "lmao", "look",
-  "memory", "model", "noticed", "output", "right", "self", "some", "state", "still",
-  "system", "there", "thing", "think", "this", "threw", "turn", "using", "which",
-  "with", "work", "would",
-]);
 
 function resolveFile(root: string): string {
   return root.endsWith(".jsonl") ? root : path.join(root, "memory.jsonl");
@@ -81,14 +73,6 @@ function resolveFile(root: string): string {
 function scopedNodes(nodes: readonly MemoryNode[], scope: string | undefined): readonly MemoryNode[] {
   if (scope === undefined) return nodes;
   return nodes.filter((n) => n.scope === scope || n.scope === undefined);
-}
-
-function salientTokens(content: string): string[] {
-  const seen = new Set<string>();
-  for (const t of content.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
-    if (isThemeToken(t)) seen.add(t);
-  }
-  return [...seen];
 }
 
 export class MemoryStore {
@@ -460,6 +444,15 @@ export class MemoryStore {
 
     // 1. Forget faded one-off episodes and stale filler "theme" semantics.
     for (const node of this.all()) {
+      // Operational noise (tool/provider error text) is never knowledge, no
+      // matter its kind or source — stores populated BEFORE the write-spine
+      // noise gate existed still carry these (a field index was 83% error
+      // entries, 2026-08-06), and this sweep is what durably cleans them out.
+      if (isOperationalNoise(node.content)) {
+        this.deleteNode(node.id);
+        pruned++;
+        continue;
+      }
       // Crystallized insight/belief nodes the deep dream synthesized are normally
       // spared pruning — but not unconditionally: a synthesized belief that keeps
       // getting DISPROVEN via recordOutcome (driven down to PRUNE_FLOOR by repeat
@@ -487,34 +480,14 @@ export class MemoryStore {
     // 2. Merge exact duplicates into one stronger node and redirect links.
     deduped += this.mergeDuplicateContent(now);
 
-    // 3. Promote recurring episodic themes into durable semantic knowledge.
-    const byToken = new Map<string, MemoryNode[]>();
-    for (const node of this.all()) {
-      if (node.kind !== "episodic") continue;
-      if (!isThemeEligibleEpisode(node)) continue;
-      for (const token of salientTokens(node.content)) {
-        let bucket = byToken.get(token);
-        if (!bucket) {
-          bucket = [];
-          byToken.set(token, bucket);
-        }
-        bucket.push(node);
-      }
-    }
-    for (const [token, episodes] of byToken) {
-      if (episodes.length < MIN_RECURRENCE) continue;
-      const tag = `theme:${token}`;
-      if (this.all().some((n) => n.kind === "semantic" && n.tags?.includes(tag))) continue;
-      const semantic = await this.add({
-        kind: "semantic",
-        content: `Recurring theme "${token}" observed across ${episodes.length} episodes.`,
-        tags: [tag],
-        strength: 1.5,
-        at: now,
-      });
-      for (const ep of episodes) this.linkPair(semantic.id, ep.id);
-      promoted.push(token);
-    }
+    // Theme promotion is GONE. Single-token "Recurring theme \"X\" observed
+    // across N episodes" semantics carried no knowledge — just a token and a
+    // count — and the stopword gate was unwinnable whack-a-mole: on the
+    // owner's real store, 47 of 66 nodes were themes like "first", "every"
+    // and "claude" (2026-08-10). Crystallization is synthesize()'s job — its
+    // insight/belief nodes carry IDF-ranked multi-token keys, provenance
+    // links, confidence, and optional phrased prose. isNoiseThemeSemantic now
+    // treats EVERY legacy theme node as prunable filler (step 1 above).
 
     await this.persist();
     // Settle vectors with sleep: prune deleted ids, embed new/edited nodes.
@@ -708,17 +681,6 @@ function normalizeForDedup(content: string): string {
   return content.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function isThemeToken(token: string): boolean {
-  return token.length >= 5 && !THEME_STOPWORDS.has(token);
-}
-
-function isThemeEligibleEpisode(node: MemoryNode): boolean {
-  const content = node.content.toLowerCase();
-  if (/^(hi|hey|hello|yo|sup)\b/.test(content)) return false;
-  if (/^(lol|lmao|haha|bet|ok|okay|cool|nice|word|true|facts|nun much|nothing much)\b/.test(content)) return false;
-  if (/^decided to answer the user by using the strongest available tools\b/.test(content)) return false;
-  return salientTokens(content).length >= 2;
-}
 
 const MIN_PRUNE_EVIDENCE = 3;
 
@@ -736,9 +698,13 @@ function isDisprovenSynthesis(node: MemoryNode, now: Date): boolean {
   return currentStrength(node, now) < PRUNE_FLOOR;
 }
 
+/** EVERY theme node is filler now that theme promotion is gone: a single
+ *  token plus a count is not knowledge, and synthesize() owns crystallization.
+ *  This prunes the legacy population (47 of 66 nodes on one real store). */
 function isNoiseThemeSemantic(node: MemoryNode): boolean {
   if (node.kind !== "semantic") return false;
-  const tag = node.tags?.find((t) => t.startsWith("theme:"));
-  const token = tag?.slice("theme:".length) ?? node.content.match(/^Recurring theme "([^"]+)"/)?.[1];
-  return Boolean(token && !isThemeToken(token.toLowerCase()));
+  return Boolean(
+    node.tags?.some((t) => t.startsWith("theme:")) ||
+    /^Recurring theme "[^"]+" observed across \d+ episodes\.?$/.test(node.content),
+  );
 }

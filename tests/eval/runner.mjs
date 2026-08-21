@@ -209,7 +209,7 @@ const SYSTEM_PROMPT =
  * and any real Provider implementation.
  */
 export async function runAgentOnTask(task, provider, { model = "eval", workspace, maxTurns = 6, systemPrompt = SYSTEM_PROMPT }) {
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider,
       model,

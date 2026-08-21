@@ -466,6 +466,7 @@ test("resumeFleetId reuses completed leaves and only re-runs the rest", async ()
     { ...spec, resumeFleetId: first.fleetId },
     baseDeps({ workspace }, runner2),
   );
+  assert.equal(second.fleetId, first.fleetId, "explicit resume continues the same fleet identity");
   const roles2 = run2Calls.map((c) => c.role);
   assert.deepEqual(roles2, ["boom"], "only the failed leaf re-ran");
   const okLeaf = second.phases[0].leaves.find((l) => l.role === "ok");
@@ -796,7 +797,7 @@ test("a build:true pipeline phase grants write tools but still strips dangerous 
   let sawTools: string[] = [];
   const run: ConductorDeps["runAgent"] = async (args) => {
     sawTools = args.tools.map((t) => t.schema.name);
-    return { finalText: "ok", events: [], usage: U(), status: "completed" };
+    return { finalText: "ok", events: [], usage: U(), status: "completed", workStatus: "verified" };
   };
   const deps = baseDeps(
     { parentTools: [tool("Read"), tool("Write", "workspace-write"), tool("Stripe", "external-state")] },
@@ -822,9 +823,9 @@ test("a parallel build phase with multiple writers is rejected (write-race guard
 
 test("a phase whose verify fails twice then passes self-repairs to green", async () => {
   const verdicts: RunAgentResult[] = [
-    { finalText: '{"ok":false,"summary":"build broke"}', events: [], usage: U(), status: "completed" },
-    { finalText: '{"ok":false,"summary":"still broken"}', events: [], usage: U(), status: "completed" },
-    { finalText: '{"ok":true,"summary":"green"}', events: [], usage: U(), status: "completed" },
+    { finalText: '{"ok":false,"summary":"build broke"}', events: [], usage: U(), status: "completed", workStatus: "verified" },
+    { finalText: '{"ok":false,"summary":"still broken"}', events: [], usage: U(), status: "completed", workStatus: "verified" },
+    { finalText: '{"ok":true,"summary":"green"}', events: [], usage: U(), status: "completed", workStatus: "verified" },
   ];
   let i = 0;
   const prompts: string[] = [];
@@ -847,7 +848,7 @@ test("repair is bounded: a never-green verify stops after repairRounds", async (
   let i = 0;
   const run: ConductorDeps["runAgent"] = async () => {
     i++;
-    return { finalText: '{"ok":false,"summary":"nope"}', events: [], usage: U(), status: "completed" };
+    return { finalText: '{"ok":false,"summary":"nope"}', events: [], usage: U(), status: "completed", workStatus: "verified" };
   };
   const spec: FleetSpec = {
     phases: [{ id: "v", kind: "pipeline", build: true, repairRounds: 2, agents: [{ role: "v", prompt: "x", schema: { ok: true, summary: "..." } }] }],
@@ -892,7 +893,7 @@ test("worktree parallel build: file-disjoint leaves run in sandboxes and merge b
   const seenWorkspaces: string[] = [];
   const run: ConductorDeps["runAgent"] = async (args) => {
     seenWorkspaces.push(args.workspace ?? "MAIN");
-    return { finalText: args.role, events: [], usage: U(), status: "completed" };
+    return { finalText: args.role, events: [], usage: U(), status: "completed", workStatus: "verified" };
   };
   const spec: FleetSpec = {
     phases: [{ id: "build", kind: "parallel", build: true, isolation: "worktree", agents: [{ role: "x", prompt: "a" }, { role: "y", prompt: "b" }] }],
@@ -909,7 +910,7 @@ test("worktree parallel build FAILS CLOSED when two leaves touch the same file",
   const wt = mockWorktrees();
   wt.filesByLabel["build-0"] = ["shared.ts"];
   wt.filesByLabel["build-1"] = ["shared.ts"];
-  const run: ConductorDeps["runAgent"] = async (args) => ({ finalText: args.role, events: [], usage: U(), status: "completed" });
+  const run: ConductorDeps["runAgent"] = async (args) => ({ finalText: args.role, events: [], usage: U(), status: "completed", workStatus: "verified" });
   const spec: FleetSpec = {
     phases: [{ id: "build", kind: "parallel", build: true, isolation: "worktree", agents: [{ role: "x", prompt: "a" }, { role: "y", prompt: "b" }] }],
   };
@@ -920,9 +921,35 @@ test("worktree parallel build FAILS CLOSED when two leaves touch the same file",
   assert.equal(wt.cleaned.length, 2, "worktrees still cleaned up");
 });
 
+test("worktree merge never applies a failed leaf's partial files", async () => {
+  const wt = mockWorktrees();
+  wt.filesByLabel["build-0"] = ["good.ts"];
+  wt.filesByLabel["build-1"] = ["partial.ts"];
+  const run: ConductorDeps["runAgent"] = async (args) =>
+    args.role === "good"
+      ? { finalText: "done", events: [], usage: U(), status: "completed", workStatus: "verified" }
+      : { finalText: "crashed", events: [], usage: U(), status: "failed", workStatus: "blocked" };
+  const spec: FleetSpec = {
+    phases: [{
+      id: "build",
+      kind: "parallel",
+      build: true,
+      isolation: "worktree",
+      agents: [{ role: "good", prompt: "a" }, { role: "bad", prompt: "b" }],
+    }],
+  };
+  const res = await runFleet(spec, baseDeps({ makeWorktree: wt.make }, run));
+  assert.deepEqual(wt.applied, ["build-0"], "only the successful leaf was eligible for merge");
+  assert.equal(res.phases[0].status, "failed", "default all policy fails the incomplete build");
+  assert.equal(wt.cleaned.length, 2);
+});
+
 test("isolation:worktree with NO factory falls back to safe serial build (no clobber)", async () => {
   const record = { calls: [] as RunAgentArgs[], inFlight: 0, peak: 0 };
-  const run = scriptedRunner({}, record);
+  const run = scriptedRunner({
+    x: { finalText: "x", events: [], usage: U(), status: "completed", workStatus: "verified" },
+    y: { finalText: "y", events: [], usage: U(), status: "completed", workStatus: "verified" },
+  }, record);
   const spec: FleetSpec = {
     phases: [{ id: "build", kind: "parallel", build: true, isolation: "worktree", agents: [{ role: "x", prompt: "a" }, { role: "y", prompt: "b" }] }],
   };

@@ -63,7 +63,11 @@ function recordingRunner(record) {
     record.peak = Math.max(record.peak, record.inFlight);
     await new Promise((r) => setTimeout(r, 5)); // overlap window
     record.inFlight--;
-    return { finalText: args.role, events: [], usage: U(), status: "completed" };
+    // Build output is accepted only with proof newer than its mutations. These
+    // policy tests inject a fake runner, so explicitly provide that proof-bearing
+    // outcome instead of relying on the old "loop completed == work succeeded"
+    // default.
+    return { finalText: args.role, events: [], usage: U(), status: "completed", workStatus: "verified" };
   };
 }
 
@@ -170,7 +174,7 @@ test("a parallel build phase with 2+ writers DEFAULTS to worktree isolation when
   const seen = [];
   const run = async (args) => {
     seen.push(args.workspace ?? "MAIN");
-    return { finalText: args.role, events: [], usage: U(), status: "completed" };
+    return { finalText: args.role, events: [], usage: U(), status: "completed", workStatus: "verified" };
   };
   // NOTE: no isolation set on the phase.
   const res = await runFleet(

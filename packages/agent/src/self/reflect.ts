@@ -39,17 +39,21 @@ export function reflect(model: SelfModel, opts: ReflectOptions = {}): SelfDirect
   for (const cap of Object.values(model.capabilities)) {
     if (cap.status === "removed") continue;
 
-    if (cap.status === "want" || cap.status === "acquiring") {
-      directives.push(acquireDirective(cap));
-      continue;
-    }
-
-    // Only outcome-bearing kinds (skills, missions) get performance judgments.
+    // Outcomes are stronger evidence than the lifecycle label. In particular,
+    // a capability created by a failed first attempt is correctly left in
+    // `acquiring`; once repeated attempts prove that it never works, reflection
+    // must diagnose/prune it instead of masking the failure as a generic
+    // acquisition request forever.
     const decided = cap.outcomes.ok + cap.outcomes.fail;
     const rel = reliabilityOf(cap.outcomes);
 
     if (decided >= minRuns && cap.outcomes.ok === 0) {
       directives.push(pruneAlwaysFail(cap, decided));
+      continue;
+    }
+
+    if (cap.status === "want" || cap.status === "acquiring") {
+      directives.push(acquireDirective(cap));
       continue;
     }
 

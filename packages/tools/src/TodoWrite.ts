@@ -94,7 +94,7 @@ export function makeTodoWriteTool(store: TodoStore) {
     concurrency: "parallel-safe",
     inputZod: inputSchema,
     activityDescription: (i) => `Tracking ${i.todos.length} todo${i.todos.length === 1 ? "" : "s"}`,
-    async call(i): Promise<{ output: TodoWriteOutput; display: string }> {
+    async call(i, ctx): Promise<{ output: TodoWriteOutput; display: string }> {
       // The canonical Claude TodoWrite shape is {content, status, activeForm}
       // with no id, so honor a model-supplied id but derive a stable one from
       // the item's position when omitted (don't hard-reject the common call).
@@ -105,7 +105,11 @@ export function makeTodoWriteTool(store: TodoStore) {
         status: t.status,
       }));
 
-      store.replace(todos);
+      // Hosts such as Garrison reuse one immutable tool catalog across many
+      // sessions. Prefer the context-routed store so one session's checklist
+      // cannot overwrite another's; keep the captured store for CLI callers
+      // that intentionally bind a tool instance to one session.
+      (ctx.todoStore ?? store).replace(todos);
 
       const inProgressCount = todos.filter((t) => t.status === "in_progress").length;
       const pendingCount = todos.filter((t) => t.status === "pending").length;

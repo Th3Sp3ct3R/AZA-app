@@ -7,6 +7,7 @@
 // imported, so @ares/mind stays dependency-free.
 
 import { buildIdf, tokenizeSalient, type IdfMap } from "./idf.js";
+import { isOperationalNoise } from "./noise.js";
 import type { MemoryNode } from "./types.js";
 
 export interface InsightCandidate {
@@ -70,9 +71,15 @@ export function clusterByConcept(
 export function detectRecurringFailures(
   nodes: readonly MemoryNode[],
   idf: IdfMap,
-  minMembers = 2,
+  // 3, not 2: at 2 this pass amplified stored error noise — N distinct error
+  // texts bucketed by token pair minted up to N/2 "recurring failure" beliefs,
+  // each then EXEMPT from normal pruning (source: "synthesis"). Self-generated
+  // noise was more durable than real memories.
+  minMembers = 3,
 ): InsightCandidate[] {
-  const fails = nodes.filter((n) => FAILURE.test(n.content));
+  // Operational noise (raw tool/provider error text) is excluded even though
+  // it matches FAILURE: a belief distilled from harness noise is still noise.
+  const fails = nodes.filter((n) => FAILURE.test(n.content) && !isOperationalNoise(n.content));
   const out: InsightCandidate[] = [];
   for (const [key, members] of bucketBy(fails, idf)) {
     if (members.length < minMembers) continue;

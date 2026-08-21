@@ -18,6 +18,7 @@ import type {
   ContentBlock,
 } from "@ares/protocol";
 import { openAIReasoningEffort, reasoningEnabled } from "@ares/protocol";
+import { narrowToolSchema } from "./toolSchema.js";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { createStallGuard, stallErrorEvent, type StallGuard } from "./stallGuard.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
@@ -39,6 +40,20 @@ export interface OpenRouterProviderOptions {
   flavor?: OpenAIChatFlavor;
   /** Provider name exposed to the engine and telemetry. */
   providerName?: string;
+  /**
+   * Resolved before every request, replacing the constructor snapshot.
+   * Exists for expiring credentials (Kimi's subscription token): a session
+   * keeps one provider instance for hours, so a key captured at build time
+   * outlives its own validity mid-turn. Falls back to `apiKey` on null/throw.
+   */
+  apiKeySupplier?: () => Promise<string | null | undefined>;
+  /**
+   * Called once per request after the server rejects the credential
+   * (401/403). Returns a replacement key to retry with — for OAuth-backed
+   * providers this is "exchange the refresh token now" — or null to give up
+   * and surface the auth error.
+   */
+  onAuthError?: () => Promise<string | null | undefined>;
 }
 
 export class OpenRouterProvider implements Provider {
@@ -48,6 +63,8 @@ export class OpenRouterProvider implements Provider {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly flavor: OpenAIChatFlavor;
+  private readonly apiKeySupplier?: () => Promise<string | null | undefined>;
+  private readonly onAuthError?: () => Promise<string | null | undefined>;
 
   constructor(opts: OpenRouterProviderOptions) {
     this.name = opts.providerName ?? "openrouter";
@@ -56,15 +73,34 @@ export class OpenRouterProvider implements Provider {
     this.baseUrl = opts.baseUrl ?? OPENROUTER_BASE_URL;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.flavor = opts.flavor ?? "openrouter";
+    this.apiKeySupplier = opts.apiKeySupplier;
+    this.onAuthError = opts.onAuthError;
+  }
+
+  /** Human name for error copy — this class fronts several branded endpoints. */
+  private label(): string {
+    switch (this.name) {
+      case "deepseek": return "DeepSeek";
+      case "kimi": return "Kimi";
+      case "openrouter": return "OpenRouter";
+      default: return this.name;
+    }
   }
 
   async *stream(req: ProviderRequest): AsyncGenerator<StreamEvent> {
-    if (!this.apiKey) {
+    let apiKey = this.apiKey;
+    if (this.apiKeySupplier) {
+      const supplied = await this.apiKeySupplier().catch(() => null);
+      if (typeof supplied === "string" && supplied.length > 0) apiKey = supplied;
+    }
+    if (!apiKey) {
       yield {
         type: "error",
         error: {
           code: "no_auth",
-          message: `No ${this.name === "deepseek" ? "DeepSeek" : "OpenRouter"} API key. Add one in Settings > API Keys.`,
+          message: this.name === "kimi"
+            ? "Kimi is not connected. Sign in with Kimi in Settings > API Keys, or add a Kimi API key."
+            : `No ${this.label()} API key. Add one in Settings > API Keys.`,
           retriable: false,
         },
       };
@@ -72,63 +108,92 @@ export class OpenRouterProvider implements Provider {
     }
 
     const body = buildChatBody(this.model || req.model, req, this.flavor);
-    const headers: Record<string, string> = {
+    const baseHeaders: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "text/event-stream",
-      Authorization: `Bearer ${this.apiKey}`,
     };
     if (this.flavor === "openrouter") {
-      headers["HTTP-Referer"] = "https://ares.dev";
-      headers["X-Title"] = "Ares";
+      baseHeaders["HTTP-Referer"] = "https://ares.dev";
+      baseHeaders["X-Title"] = "Ares";
     }
 
-    // Stall watchdog: abort the fetch when no bytes arrive for the stall
-    // window so a hung connection becomes a retriable error, not a freeze.
-    const guard = createStallGuard(req.signal);
+    // One transparent auth retry: a 401/403 usually means the credential
+    // expired since it was minted (subscription tokens live ~hours). Ask the
+    // host to refresh once and replay; a second rejection is a real sign-out.
+    let authRetried = false;
     let response: Response;
-    try {
-      response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: guard.signal,
-      });
-    } catch (err) {
-      guard.dispose();
-      if (guard.stalled()) {
-        yield stallErrorEvent();
+    let guard: StallGuard;
+    for (;;) {
+      // Stall watchdog: abort the fetch when no bytes arrive for the stall
+      // window so a hung connection becomes a retriable error, not a freeze.
+      guard = createStallGuard(req.signal);
+      try {
+        response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { ...baseHeaders, Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify(body),
+          signal: guard.signal,
+        });
+      } catch (err) {
+        guard.dispose();
+        if (guard.stalled()) {
+          yield stallErrorEvent();
+          return;
+        }
+        // Caller-initiated abort (user pressed Stop, engine superseded the
+        // attempt) is not an error — return silently, mirroring anthropic.ts.
+        if (req.signal?.aborted || isAbortError(err)) return;
+        yield {
+          type: "error",
+          error: { code: "network_error", message: err instanceof Error ? err.message : String(err), retriable: true },
+        };
         return;
       }
-      yield {
-        type: "error",
-        error: { code: "network_error", message: err instanceof Error ? err.message : String(err), retriable: true },
-      };
-      return;
+      guard.reset();
+
+      if ((response.status === 401 || response.status === 403) && !authRetried && this.onAuthError) {
+        authRetried = true;
+        // Disarm the stall watchdog before the refresh round-trip — it must
+        // not abort this (already-answered) response while we wait, or the
+        // give-up path below loses the server's error body.
+        guard.dispose();
+        const replacement = await this.onAuthError().catch(() => null);
+        if (typeof replacement === "string" && replacement.length > 0 && replacement !== apiKey) {
+          await response.body?.cancel().catch(() => {});
+          apiKey = replacement;
+          continue;
+        }
+      }
+      break;
     }
-    guard.reset();
 
     if (!response.ok) {
+      guard.dispose();
       const text = await response.text().catch(() => "");
+      const expired = response.status === 401 || response.status === 403;
       yield {
         type: "error",
         error: {
           code: `http_${response.status}`,
-          message: `OpenRouter returned ${response.status}: ${text.slice(0, 500)}`,
-          retriable: response.status === 429 || response.status >= 500,
+          message: expired && this.name === "kimi"
+            ? `Kimi subscription auth failed (${response.status}) and the token could not be refreshed. Re-connect Kimi in Settings > API Keys. Server said: ${text.slice(0, 300)}`
+            : `${this.label()} returned ${response.status}: ${text.slice(0, 500)}`,
+          retriable: response.status === 408 || response.status === 409 || response.status === 425 || response.status === 429 || response.status >= 500,
           retryAfterMs: parseRetryAfterMs(response.headers),
         },
       };
       return;
     }
     if (!response.body) {
+      guard.dispose();
       yield { type: "error", error: { code: "no_body", message: "Response had no body", retriable: false } };
       return;
     }
 
-    yield* this.parseSSE(response.body, this.model || req.model, guard);
+    yield* this.parseSSE(response.body, this.model || req.model, guard, req.signal);
   }
 
-  private async *parseSSE(body: ReadableStream<Uint8Array>, model: string, guard?: StallGuard): AsyncGenerator<StreamEvent> {
+  private async *parseSSE(body: ReadableStream<Uint8Array>, model: string, guard?: StallGuard, signal?: AbortSignal): AsyncGenerator<StreamEvent> {
     const decoder = new TextDecoder("utf8");
     const reader = body.getReader();
     let buffer = "";
@@ -248,6 +313,9 @@ export class OpenRouterProvider implements Provider {
             yield stallErrorEvent();
             return;
           }
+          // Caller-initiated abort mid-stream (Stop button) — end silently
+          // instead of rethrowing as a red retriable error. See anthropic.ts.
+          if (signal?.aborted || isAbortError(err)) return;
           throw err;
         }
         guard?.reset();
@@ -346,15 +414,21 @@ function buildChatBody(model: string, req: ProviderRequest, flavor: OpenAIChatFl
       ? {
           tools: req.tools.map((t) => ({
             type: "function",
-            function: { name: t.name, description: t.description, parameters: t.input_schema },
+            // Narrowed, not passed through: OpenRouter fails a request over to
+            // whichever upstream is available, and some of them 422 the whole
+            // tool array on a single anyOf/oneOf union. See toolSchema.ts.
+            function: { name: t.name, description: t.description, parameters: narrowToolSchema(t.input_schema) },
           })),
+          tool_choice: req.toolChoice === "any" ? "required" : "auto",
         }
       : {}),
-    ...(reasoningEnabled(req.reasoningLevel)
+    ...(flavor === "deepseek" && req.reasoningLevel === "off"
+      ? { thinking: { type: "disabled" } }
+      : reasoningEnabled(req.reasoningLevel)
       ? flavor === "deepseek"
         ? {
             thinking: { type: "enabled" },
-            reasoning_effort: req.reasoningLevel === "max" ? "max" : "high",
+            reasoning_effort: req.reasoningLevel === "xhigh" || req.reasoningLevel === "max" ? "max" : "high",
           }
         : // reasoningEnabled() guarantees a defined, non-"off" level here.
           { reasoning: { effort: openAIReasoningEffort(req.reasoningLevel!) } }
@@ -504,6 +578,11 @@ function toChatMessages(m: Message, flavor: OpenAIChatFlavor): Record<string, un
   return [{ role: m.role === "system" ? "system" : "user", content }];
 }
 
+/** Same shape anthropic.ts uses: undici/fetch abort surfaces as AbortError. */
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
+}
+
 function mapFinish(reason: string): StopReason {
   switch (reason) {
     case "stop":
@@ -525,6 +604,7 @@ export interface OpenRouterModel {
   name: string;
   contextLength?: number;
   promptPrice?: string;
+  completionPrice?: string;
   description?: string;
   supportedParameters?: string[];
   inputModalities?: string[];
@@ -573,6 +653,7 @@ export async function fetchOpenRouterModels(opts: { baseUrl?: string; fetchImpl?
     name: typeof r.name === "string" ? r.name : String(r.id),
     contextLength: typeof r.context_length === "number" ? r.context_length : undefined,
     promptPrice: typeof (r.pricing as Record<string, unknown> | undefined)?.prompt === "string" ? String((r.pricing as Record<string, unknown>).prompt) : undefined,
+    completionPrice: typeof (r.pricing as Record<string, unknown> | undefined)?.completion === "string" ? String((r.pricing as Record<string, unknown>).completion) : undefined,
     description: typeof r.description === "string" ? r.description : undefined,
     supportedParameters: Array.isArray(r.supported_parameters)
       ? r.supported_parameters.filter((value): value is string => typeof value === "string")

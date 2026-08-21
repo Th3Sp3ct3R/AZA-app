@@ -6,8 +6,15 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, contentHash, pathInputProblem, resolveWorkspacePath, toolError, zPath } from "./_shared.js";
-import { safeOverwrite } from "./safeWrite.js";
+import {
+  type PostMutationFeedback,
+  WorkspaceMutationError,
+  WorkspaceMutationService,
+  workspaceContentHash,
+} from "@ares/core";
+import { buildTool, contentHash, mutationInstructionBlock, mutationWorkspaceForPaths, pathInputProblem, resolveWorkspacePath, toolError, zPath } from "./_shared.js";
+import { assertSafeReplacement, createOverwriteBackup } from "./safeWrite.js";
+import { appendMutationFeedback, collectMutationFeedback } from "./postMutationFeedback.js";
 
 const inputSchema = z
   .object({
@@ -28,6 +35,8 @@ export interface WriteOutput {
   bytesWritten: number;
   /** Where the prior contents were saved before this overwrite, if any. */
   backupPath?: string;
+  /** Immediate formatter/type diagnostics, attributed to the committed SHA-256. */
+  feedback?: PostMutationFeedback;
 }
 
 export const WriteTool = buildTool({
@@ -63,6 +72,8 @@ export const WriteTool = buildTool({
         reason: `${filePath} exists; Read it before overwriting so you've seen the current contents.`,
       };
     }
+    const instructionBlock = await mutationInstructionBlock(ctx, [filePath]);
+    if (instructionBlock) return { kind: "deny", reason: instructionBlock };
     return { kind: "allow" };
   },
 
@@ -76,28 +87,55 @@ export const WriteTool = buildTool({
     // clobber changes made on disk since the last Read. New files (no stamp) are
     // untouched; only an existing file whose content drifted from the read hash
     // is refused — self-correctingly.
+    let current: string | null = null;
     if (existed) {
+      current = await fs.readFile(filePath, "utf8");
       const stamp = ctx.fileReadStamps.get(filePath);
       if (stamp?.hash !== undefined) {
-        const current = await fs.readFile(filePath, "utf8").catch(() => null);
-        if (current !== null && contentHash(current) !== stamp.hash) {
+        if (contentHash(current) !== stamp.hash) {
           throw toolError(`${filePath} was modified on disk since the last Read. Re-Read it and retry so you don't clobber newer changes.`);
         }
       }
+      assertSafeReplacement({
+        original: current,
+        next: i.content,
+        label: "Write",
+        absPath: filePath,
+        allowFullReplace: i.allow_full_replace,
+      });
     }
-    const written = await safeOverwrite({
-      workspace: ctx.workspace,
-      absPath: filePath,
-      content: i.content,
-      label: "Write",
-      allowFullReplace: i.allow_full_replace,
-    });
+
+    let backupPath: string | undefined;
+    let feedback: PostMutationFeedback | undefined;
+    const mutationWorkspace = await mutationWorkspaceForPaths(ctx.workspace, [filePath]);
+    // Keep the established user-visible backup/index in addition to the
+    // transaction's private rollback blob. This applies equally to an approved
+    // external project; bytes are committed in that project, not copied later.
+    if (existed && current !== null) {
+      backupPath = await createOverwriteBackup(ctx.workspace, filePath, current, "Write");
+    }
+    if (!(existed && current === i.content)) {
+      try {
+        const receipt = await new WorkspaceMutationService(mutationWorkspace).apply(
+          existed
+            ? [{ kind: "update", path: filePath, expectedHash: workspaceContentHash(current ?? ""), content: i.content }]
+            : [{ kind: "add", path: filePath, content: i.content }],
+          { label: "Write", transactionId: ctx.mutationTransactionId },
+        );
+        feedback = await collectMutationFeedback(mutationWorkspace, receipt);
+      } catch (error) {
+        if (error instanceof WorkspaceMutationError) {
+          throw toolError(`${error.message} ${error.actionable}`);
+        }
+        throw error;
+      }
+    }
     const stat = await fs.stat(filePath);
     ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, hash: contentHash(i.content) });
     return {
-      output: { path: filePath, created: written.created, bytesWritten: written.bytesWritten, backupPath: written.backupPath },
+      output: { path: filePath, created: !existed, bytesWritten: stat.size, backupPath, feedback },
       touchedFiles: [filePath],
-      display: existed ? `Updated ${filePath}` : `Created ${filePath}`,
+      display: appendMutationFeedback(existed ? `Updated ${filePath}` : `Created ${filePath}`, feedback),
     };
   },
 });

@@ -1,9 +1,9 @@
 // Extracted from entry.ts — providers.
 
-import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
+import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchOllamaLibraryModels, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, fetchCodexModels, loadAuthToken, MoaProvider, fetchKimiModels, resolveKimiAccessToken, forceRefreshKimiAccessToken, type MoaMember, type Provider } from "@ares/core";
 import path from "node:path";
-import { gzipSync } from "node:zlib";
 import { type SubModelPool } from "@ares/tools";
+import { buildReportBody } from "./daemon/report.js";
 import { loadUiSettings, type UiSettings } from "../uiSettings.js";
 
 // Ares talks to the LOCAL Ollama daemon (native /api/chat) by default — it
@@ -20,6 +20,12 @@ export interface ProviderSelection {
   provider: Provider;
   model: string;
   source: string;
+  /** Canonical product-facing provider identity. Never infer this from the
+   * transport adapter: Ares and DeepSeek both deliberately reuse the hardened
+   * Anthropic wire client, but they are not Anthropic accounts. */
+  family?: TerminalProviderId;
+  /** Cheap validation run before a user-selected model is committed. */
+  preflight?: () => Promise<{ ok: true } | { ok: false; error: string }>;
   subModel?: SubModelPool;
 }
 
@@ -42,9 +48,22 @@ interface DaemonModelOption {
   capabilities?: string[];
   /** Rich prose (OpenRouter) for the discovery cards. */
   description?: string;
+  /** Structured stats for the discovery panel (the hint string keeps a packed
+   *  copy for old clients, but the UI wants real numbers). */
+  contextLength?: number;
+  pricing?: { input?: number; output?: number };
+  /** Ollama library meta: human pull count + relative updated age. */
+  pulls?: string;
+  updated?: string;
+  /** The reasoning-effort ladder this model ACTUALLY supports, newest-known
+   *  first-party truth. The desktop renders exactly these rungs instead of a
+   *  hardcoded low/medium/high — Kimi K3 offers only high/max, and showing it
+   *  a "low" it will silently ignore is a lie about what the dial does.
+   *  Omitted = unknown; the client falls back to its heuristic ladder. */
+  effortLevels?: string[];
 }
 
-export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "ares", "custom", "moa", "mock"] as const;
+export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "kimi", "openrouter", "ares", "custom", "moa", "mock"] as const;
 
 // Mixture-of-Agents ensembles — pickable "models" under the `moa` provider.
 // Each reference drafts independently; the aggregator (tool-capable) synthesizes.
@@ -79,24 +98,32 @@ export const MOA_ENSEMBLES: Record<string, MoaEnsembleSpec> = {
   },
 };
 
-type TerminalProviderId = (typeof TERMINAL_PROVIDERS)[number];
+export type TerminalProviderId = (typeof TERMINAL_PROVIDERS)[number];
 
 export const ROUTE_LANES = ["chat", "coding", "research", "tool-use"] as const;
 
 const STATIC_MODEL_CATALOG: Record<"openai" | "anthropic" | "mock", DaemonModelOption[]> = {
   openai: [
-    { id: "gpt-5.5", hint: "flagship deep reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "gpt-5.5-codex", hint: "agentic coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5.1", hint: "previous flagship", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "gpt-5.1-codex", hint: "coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5", hint: "stable baseline", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5-mini", hint: "fast + cheap", group: "OpenAI", capabilities: ["tools"] },
+    // Verified working through ChatGPT Codex OAuth (probed live). Luna and the
+    // bare gpt-5.6 alias are NOT supported on a ChatGPT account (API-only), so
+    // they're omitted. The daemon also live-fetches the account's real list;
+    // this is the fallback when signed out / the endpoint is unreachable.
+    { id: "gpt-5.6-sol", label: "5.6 Sol", hint: "flagship — deepest reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.6-terra", label: "5.6 Terra", hint: "balanced — ~5.5 quality, 2× cheaper", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.5", label: "5.5", hint: "previous flagship", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.4", label: "5.4", hint: "stable baseline", group: "OpenAI", capabilities: ["tools", "reasoning"] },
+    { id: "gpt-5.4-mini", label: "5.4 Mini", hint: "fast + cheap", group: "OpenAI", capabilities: ["tools"] },
+    { id: "gpt-5.3-codex-spark", label: "5.3 Codex Spark", hint: "agentic coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
   ],
   anthropic: [
-    { id: "claude-fable-5", hint: "flagship adaptive thinking", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "claude-opus-4-8", hint: "deep reasoning workhorse · 1M context", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "claude-sonnet-4-6", hint: "balanced speed / depth", group: "Anthropic", capabilities: ["tools", "reasoning"] },
-    { id: "claude-haiku-4-5-20251001", hint: "fast + cheap", group: "Anthropic", capabilities: ["tools"] },
+    { id: "claude-fable-5", label: "Claude Fable 5", hint: "flagship · adaptive extended thinking", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-5", label: "Claude Opus 5", hint: "newest Opus · deepest reasoning", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "frontier Sonnet · coding + agents", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-8", label: "Claude Opus 4.8", hint: "deep reasoning workhorse · 1M context", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-7", label: "Claude Opus 4.7", hint: "prior Opus · deep reasoning", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-6", label: "Claude Opus 4.6", hint: "earlier Opus", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "balanced speed / depth", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", hint: "fastest · cheap + capable", group: "Anthropic", capabilities: ["tools", "vision"] },
   ],
   mock: [{ id: "mock-echo", hint: "offline echo provider for UI testing", group: "Mock", capabilities: [] }],
 };
@@ -217,12 +244,15 @@ export async function postAresGatewayReport(
   token: string | undefined,
   payload: Record<string, unknown>,
   fetchImpl: typeof fetch = fetch,
-): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; id: string; droppedEvents: number } | { ok: false; error: string }> {
   if (!token) return { ok: false, error: "connect your Ares account first (doingteam.com → Account)" };
   // Coding transcripts run to tens of MB — far past the platform's ~4.5MB
-  // request-body limit ("Request Entity Too Large"). gzip shrinks text ~10x so
-  // it fits; the gateway inflates it (x-ares-encoding: gzip).
-  const gz = gzipSync(Buffer.from(JSON.stringify(payload), "utf8"));
+  // request-body limit ("Request Entity Too Large"). gzip usually gets them
+  // under it, and the gateway inflates them (x-ares-encoding: gzip) — but
+  // "usually" was the bug. buildReportBody measures the COMPRESSED body and
+  // sheds old events until it genuinely fits, so a session big enough to be
+  // worth reporting can still be reported.
+  const { body, droppedEvents } = buildReportBody(payload);
   const res = await fetchImpl(`${base}/api/gateway/v1/report`, {
     method: "POST",
     headers: {
@@ -231,7 +261,9 @@ export async function postAresGatewayReport(
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
     },
-    body: gz,
+    // Copied into a plain Uint8Array: fetch's BodyInit does not accept the
+    // ArrayBufferLike-generic view that zlib hands back.
+    body: new Uint8Array(body),
   }).catch(() => null);
   if (!res) return { ok: false, error: "couldn't reach the Ares gateway" };
   const data = (await res.json().catch(() => ({}))) as { id?: string; error?: unknown };
@@ -240,9 +272,12 @@ export async function postAresGatewayReport(
     // {error:{message}} — unwrap either into a readable line for the toast.
     const e = data.error;
     const msg = typeof e === "string" ? e : (e as { message?: string } | undefined)?.message;
+    if (res.status === 413) {
+      return { ok: false, error: "the gateway rejected this transcript as too large even after trimming — please tell the owner, this shouldn't happen" };
+    }
     return { ok: false, error: msg || `gateway returned ${res.status}` };
   }
-  return { ok: true, id: String(data.id ?? "") };
+  return { ok: true, id: String(data.id ?? ""), droppedEvents };
 }
 
 export function defaultTerminalModel(provider: string, settings: UiSettings): string {
@@ -266,11 +301,102 @@ export function defaultTerminalModel(provider: string, settings: UiSettings): st
 }
 
 /** Build a live model catalog without exposing provider keys to the webview. */
+/**
+ * The reasoning-effort ladder a model ACTUALLY honours.
+ *
+ * This is the single source of truth for the effort dial. It is deliberately
+ * here (daemon-side, beside discovery) and not in the desktop: the desktop must
+ * never guess a ladder from a model-id regex, because a rung the model ignores
+ * is a dial that lies. Kimi K3 is the worked example — it exposes high/max
+ * only, so offering "low" renders a control that silently does nothing.
+ *
+ * Order is always coldest → hottest; the desktop renders exactly these rungs.
+ * Returns [] when the model does no extended thinking at all (dial hidden), and
+ * undefined when we genuinely don't know (client keeps its fallback).
+ */
+export function effortLadderFor(
+  provider: string,
+  modelId: string,
+  live?: { supportsReasoning?: boolean; supportedParameters?: string[]; validEfforts?: string[] },
+): string[] | undefined {
+  const p = provider.toLowerCase();
+  const m = modelId.toLowerCase();
+
+  // Live capability wins over any table: OpenRouter publishes supported
+  // parameters per model, and Kimi reports supportsReasoning per model.
+  if (live?.supportsReasoning === false) return [];
+  // Kimi's K3 line publishes the exact rungs it honours (think_efforts) —
+  // the server's own list beats every heuristic below.
+  if (live?.validEfforts !== undefined && live.validEfforts.length > 0) {
+    return live.validEfforts;
+  }
+  if (live?.supportedParameters) {
+    return live.supportedParameters.includes("reasoning") ? ["off", "low", "medium", "high"] : [];
+  }
+
+  if (p === "kimi" || /^k\d|kimi/.test(m)) {
+    // Kimi's thinking models expose two rungs, not a five-step ladder.
+    return /highspeed|no-?think/.test(m) ? [] : ["high", "max"];
+  }
+  if (p === "deepseek" || /deepseek-v4|deepseek-v3\.2/.test(m)) return ["off", "high", "max"];
+  if (p === "anthropic" || /claude|fable|mythos|opus|sonnet|haiku/.test(m)) {
+    if (/haiku/.test(m)) return ["off", "low", "medium", "high"];
+    // The Claude 5 family (and late Opus 4.x) carry the full adaptive ladder.
+    if (/(?:fable|mythos)-?5|opus-5|sonnet-5|opus-4-[78]/.test(m)) return ["low", "medium", "high", "xhigh", "max"];
+    return ["off", "low", "medium", "high", "max"];
+  }
+  if (p === "openai" || /^gpt-|^o[134](?:-|$)/.test(m)) {
+    return /mini|spark/.test(m)
+      ? ["off", "minimal", "low", "medium", "high"]
+      : ["off", "minimal", "low", "medium", "high", "xhigh"];
+  }
+  if (p === "ollama") {
+    // Only the thinking-tagged builds honour an effort hint at all.
+    return /think|reason|qwen3|deepseek|glm|minimax|gpt-oss|nemotron|cogito/.test(m)
+      ? ["off", "low", "medium", "high"]
+      : [];
+  }
+  return undefined; // unknown — let the client fall back
+}
+
+/** Public entry: discovery + the effort ladder stamped onto every row. */
 export async function daemonModelCatalog(provider: string): Promise<DaemonModelOption[]> {
+  const rows = await daemonModelCatalogRaw(provider);
+  return rows.map((row) =>
+    row.effortLevels
+      ? row
+      : { ...row, effortLevels: effortLadderFor(provider, row.id, { supportsReasoning: row.capabilities?.includes("reasoning") === false ? false : undefined }) },
+  );
+}
+
+async function daemonModelCatalogRaw(provider: string): Promise<DaemonModelOption[]> {
   const settings = await loadUiSettings();
 
-  if (provider === "openai" || provider === "mock") {
-    return STATIC_MODEL_CATALOG[provider];
+  if (provider === "mock") {
+    return STATIC_MODEL_CATALOG.mock;
+  }
+
+  if (provider === "openai") {
+    // Ask the authenticated ChatGPT/Codex account for its REAL model list —
+    // exact ids the backend accepts, never guessed from display labels or an
+    // app-update-stale hardcoded list. Falls back to the static catalog when
+    // signed out or the endpoint is unreachable.
+    const live = await fetchCodexModels().catch(() => []);
+    if (live.length > 0) {
+      const staticHints = new Map(STATIC_MODEL_CATALOG.openai.map((m) => [m.id, m]));
+      return live.map((m) => {
+        const known = staticHints.get(m.id);
+        return {
+          id: m.id,
+          label: m.label ?? known?.label ?? m.id,
+          hint: m.description?.slice(0, 80) ?? known?.hint ?? "",
+          group: "OpenAI",
+          capabilities: known?.capabilities ?? ["tools", "reasoning", "vision"],
+          description: m.description,
+        };
+      });
+    }
+    return STATIC_MODEL_CATALOG.openai;
   }
 
   if (provider === "moa") {
@@ -321,6 +447,14 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
       ],
       // OpenRouter ships a rich blurb per model — the heart of the discovery UI.
       description: model.description?.trim() || undefined,
+      // ...and publishes the parameters each model accepts, so the effort
+      // ladder here is genuinely native rather than inferred from its id.
+      effortLevels: effortLadderFor("openrouter", model.id, { supportedParameters: model.supportedParameters ?? [] }),
+      contextLength: model.contextLength || undefined,
+      pricing: {
+        input: model.promptPrice != null ? Number(model.promptPrice) * 1e6 : undefined,
+        output: model.completionPrice != null ? Number(model.completionPrice) * 1e6 : undefined,
+      },
     }));
   }
 
@@ -336,6 +470,62 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
       group: "DeepSeek",
       capabilities: ["tools", "reasoning"],
     }));
+  }
+
+  if (provider === "kimi") {
+    // Live discovery from the signed-in Kimi account — surfaces the account's
+    // real roster (kimi-for-coding = K2.7 Coding, k3, k3-256k, ...). Static
+    // rows otherwise so the picker is never empty when signed out or offline.
+    const KIMI_LABELS: Record<string, string> = {
+      "kimi-for-coding": "Kimi K2.7 Coding",
+      "kimi-for-coding-highspeed": "Kimi K2.7 Coding · Highspeed",
+      k3: "Kimi K3",
+      "k3-256k": "Kimi K3 · 256K",
+    };
+    const kimiLabel = (id: string, displayName?: string): string =>
+      displayName !== undefined
+        ? (/^kimi/iu.test(displayName) ? displayName : `Kimi ${displayName}`)
+        : KIMI_LABELS[id] ?? `Kimi ${id.replace(/^kimi-/u, "").replace(/\bk(\d)/u, "K$1")}`;
+    try {
+      const settings = await loadUiSettings();
+      const live = await fetchKimiModels(settings.kimiKey || process.env.KIMI_API_KEY || undefined).catch(() => null);
+      if (live !== null && live.length > 0) {
+        return live.map((model) => {
+          const thinks = model.supportsReasoning !== false && model.thinkingType !== "no";
+          return {
+            id: model.id,
+            label: kimiLabel(model.id, model.displayName),
+            hint: [
+              thinks ? "agentic coding + reasoning" : "fast, no extended thinking",
+              model.contextLength !== undefined ? `${Math.round(model.contextLength / 1024)}K context` : undefined,
+            ].filter(Boolean).join(" · "),
+            group: "Kimi",
+            capabilities: [
+              "tools",
+              ...(thinks ? ["reasoning"] : []),
+              ...(model.supportsVision === true ? ["vision"] : []),
+            ],
+            // Kimi reports per-model thinking support — and, for the K3 line,
+            // the exact effort rungs it honours (think_efforts.valid_efforts).
+            // Feed both straight in so a no-think build hides the dial and a
+            // thinking build shows its real ladder, never a fabricated one.
+            effortLevels: effortLadderFor("kimi", model.id, {
+              supportsReasoning: thinks,
+              validEfforts: model.validEfforts,
+            }),
+            ...(model.contextLength !== undefined ? { contextLength: model.contextLength } : {}),
+          };
+        });
+      }
+    } catch {
+      // signed out or offline — fall through to the static rows
+    }
+    return [
+      { id: "kimi-for-coding", label: "Kimi K2.7 Coding", hint: "agentic coding + reasoning · 256K context", group: "Kimi", capabilities: ["tools", "reasoning", "vision"], contextLength: 262_144 },
+      { id: "kimi-for-coding-highspeed", label: "Kimi K2.7 Coding · Highspeed", hint: "faster serving · 256K context", group: "Kimi", capabilities: ["tools", "reasoning", "vision"], contextLength: 262_144 },
+      { id: "k3", label: "Kimi K3", hint: "frontier reasoning · 1M context", group: "Kimi", capabilities: ["tools", "reasoning", "vision"], contextLength: 1_048_576 },
+      { id: "k3-256k", label: "Kimi K3 · 256K", hint: "K3 on the 256K window", group: "Kimi", capabilities: ["tools", "reasoning", "vision"], contextLength: 262_144 },
+    ];
   }
 
   if (provider === "ares") {
@@ -367,6 +557,7 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     const apiKey = settings.ollamaApiKey || process.env.OLLAMA_API_KEY || "";
     const response = await fetch("https://ollama.com/api/tags", {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(8_000),
     }).catch(() => null);
     if (response?.ok) {
       const payload = await response.json() as {
@@ -390,12 +581,38 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     }
   }
 
+  // The FULL public library (ollama.com/library) — every model, pulled or not,
+  // with the same blurb/pulls/updated meta the website shows. Degrades to
+  // nothing on network failure; never blocks the rest of the catalog.
+  const library = await fetchOllamaLibraryModels().catch(() => []);
+  for (const entry of library) {
+    if (entry.capabilities.includes("embedding")) continue; // not chat-pickable
+    const caps = [
+      ...(entry.capabilities.includes("tools") ? ["tools"] : []),
+      ...(entry.capabilities.includes("thinking") ? ["reasoning"] : []),
+      ...(entry.capabilities.includes("vision") ? ["vision"] : []),
+    ];
+    put({
+      // Cloud-hosted library models run as name:cloud; local-only ones by name
+      // (which works once pulled — the UI shows pulled state).
+      id: entry.cloud ? `${entry.name}:cloud` : entry.name,
+      label: entry.name,
+      hint: [entry.pulls ? `${entry.pulls} pulls` : "", entry.tagCount ? `${entry.tagCount} tag${entry.tagCount === 1 ? "" : "s"}` : "", entry.updated ? `updated ${entry.updated}` : ""].filter(Boolean).join(" · "),
+      group: entry.cloud ? "Ollama Library · cloud" : "Ollama Library",
+      capabilities: caps,
+      description: entry.description,
+      pulls: entry.pulls,
+      updated: entry.updated,
+    });
+  }
+
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 export function providerFamilyForSelection(selection: ProviderSelection): string {
+  if (selection.family) return selection.family;
   const fromSource = selection.source.split(":").at(-1);
-  if (fromSource && ["openai", "ollama", "anthropic", "deepseek", "openrouter", "mock"].includes(fromSource)) {
+  if (fromSource && TERMINAL_PROVIDERS.includes(fromSource as TerminalProviderId)) {
     return fromSource;
   }
   const name = selection.provider.name.toLowerCase();
@@ -403,6 +620,21 @@ export function providerFamilyForSelection(selection: ProviderSelection): string
   if (name.startsWith("ollama")) return "ollama";
   if (name.startsWith("mock")) return "mock";
   return name;
+}
+
+/** Validate a newly requested provider/model without sending conversation data.
+ * Selection is only committed after this succeeds, so a typo, expired key, or
+ * unpulled Ollama model cannot mutate the session and trigger surprise routing. */
+export async function preflightProviderSelection(selection: ProviderSelection): Promise<void> {
+  if (!selection.preflight) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${selection.family ?? "provider"} preflight timed out after 8 seconds`)), 8_000);
+  });
+  const result = await Promise.race([selection.preflight(), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+  if (!result.ok) throw new Error(result.error);
 }
 
 /** Resolve a MoA ensemble's members into concrete Providers by re-entering
@@ -430,6 +662,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: new MockEchoProvider(),
       model: requestedModel ?? "mock-echo",
       source: "explicit:mock",
+      family: "mock",
     };
   }
 
@@ -439,6 +672,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider,
       model: requestedModel ?? process.env.ARES_OPENAI_MODEL ?? settings.lastOpenAIModel ?? "gpt-5.5",
       source: explicit ? "explicit:openai" : preferred ? "settings:openai" : "auto:openai",
+      family: "openai",
     };
   }
 
@@ -449,6 +683,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: new OpenRouterProvider({ apiKey: settings.openRouterKey ?? "", model }),
       model,
       source: explicit ? "explicit:openrouter" : "settings:openrouter",
+      family: "openrouter",
     };
   }
 
@@ -469,6 +704,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       }),
       model,
       source: explicit ? "explicit:custom" : "settings:custom",
+      family: "custom",
     };
   }
 
@@ -485,6 +721,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       }),
       model,
       source: explicit ? "explicit:ares" : "settings:ares",
+      family: "ares",
     };
   }
 
@@ -496,17 +733,71 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
     // budget_tokens. x-api-key skips the OAuth identity branch (no Claude-Code
     // leak). ARES_DEEPSEEK_DIALECT=openai forces the legacy OpenAI-compat path.
     const useOpenAiDialect = process.env.ARES_DEEPSEEK_DIALECT === "openai";
+    const deepSeekKey = settings.deepSeekKey || process.env.DEEPSEEK_API_KEY || "";
     return {
       provider: useOpenAiDialect
-        ? new DeepSeekProvider({ apiKey: settings.deepSeekKey, model })
+        ? new DeepSeekProvider({ apiKey: deepSeekKey, model })
         : new AnthropicProvider({
-            apiKey: settings.deepSeekKey || undefined,
+            apiKey: deepSeekKey || undefined,
             // /anthropic is the base; the Messages API path appends like Anthropic's own.
             endpointUrl: "https://api.deepseek.com/anthropic/v1/messages",
             dialect: "deepseek",
           }),
       model,
       source: explicit ? "explicit:deepseek" : "settings:deepseek",
+      family: "deepseek",
+      preflight: async () => {
+        if (!deepSeekKey) return { ok: false, error: "DeepSeek API key is missing. Add it in Settings → API Keys." };
+        try {
+          const models = await fetchDeepSeekModels({ apiKey: deepSeekKey });
+          if (!models.some((item) => item.id === model)) {
+            return { ok: false, error: `DeepSeek model \"${model}\" is not enabled for this API key.` };
+          }
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, error: `DeepSeek connection failed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+      },
+    };
+  }
+  if (preferred === "kimi") {
+    const model = requestedModel ?? settings.lastKimiModel ?? "kimi-for-coding";
+    // Kimi's coding endpoint is plain Chat Completions with Bearer auth, so the
+    // hardened OpenAI-compat client drives it directly. Credential order: the
+    // Ares-stored key, the env key, then the subscription token minted by the
+    // Kimi OAuth device flow (packages/core/src/providers/kimiAuth.ts).
+    const staticKimiKey = settings.kimiKey || process.env.KIMI_API_KEY || "";
+    let kimiCredential = staticKimiKey;
+    if (!kimiCredential) {
+      kimiCredential = (await resolveKimiAccessToken().catch(() => null)) ?? "";
+    }
+    return {
+      provider: new OpenRouterProvider({
+        apiKey: kimiCredential,
+        model,
+        baseUrl: "https://api.kimi.com/coding/v1",
+        providerName: "kimi",
+        // Subscription tokens expire in hours while a session's provider
+        // instance lives for days: re-resolve per request (refresh-on-read
+        // renews near expiry), and when the server still 401s mid-turn,
+        // exchange the refresh token once and replay instead of failing the
+        // task. Static API keys skip both — there is nothing to refresh.
+        ...(staticKimiKey
+          ? {}
+          : {
+              apiKeySupplier: () => resolveKimiAccessToken(),
+              onAuthError: () => forceRefreshKimiAccessToken(),
+            }),
+      }),
+      model,
+      source: explicit ? "explicit:kimi" : "settings:kimi",
+      family: "kimi",
+      preflight: async () => {
+        if (!kimiCredential) {
+          return { ok: false, error: "Kimi is not connected. Sign in with Kimi in Settings → API Keys, or add a Kimi API key." };
+        }
+        return { ok: true };
+      },
     };
   }
 
@@ -518,6 +809,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: new AnthropicProvider({ apiKey: settings.anthropicKey || undefined }),
       model,
       source: explicit ? "explicit:anthropic" : "settings:anthropic",
+      family: "anthropic",
     };
   }
 
@@ -528,6 +820,7 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: await buildMoaProvider(ensembleName),
       model: ensembleName,
       source: explicit ? "explicit:moa" : "settings:moa",
+      family: "moa",
     };
   }
 
@@ -553,6 +846,21 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: pool.provider("reasoner"),
       model: slots.reasoner.model,
       source: explicit ? "explicit:ollama" : preferred ? "settings:ollama" : "auto:ollama",
+      family: "ollama",
+      preflight: async () => {
+        const health = await pool.health();
+        if (!health.reachable) {
+          return { ok: false, error: `Ollama is not reachable at ${health.host}. Start Ollama or check OLLAMA_HOST.` };
+        }
+        if (!health.availableModels.includes(slots.reasoner.model)) {
+          const available = health.availableModels.slice(0, 6).join(", ");
+          return {
+            ok: false,
+            error: `Ollama model \"${slots.reasoner.model}\" is not installed or available${available ? `. Available now: ${available}` : ""}. Pull it before selecting it.`,
+          };
+        }
+        return { ok: true };
+      },
       subModel: {
         apply: (req) => pool.apply(req),
         summarize: (req) => pool.summarize(req),

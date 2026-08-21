@@ -34,7 +34,8 @@ export type LifecycleEvent =
   | { type: "mission_started"; missionId: string; goal: string; gain?: EvolutionGain }
   | { type: "mission_step_completed"; missionId: string; step: string; remaining: number; gain?: EvolutionGain }
   | { type: "mission_verified"; missionId: string; passed: boolean; iteration: number; gain?: EvolutionGain }
-  | { type: "mission_completed"; missionId: string; goal: string; steps: number; gain?: EvolutionGain };
+  | { type: "mission_completed"; missionId: string; goal: string; steps: number; gain?: EvolutionGain }
+  | { type: "persona_changed"; action: "adopted" | "released" | "created" | "removed"; name: string; gain?: EvolutionGain };
 
 const listeners = new Set<(event: LifecycleEvent) => void>();
 

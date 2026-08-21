@@ -104,7 +104,7 @@ export interface InkChatOptions {
    *  as an IN-FRAME card (keys 1/2/3 or click) instead of a raw-stderr prompt
    *  Ink instantly paints over — which hung turns forever. */
   registerPermissionHandler?(
-    handler: (req: { toolName: string; reason: string; suggestion?: string }) => Promise<"allow_once" | "allow_always" | "deny">,
+    handler: (req: { toolName: string; reason: string; suggestion?: string; signal?: AbortSignal }) => Promise<"allow_once" | "allow_always" | "deny">,
   ): void;
   /** Mid-turn steering: a line typed while busy is queued into the live turn
    *  (the engine drains reminders after every tool round) instead of dropped. */
@@ -116,7 +116,8 @@ interface PendingPermission {
   toolName: string;
   reason: string;
   suggestion?: string;
-  resolve: (d: "allow_once" | "allow_always" | "deny") => void;
+  settled: boolean;
+  finish: (d: "allow_once" | "allow_always" | "deny") => boolean;
 }
 
 interface LogLine {
@@ -623,17 +624,52 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
     options.registerPermissionHandler?.(
       (req) =>
         new Promise((resolve) => {
-          const pending: PendingPermission = { ...req, resolve };
+          let pending!: PendingPermission;
+          const onAbort = () => {
+            if (!pending.finish("deny")) return;
+            if (permRef.current === pending) {
+              let next = permQueue.current.shift() ?? null;
+              while (next?.settled) next = permQueue.current.shift() ?? null;
+              permRef.current = next;
+              setPerm(next);
+            } else {
+              permQueue.current = permQueue.current.filter((candidate) => candidate !== pending);
+            }
+          };
+          pending = {
+            toolName: req.toolName,
+            reason: req.reason,
+            suggestion: req.suggestion,
+            settled: false,
+            finish: (decision) => {
+              if (pending.settled) return false;
+              pending.settled = true;
+              req.signal?.removeEventListener("abort", onAbort);
+              resolve(decision);
+              return true;
+            },
+          };
+          if (req.signal?.aborted) {
+            pending.finish("deny");
+            return;
+          }
+          req.signal?.addEventListener("abort", onAbort, { once: true });
           if (permRef.current) permQueue.current.push(pending);
-          else setPerm(pending);
+          else {
+            permRef.current = pending;
+            setPerm(pending);
+          }
         }),
     );
   }, [options]);
   const decidePermission = useCallback((decision: "allow_once" | "allow_always" | "deny") => {
     const current = permRef.current;
     if (!current) return;
-    current.resolve(decision);
-    setPerm(permQueue.current.shift() ?? null);
+    if (!current.finish(decision)) return;
+    let next = permQueue.current.shift() ?? null;
+    while (next?.settled) next = permQueue.current.shift() ?? null;
+    permRef.current = next;
+    setPerm(next);
   }, []);
   // Fullscreen overlays — each REPLACES the main view (anchored at app row 1)
   // so every row is deterministic for the tuiChrome hit-tests.
@@ -1007,9 +1043,18 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         // was the single ugliest thing in the TUI. Collapse to one dim pulse
         // per source and never repeat back-to-back.
         if (event.source === "verifier") {
-          append("verify", event.text, event.source);
-        } else if (event.source === "compaction") {
+          // Turn-end verification disclosures (UNVERIFIED / UNRESOLVED /
+          // GUI-UNVERIFIED) are gone by owner order — they stay in the model's
+          // context and diagnostics, never in the stream.
+          if (!/^(?:UNVERIFIED|UNRESOLVED|GUI-UNVERIFIED)\b/i.test(event.text)) {
+            append("verify", event.text, event.source);
+          }
+        } else if (event.source === "compaction" && !/^microcompacted\b/i.test(event.text)) {
           append("muted", event.text.split("\n")[0].slice(0, 120), "compaction");
+        } else if (event.source === "instructions" && /retrying|stalled|provider hiccup|switched to/i.test(event.text)) {
+          // Provider retry/stall/failover notes are the only heartbeat the user
+          // gets during dead air — swallowing them read as a frozen turn.
+          append("muted", event.text.split("\n")[0].slice(0, 120), "retry");
         }
         // Everything else (memory weave, identity anchor, foreground framing) is
         // INTERNAL prompt plumbing with zero user value. It is NOT shown — dumping
@@ -1026,12 +1071,15 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         collapseDiffCards();
         finalizeFleet();
         settleOrphanToolLines();
+        // workStatus (unverified/blocked) is intentionally not echoed into the
+        // stream — the owner removed the turn-end verification warning.
         // A permission ask can't outlive its turn — deny + drain so no dead
         // card lingers (its awaiter is gone; resolving is a harmless no-op).
         if (permRef.current) {
-          permRef.current.resolve("deny");
-          for (const p of permQueue.current) p.resolve("deny");
+          permRef.current.finish("deny");
+          for (const p of permQueue.current) p.finish("deny");
           permQueue.current = [];
+          permRef.current = null;
           setPerm(null);
         }
         setStats((prev) => ({

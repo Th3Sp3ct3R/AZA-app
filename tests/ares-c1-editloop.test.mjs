@@ -83,7 +83,7 @@ test("C1 mid-turn drain: a reminder ready after a tool batch lands in the SAME t
     { tool: { name: "Edit", input: { file_path: "a.ts" } } },
     { text: "done" },
   ]);
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider,
       model: "scripted",
@@ -121,7 +121,7 @@ test("C1 end-of-turn gate: red blocks 'done', the model gets to repair, green en
     { text: "all done!" }, // tries to finish immediately
     { text: "fixed it properly now" }, // after the gate objects
   ]);
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider,
       model: "scripted",
@@ -155,7 +155,7 @@ test("C1 gate cap: a permanently-red gate cannot trap the turn forever", async (
   const dir = await mkdtemp(path.join(tmpdir(), "ares-c1-"));
   let gateCalls = 0;
   const provider = scriptedProvider([{ text: "done (1)" }, { text: "done (2)" }, { text: "done (3)" }]);
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider,
       model: "scripted",
@@ -182,7 +182,7 @@ test("C1 gate honesty: a stuck red gate ends the turn but SURFACES the failure (
   const dir = await mkdtemp(path.join(tmpdir(), "ares-c1-"));
   let gateCalls = 0;
   const provider = scriptedProvider([{ text: "done (1)" }, { text: "done (2)" }, { text: "done (3)" }]);
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider,
       model: "scripted",
@@ -207,7 +207,9 @@ test("C1 gate honesty: a stuck red gate ends the turn but SURFACES the failure (
     (e) => e.type === "system_reminder_injected" && /UNRESOLVED at turn end/.test(e.text),
   );
   assert.ok(unresolved.length >= 1, "the still-red failure is surfaced as UNRESOLVED, not silently completed");
-  assert.equal(events.find((e) => e.type === "turn_end").status, "completed");
+  const end = events.find((e) => e.type === "turn_end");
+  assert.equal(end.status, "completed");
+  assert.equal(end.workStatus, "blocked", "execution completed, but work truth remains blocked");
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -215,7 +217,7 @@ test("C1 gate progress: NEW objections each round keep the model working past th
   const dir = await mkdtemp(path.join(tmpdir(), "ares-c1-"));
   let gateCalls = 0;
   const provider = scriptedProvider([{ text: "a" }, { text: "b" }, { text: "c" }, { text: "d" }, { text: "done" }]);
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     {
       provider,
       model: "scripted",
@@ -241,7 +243,7 @@ test("C1 gate progress: NEW objections each round keep the model working past th
 test("C1 gate is skipped entirely when not configured (zero-cost default)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "ares-c1-"));
   const provider = scriptedProvider([{ text: "done" }]);
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider, model: "scripted", systemPrompt: "s", tools: [], workspace: dir },
     "sess_c1_off",
   );

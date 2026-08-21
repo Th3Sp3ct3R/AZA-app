@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Ares Browser Bridge",
+  "version": "1.0.0",
+  "minimum_chrome_version": "125",
+  "description": "Owner-approved, authenticated high-speed bridge between Ares and existing browser tabs.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxNB4FO/yjBWrHf2s48+rlepMhAcRa1zCfILGXe+YqzCg7xozcnX+keS6cfcIQb+sNy1/Mpw3GJpKkyFMAXMWbed1jsYkle7KIaVp2D3G8q+/VOJM1JW//k6dhhBd0I5Mkga5JQRBqpy4bEOsgpGdZRdC9oQsktAw5K2uaDOvUgW/1J7/hPpYwNyuvceFeSYhxSVgy3iqkJxjTHnf29nVtQegjU4VQFBlmDBZl6el4WPz6QgK5BTd1DsZcdr5lor844iEUH7lEuzClqCaRYC9Vjb2p0kZOgmBC7mTIFHXIX2yU820dz7SQqWI28Ea4Foe/Q9MYkqdFdM8yzAeAtPcWQIDAQAB",
+  "permissions": [
+    "activeTab",
+    "debugger",
+    "nativeMessaging",
+    "scripting",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "optional_permissions": ["downloads"],
+  "optional_host_permissions": ["http://*/*", "https://*/*", "file:///*"],
+  "background": { "service_worker": "src/service-worker.js", "type": "module" },
+  "action": {
+    "default_title": "Ares Browser Bridge",
+    "default_popup": "src/popup.html"
+  }
+}

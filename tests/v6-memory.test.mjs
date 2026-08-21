@@ -66,21 +66,25 @@ test("memory: recall spreads along associations to surface a linked memory", asy
 
 // ── 4. consolidation ─────────────────────────────────────────────────────────
 
-test("memory: consolidation forgets trivia and crystallizes a recurring theme", async () => {
+test("memory: consolidation forgets trivia; crystallization belongs to synthesize()", async () => {
   const store = MemoryStore.memory();
   // a faded one-off episode (old, never reinforced) → should be pruned
   await store.add({ kind: "episodic", content: "random idle chatter", at: daysAgo(90) });
-  // a recurring theme across 3 fresh episodes → should be promoted to semantic
+  // recurring fresh episodes: consolidate() KEEPS them but no longer mints
+  // single-token "Recurring theme" semantics from them — that mechanism
+  // produced 47 filler nodes on one real store ("first", "every", "claude").
+  // synthesize() crystallizes recurrence properly (IDF keys, provenance).
   await store.add({ kind: "episodic", content: "Researched shopify product trends" });
   await store.add({ kind: "episodic", content: "Posted a shopify listing" });
   await store.add({ kind: "episodic", content: "Checked shopify revenue dashboard" });
 
   const report = await store.consolidate();
   assert.ok(report.pruned >= 1, "the faded one-off episode was forgotten");
-  assert.ok(report.promoted.includes("shopify"), "the recurring theme was crystallized");
-  const semantic = store.all().find((n) => n.kind === "semantic" && n.tags?.includes("theme:shopify"));
-  assert.ok(semantic, "a durable semantic memory now exists for the theme");
-  assert.ok(semantic.links.length >= 3, "and it's linked to the episodes it came from");
+  assert.equal(report.promoted.length, 0, "consolidate no longer mints theme semantics");
+  assert.equal(store.all().some((n) => n.tags?.some((t) => t.startsWith("theme:"))), false);
+  // (Crystallization itself — recurring episodes → insight nodes with IDF
+  // cluster keys and provenance — is covered by v9-synthesis.test.mjs.)
+  assert.equal(store.all().filter((n) => n.kind === "episodic").length, 3, "the fresh episodes survive for synthesize()");
 });
 
 // ── 5. pluggable home (the flashdrive) ───────────────────────────────────────
@@ -181,18 +185,19 @@ test("memory: consolidation merges exact duplicate memories and redirects links"
   assert.equal(store.get(keeper.id).links.includes(neighbor.id), true, "keeper should inherit duplicate links");
 });
 
-test("memory: consolidation prunes filler theme semantics and refuses new filler themes", async () => {
+test("memory: consolidation prunes ALL theme semantics and mints no new ones", async () => {
   const store = MemoryStore.memory();
   await store.add({ kind: "semantic", content: 'Recurring theme "lmao" observed across 5 episodes.', tags: ["theme:lmao"], strength: 1.5 });
+  // Even a "meaningful"-looking theme is filler: a token plus a count is not
+  // knowledge, and the stopword gate was unwinnable whack-a-mole in the field.
+  await store.add({ kind: "semantic", content: 'Recurring theme "shopify" observed across 3 episodes.', tags: ["theme:shopify"], strength: 1.5 });
   await store.add({ kind: "episodic", content: "hey homie u working lmao?" });
-  await store.add({ kind: "episodic", content: "tried to fix ur memory as i was hitting context limits lmao" });
-  await store.add({ kind: "episodic", content: "should all be good tho codex did lmao" });
   await store.add({ kind: "episodic", content: "Researched shopify product trends" });
   await store.add({ kind: "episodic", content: "Posted a shopify listing" });
   await store.add({ kind: "episodic", content: "Checked shopify revenue dashboard" });
 
   const report = await store.consolidate();
-  assert.ok(report.pruned >= 1, "existing filler semantic should be removed");
-  assert.equal(store.all().some((n) => n.tags?.includes("theme:lmao")), false, "lmao should never become semantic knowledge");
-  assert.ok(report.promoted.includes("shopify"), "meaningful repeated concepts still crystallize");
+  assert.ok(report.pruned >= 2, "every legacy theme semantic is removed");
+  assert.equal(store.all().some((n) => n.tags?.some((t) => t.startsWith("theme:"))), false, "no theme node survives or is minted");
+  assert.equal(report.promoted.length, 0, "theme promotion is gone for good");
 });

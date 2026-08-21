@@ -14,15 +14,16 @@ import { agentPaths, aresAgentHome } from "../paths.js";
 import { exists, writeFileAtomic } from "../files.js";
 import { emitLifecycle } from "../lifecycle/bus.js";
 import { countAppendedItems, gainForTarget } from "../voice.js";
+import { addLaw, MAX_LAWS } from "../laws.js";
 
-const TARGETS = ["soul", "heartbeat", "user", "memory", "identity", "capabilities", "daily"] as const;
+const TARGETS = ["soul", "laws", "heartbeat", "user", "memory", "identity", "capabilities", "daily"] as const;
 type Target = (typeof TARGETS)[number];
 
 const inputSchema = z
   .object({
     target: z
       .enum(TARGETS)
-      .describe("Which mind file to edit: soul, heartbeat, user, memory, identity, capabilities, or daily (today's raw log)."),
+      .describe("Which mind file to edit: soul, laws (the owner's standing orders — ALWAYS-ON in every prompt; append ONE imperative sentence the moment the owner gives a standing instruction or correction), heartbeat, user, memory, identity, capabilities, or daily (today's raw log)."),
     action: z
       .enum(["read", "append", "replace_section", "replace_file", "note"])
       .describe(
@@ -85,6 +86,22 @@ export const SelfEvolveTool = buildTool({
 
     if (!input.text || !input.text.trim()) {
       throw new Error(`SelfEvolve.${input.action} requires non-empty text`);
+    }
+
+    // Laws appends go through addLaw, not the generic file append: laws carry
+    // a dedupe (re-adding refreshes the date instead of duplicating), a hard
+    // cap with a loud failure, and the one-sentence format the always-on
+    // injector renders. Other actions (read above, replace_* below) stay
+    // generic — LAWS.md is the owner's file and tolerates hand edits.
+    if (input.target === "laws" && input.action === "append") {
+      const laws = await addLaw(input.text);
+      const after = await readIfExists(filePath);
+      emitLifecycle({ type: "self_evolve", target: "laws", action: "append", bytesBefore, bytesAfter: after.length, gain: gainForTarget("LAWS", 1, "append") });
+      return {
+        output: { target: input.target, action: "append", filePath, bytesBefore, bytesAfter: after.length },
+        touchedFiles: [filePath],
+        display: `law recorded (${laws.length}/${MAX_LAWS}) — in force from the next prompt on`,
+      };
     }
 
     let nextContent: string;
@@ -161,6 +178,7 @@ export const SelfEvolveTool = buildTool({
 function resolveTargetPath(target: Target, paths: ReturnType<typeof agentPaths>): string {
   switch (target) {
     case "soul": return paths.soul;
+    case "laws": return paths.laws;
     case "heartbeat": return paths.heartbeat;
     case "user": return paths.user;
     case "memory": return paths.memory;

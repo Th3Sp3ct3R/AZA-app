@@ -10,57 +10,39 @@ import { type PermissionSettings } from "../permissionPolicy.js";
 import { aresAgentHome } from "@ares/agent";
 import { mindPaths } from "@ares/mind";
 import { effectsPaths, type RailsContext } from "@ares/effects";
-
-export interface ParsedArgs {
-  command: string;
-  flags: Map<string, string>;
-  positionals: string[];
-}
-
-export function parseArgs(argv: string[]): ParsedArgs {
-  let command = "launcher";
-  let rest = argv;
-  if (argv[0] && !argv[0].startsWith("--")) {
-    command = argv[0];
-    rest = argv.slice(1);
-  }
-  const flags = new Map<string, string>();
-  const positionals: string[] = [];
-  for (let i = 0; i < rest.length; i++) {
-    const arg = rest[i];
-    if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      const next = rest[i + 1];
-      if (next !== undefined && !next.startsWith("--")) {
-        flags.set(key, next);
-        i++;
-      } else {
-        flags.set(key, "true");
-      }
-    } else {
-      positionals.push(arg);
-    }
-  }
-  return { command, flags, positionals };
-}
+export { parseArgs, type ParsedArgs } from "./args.js";
 
 let cachedCliVersion: string | undefined;
 
-/** The shipped CLI version, read from this package's own package.json instead
- *  of a hardcoded literal that goes stale every release (was "0.11.2" while
- *  the actual build had moved on). Walks up from dist/entry/ (or src/entry/)
- *  until it finds the package.json. */
+/** The shipped CLI version, read from a package.json instead of a hardcoded
+ *  literal that goes stale every release (was "0.11.2" while the actual build
+ *  had moved on). Walks up from dist/entry/ (or src/entry/) and keeps going to
+ *  the root manifest — the one named "ares", whose version the release workflow
+ *  bumps alongside tauri.conf.json.
+ *
+ *  Stopping at the first package.json found reintroduced the same staleness by
+ *  another route: `packages/cli/package.json` is a private workspace member
+ *  nobody bumps, so it still read 0.16.0 while the product shipped 0.37.2. That
+ *  number is not only cosmetic — it goes out as `app_version` in the daemon
+ *  handshake and as `aresVersion` on the agent side.
+ *
+ *  The nearest manifest stays as the fallback, so a CLI extracted on its own
+ *  (no monorepo root above it) still reports something rather than 0.0.0. */
 export async function cliVersion(): Promise<string> {
   if (cachedCliVersion) return cachedCliVersion;
   try {
     let dir = path.dirname(fileURLToPath(import.meta.url));
-    let version: string | undefined;
-    for (let depth = 0; depth < 4 && !version; depth++) {
+    let nearest: string | undefined;
+    let root: string | undefined;
+    for (let depth = 0; depth < 5 && !root; depth++) {
       dir = path.dirname(dir);
       const raw = await readFile(path.join(dir, "package.json"), "utf8").catch(() => null);
-      if (raw) version = (JSON.parse(raw) as { version?: string }).version;
+      if (!raw) continue;
+      const manifest = JSON.parse(raw) as { name?: string; version?: string };
+      if (manifest.name === "ares") root = manifest.version;
+      else nearest ??= manifest.version;
     }
-    cachedCliVersion = version ?? "0.0.0";
+    cachedCliVersion = root ?? nearest ?? "0.0.0";
   } catch {
     cachedCliVersion = "0.0.0";
   }
@@ -69,9 +51,42 @@ export async function cliVersion(): Promise<string> {
 
 export interface AresRuntimeState {
   permissionMode: PermissionMode;
+  /** Late-bound full child prompt composition. Tool catalogs are constructed
+   * before agent persona/memory/git context is loaded, so Task and Conductor
+   * resolve this at dispatch time instead of capturing a reduced prompt. */
+  composeChildSystemPrompt?(): string | Promise<string>;
   /** Live owner permission posture (master + per-category + fleet inherit).
    *  Mutated by the set_permissions daemon command so toggles apply mid-session. */
   permissions?: PermissionSettings;
+  /** Session-owned transition hook. Mode changes are workflow state, not just
+   * a mutable UI bit: this recomposes the prompt and persists the transition. */
+  onPermissionModeChanged?(
+    mode: PermissionMode,
+    opts?: { ownerIntent?: boolean },
+  ): Promise<void> | void;
+  onPlanStarted?(reason: string): Promise<void> | void;
+  onPlanDraftUpdated?(plan: string): Promise<void> | void;
+  currentPlan?(): Promise<string | null> | string | null;
+  onPlanProposed?(plan: string): Promise<void> | void;
+  onPlanApproved?(plan: string): Promise<void> | void;
+}
+
+/** The owner's own transition (`/plan`, `/code`, the desktop mode toggle).
+ *  Model-driven transitions go through the PlanMode tool instead, which does
+ *  NOT carry owner intent and so stays subject to the plan-approval guard. */
+export async function transitionPermissionMode(
+  runtime: AresRuntimeState,
+  mode: PermissionMode,
+  opts: { ownerIntent?: boolean } = { ownerIntent: true },
+): Promise<void> {
+  const previous = runtime.permissionMode;
+  runtime.permissionMode = mode;
+  try {
+    await runtime.onPermissionModeChanged?.(mode, opts);
+  } catch (error) {
+    runtime.permissionMode = previous;
+    throw error;
+  }
 }
 
 export interface CliRuntimeContext {
@@ -96,7 +111,10 @@ export function cliRuntimeContext(options: { workspace?: string; home?: string }
   return {
     workspace,
     home,
-    aresHome: aresHome(),
+    // An explicit home is an isolation boundary (tests/evals/portable installs),
+    // not merely a Mind-directory override. Permission and auth-adjacent state
+    // must follow it instead of leaking back to the owner's global ~/.ares.
+    aresHome: options.home ? path.resolve(options.home) : aresHome(),
     mind: mindPaths(home),
     effects: effectsPaths(home),
     selfTerritoryRoots: [home],
@@ -163,10 +181,22 @@ export async function printHelp(): Promise<void> {
       "  ares mind add --content \"<text>\" [--kind episodic|semantic|procedural]",
       "  ares mind list | doctor | consolidate [--json]",
       "                              Inspect, diagnose, or sleep-consolidate memory.",
+      "  ares mnemosyne [status|serve|bindings|add|retire|compliance]",
+      "                              The memory server: bindings (law/pact/doctrine) and the recalled-but-violated report.",
+      "  ares computer [status|setup|screen [--watch]|exec -- <cmd>|distros|use <distro>|mode <host|sandbox>|snapshot|rebuild]",
+      "                              The agent's own computer: a sandboxed Debian under WSL2 with a watchable screen.",
+      "                              `use` adopts any registered WSL distro as the machine; `mode sandbox` confines Ares to it.",
       "  ares eval [--json]         Run the built-in harness regression eval suite.",
+      "  ares eval coding [--suite coding-v4|coding-v3|coding-v2|coding-v1] [--no-harness] [--gate] [--json]",
+      "                              Run the coding gauntlet; real models require --allow-unsafe-process-eval inside an isolated VM/container.",
+      "                              --gate exits 3 when this run regresses against its own history (cost, verification, wall-clock).",
+      "  ares eval trend [--suite S] [--model M] [--json]",
+      "                              Trend completed gauntlet runs and print the harness on/off A/B.",
       "  ares login                  ChatGPT OAuth device-code flow.",
       "  ares doctor                 Show provider auth + Ollama Cloud health.",
       "  ares friction [--days N]    Telemetry report: tool errors, edit tiers, stalls, cache health.",
+      "  ares triage [scan|list]      Cluster local failures into a durable, human-gated reliability queue.",
+      "  ares triage show <id>        Inspect redacted evidence and source pointers for one finding.",
       "  ares help                   Print this help.",
       "",
       "Env vars:",
@@ -175,6 +205,11 @@ export async function printHelp(): Promise<void> {
       "                              Override Ollama Cloud slot models.",
       "  ARES_HOME                   Override auth/config dir (default ~/.ares).",
       "  ARES_RESUME_MESSAGES        Max replay messages before compaction (default 80, 0=all).",
+      "  ARES_SESSION_LEASE_TTL_MS    Crash-takeover window for a running session (default 30000).",
+      "  ARES_SESSION_LEASE_HEARTBEAT_MS  Lease renewal cadence (default 10000; capped at TTL/3).",
+      "  ARES_SELF_TRIAGE             Set to 0 to disable automatic post-turn reliability scans.",
+      "  ARES_SELF_TRIAGE_INTERVAL_MS Minimum automatic scan cadence (default 6 hours).",
+      "  ARES_TRIAGE_WORKSPACES       Extra workspace roots (OS path-delimiter separated).",
       "  ARES_THEME                  UI theme: cyberpunk, minimal, matrix, neon, split, professional, amber, dashboard, light.",
       "",
       "Flags:",

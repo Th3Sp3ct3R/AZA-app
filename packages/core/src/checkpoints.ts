@@ -259,11 +259,7 @@ export async function diffWorkspaceCheckpoint(
   id: string,
 ): Promise<{ added: string[]; modified: string[]; deleted: string[] }> {
   const checkpoint = await loadWorkspaceCheckpoint(workspace, id);
-  const currentFiles = await listWorkspaceFiles(workspace);
-  const current = new Map<string, string>();
-  for (const file of currentFiles) {
-    current.set(path.relative(workspace, file).replace(/\\/g, "/"), sha256(await fs.readFile(file)));
-  }
+  const current = new Map((await fullManifest(workspace)).map((file) => [file.path, file.blobHash]));
   const snap = new Map(checkpoint.fileManifest.map((f) => [f.path, f.blobHash]));
   const added = [...current.keys()].filter((p) => !snap.has(p)).sort();
   const deleted = [...snap.keys()].filter((p) => !current.has(p)).sort();
@@ -306,19 +302,26 @@ export async function diffWorkspaceCheckpointUnified(
   const manifest = new Map(checkpoint.fileManifest.map((f) => [f.path, f]));
   // When the caller names the files (the per-tool touchedFiles diff — the hot
   // path), stat ONLY those instead of walking the whole workspace again.
+  const currentStats = new Map<string, { path: string; mtimeMs: number; size: number }>();
   let currentFiles: Set<string>;
   let requested: string[];
   if (files?.length) {
-    requested = files.map((file) => normalizeRel(workspace, file));
+    requested = [...new Set(files.map((file) => normalizeRel(workspace, file)))];
     currentFiles = new Set<string>();
     await Promise.all(
       requested.map(async (rel) => {
-        const stat = await fs.stat(path.join(workspace, rel)).catch(() => null);
-        if (stat?.isFile()) currentFiles.add(rel);
+        const full = path.join(workspace, rel);
+        const fileStat = await fs.stat(full).catch(() => null);
+        if (fileStat?.isFile() && fileStat.size <= MAX_FILE_BYTES) {
+          currentFiles.add(rel);
+          currentStats.set(rel, { path: full, mtimeMs: fileStat.mtimeMs, size: fileStat.size });
+        }
       }),
     );
   } else {
-    currentFiles = new Set((await listWorkspaceFiles(workspace)).map((file) => relPath(workspace, file)));
+    const filesWithStats = await listWorkspaceFilesWithStats(workspace);
+    for (const file of filesWithStats) currentStats.set(relPath(workspace, file.path), file);
+    currentFiles = new Set(currentStats.keys());
     requested = [...new Set([...manifest.keys(), ...currentFiles])].sort();
   }
   const maxChars = opts.maxChars ?? 40_000;
@@ -331,18 +334,23 @@ export async function diffWorkspaceCheckpointUnified(
   for (const rel of requested) {
     const ref = manifest.get(rel);
     const currentPath = path.join(workspace, rel);
+    const currentStat = currentStats.get(rel);
+    if (ref && currentStat) {
+      const currentHash = await hashFileCached(workspace, currentStat.path, currentStat.mtimeMs, currentStat.size);
+      if (currentHash === ref.blobHash) continue;
+    }
+
+    changedFiles.push(rel);
+    if (truncated) continue; // keep enumerating file names; only patch text is capped
     const before = ref ? await fs.readFile(blobPath(workspace, ref.blobHash), "utf8").catch(() => "") : "";
     const after = currentFiles.has(rel) ? await fs.readFile(currentPath, "utf8").catch(() => "") : "";
-    if (before === after) continue;
-
     const patch = unifiedFileDiff(rel, before, after, contextLines);
     if (!patch) continue;
-    changedFiles.push(rel);
     if (size + patch.length > maxChars) {
       const remaining = Math.max(0, maxChars - size);
       if (remaining > 0) parts.push(patch.slice(0, remaining));
       truncated = true;
-      break;
+      continue;
     }
     parts.push(patch);
     size += patch.length;

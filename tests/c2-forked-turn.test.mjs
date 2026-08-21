@@ -10,7 +10,10 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runForkedTurn } from "../packages/core/dist/index.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { openWorkspaceSessionKernel, runForkedTurn } from "../packages/core/dist/index.js";
 
 const WS = process.platform === "win32" ? "D:\\Ares" : "/tmp";
 
@@ -110,4 +113,95 @@ test("C2: result propagates finalText, streamedText, usage, and status", async (
   assert.equal(r.finalText, "the answer");
   assert.equal(r.status, "completed");
   assert.equal(r.usage.outputTokens, 3);
+});
+
+test("C2: an effectful compatibility fork auto-provisions the canonical durable host", async () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "ares-effectful-fork-"));
+  let providerRound = 0;
+  let calls = 0;
+  const provider = {
+    name: "effectful-fork-provider",
+    async *stream() {
+      providerRound += 1;
+      if (providerRound === 1) {
+        yield { type: "tool_use_start", id: "write-1", name: "Mutate" };
+        yield { type: "tool_use_input_done", id: "write-1", input: {} };
+        yield {
+          type: "message_done",
+          message: {
+            id: "effectful-use",
+            role: "assistant",
+            content: [{ type: "tool_use", id: "write-1", name: "Mutate", input: {} }],
+            createdAt: new Date().toISOString(),
+          },
+          usage: { inputTokens: 1, outputTokens: 1 },
+          stopReason: "tool_use",
+        };
+        return;
+      }
+      yield { type: "text_delta", text: "durably done" };
+      yield {
+        type: "message_done",
+        message: {
+          id: "effectful-done",
+          role: "assistant",
+          content: [{ type: "text", text: "durably done" }],
+          createdAt: new Date().toISOString(),
+        },
+        usage: { inputTokens: 2, outputTokens: 2 },
+        stopReason: "end_turn",
+      };
+    },
+  };
+  const tool = {
+    schema: {
+      name: "Mutate",
+      description: "exercise the durable effect boundary",
+      inputJsonSchema: { type: "object", properties: {} },
+      safety: "read-only",
+      concurrency: "exclusive",
+    },
+    // Exercise the harder case: the static schema is inspect-safe, but a valid
+    // input can become effectful and therefore still requires a durable host.
+    mayHaveEffects: true,
+    classifyInput() {
+      return { safety: "workspace-write" };
+    },
+    async call() {
+      calls += 1;
+      return { output: "mutation settled" };
+    },
+  };
+
+  let kernel;
+  try {
+    const result = await runForkedTurn({
+      config: { provider, model: "m", systemPrompt: "s", tools: [tool], workspace, maxTurns: 3 },
+      sessionId: "effectful_compatibility_fork",
+      inputId: "effectful_compatibility_input",
+      seed: { kind: "work-item", text: "perform the requested mutation" },
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.finalText, "durably done");
+    assert.equal(result.history[0].metadata?.source, "work-item");
+    assert.equal(calls, 1);
+
+    const replay = await runForkedTurn({
+      config: { provider, model: "m", systemPrompt: "s", tools: [tool], workspace, maxTurns: 3 },
+      sessionId: "effectful_compatibility_fork",
+      inputId: "effectful_compatibility_input",
+      seed: { kind: "work-item", text: "perform the requested mutation" },
+    });
+    assert.equal(replay.finalText, "durably done");
+    assert.equal(calls, 1, "the settled logical input is not executed again");
+    assert.equal(providerRound, 2, "replay returns canonical history without another provider call");
+
+    kernel = await openWorkspaceSessionKernel(workspace);
+    const runs = kernel.listToolRuns("effectful_compatibility_fork");
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].executionState, "succeeded");
+  } finally {
+    kernel?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });

@@ -43,7 +43,7 @@ function provider(toolName) {
 }
 
 function run(tool, toolName) {
-  const engine = new QueryEngine(
+  const engine = QueryEngine.forTesting(
     { provider: provider(toolName), model: "test", systemPrompt: "t", tools: [tool], workspace: "D:\\Ares", maxTurns: 5 },
     "sess_wd",
   );

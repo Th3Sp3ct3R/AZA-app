@@ -33,14 +33,27 @@ pnpm test          # build + node --test
 
 Install `ares` as a global command so it works from any terminal:
 
-```powershell
-pnpm install:cli   # Windows: builds, adds `ares` to your user PATH (open a new shell)
+```bash
+pnpm build         # the installer refuses to run against an unbuilt CLI
+pnpm install:cli   # Linux/macOS: a launcher in ${XDG_BIN_HOME:-~/.local/bin}
+                   # Windows:     scripts/install.ps1 (adds `ares` to your user PATH)
+pnpm uninstall:cli # symmetric removal
 ```
 
+On Linux and macOS this never runs `sudo` and **does not edit your PATH or your shell
+config** — if the destination is not already on PATH, the installer prints a POSIX
+shell line for you to add yourself. Send it somewhere else with `pnpm install:cli --
+--dir <path>` or `ARES_CLI_BIN_DIR`. Both commands are idempotent, both refuse to
+touch a file at that path they did not create, and uninstall removes the launcher
+*only* — your `~/.ares` config, vault, and sessions are left intact. The launcher
+points at this checkout by absolute path, so re-run the installer if you move it.
+Which platforms this is actually tested on:
+[`docs/PLATFORM-SUPPORT.md`](docs/PLATFORM-SUPPORT.md).
+
 Then `ares` launches the agent anywhere — say **"connect telegram"** and it walks you
-through setup conversationally (no env vars). The desktop `.exe` installer registers the
-same `ares` command automatically using its bundled runtime, so the terminal and UI are
-the same agent over the same encrypted `~/.ares` vault.
+through setup conversationally (no env vars). On Windows the desktop `.exe` installer
+registers the same `ares` command automatically using its bundled runtime, so the
+terminal and UI are the same agent over the same encrypted `~/.ares` vault.
 
 Or run the CLI straight from the workspace (no install; on Windows you can also use `.\ares.bat`):
 
@@ -49,6 +62,8 @@ pnpm ares help                          # list commands
 pnpm ares chat --provider mock          # interactive terminal chat (no API key)
 pnpm ares run --goal "fix failing tests"
 pnpm ares doctor                        # provider/runtime health
+pnpm ares triage scan --deep            # backfill + cluster local reliability failures
+pnpm ares triage list                    # review active reliability candidates
 pnpm ares garrison serve                # start the always-on daemon + gateway
 pnpm ares attach                        # attach a thin client to the gateway
 pnpm ares mind consolidate              # prune, dedupe, crystallize memory
@@ -59,8 +74,20 @@ Desktop shell (optional):
 
 ```bash
 pnpm --filter ares-tauri dev            # run the Tauri app in dev
-pnpm desktop:installer                  # build the .exe (bundles a self-contained
+pnpm desktop:installer                  # build the Windows .exe (bundles a self-contained
                                         # runtime + registers the `ares` CLI on PATH)
+```
+
+`desktop:installer` builds the **Windows NSIS installer only** — that is what
+`tauri.conf.json` pins. Every release also ships Linux `.AppImage` and `.deb`
+artifacts, built by the `release-linux` job in `.github/workflows/release.yml`,
+which passes its own `--bundles appimage,deb` rather than going through this
+script. To produce them locally, after installing the WebKitGTK build
+dependencies that job lists:
+
+```bash
+pnpm --filter ares-tauri build:runtime
+pnpm --filter ares-tauri exec tauri build --bundles appimage,deb
 ```
 
 ## Safety & secrets
@@ -70,6 +97,26 @@ pnpm desktop:installer                  # build the .exe (bundles a self-contain
 - **You are responsible for what you authorize.** Bypass/"unleashed" mode is a loud, audited, opt-in power-user choice. Treat desktop control and real-world connectors accordingly.
 
 See `docs/DEVELOPMENT.md` for the full permission-mode and verification policy.
+
+### Self-triage reliability loop
+
+Ares keeps a local, redacted failure envelope for each completed Core and
+Garrison turn when telemetry is enabled, registers workspace rollouts under the
+active Ares home, and periodically reconciles those records with crash logs.
+The scanner joins both default durable homes (`~/.ares` and the Windows desktop
+home), registered session pointers, the current workspace, and the default
+desktop workspace. For pre-registry sessions in any other workspace, pass
+`--workspaces PATH1;PATH2` on Windows (`:` on POSIX), or persist the same list in
+`ARES_TRIAGE_WORKSPACES`. Stable signatures become durable findings under
+`<ARES_HOME>/triage`; recurrence thresholds keep auth problems, page-state
+misses, and old test pollution out of the product-repair queue.
+
+`ares triage show <id>` resolves the local evidence pointer for review.
+`acknowledge`, `dismiss`, and `resolve` are bookkeeping only: log text is never
+executed and no fixer, shell, model, worktree, commit, or push is launched. The
+repair gate intentionally stays closed until an authenticated, isolated Git
+worktree runner exists. Set `ARES_SELF_TRIAGE=0` to disable automatic scans or
+`ARES_SELF_TRIAGE_INTERVAL_MS` to change the six-hour cadence.
 
 ## Browser & CDP attach
 
@@ -88,16 +135,27 @@ set ARES_BROWSER_CDP_URL=http://127.0.0.1:9222   # Windows (PowerShell: $env:ARE
 export ARES_BROWSER_CDP_URL=http://127.0.0.1:9222 # macOS/Linux
 ```
 
-Launch-strategy order: configured CDP endpoint → opt-in localhost discovery →
+Launch-strategy order: configured CDP endpoint → localhost discovery →
 detected Edge/Chrome exe (persistent `~/.ares` profile) → msedge channel →
 chrome channel → bundled Chromium.
 
 - `ARES_BROWSER_CDP_URL` — explicit endpoint, tried first. If it's unreachable,
   Ares falls back to launching its own browser.
-- `ARES_BROWSER_CDP_DISCOVERY=1` — **opt-in** auto-discovery of a local debugging
-  browser (`127.0.0.1:9222` by default; override with `ARES_BROWSER_CDP_PORTS=9222,9223`).
-  Off by default on purpose: Ares never attaches to a random open browser unless
-  you ask it to.
+- Local CDP discovery is on by default for `127.0.0.1:9222`; set
+  `ARES_BROWSER_CDP_DISCOVERY=0` to disable it, or override probe ports with
+  `ARES_BROWSER_CDP_PORTS=9222,9223`.
+
+Use Browser `handshake` when attachment—not fallback—is required. It probes the
+explicit/discovered CDP endpoint and fails if it cannot attach; it never quietly
+launches a different profile. Chrome 136+ intentionally ignores remote-debugging
+flags against the default Chrome profile, so use Ares's separate persistent
+browser profile. Controlling arbitrary tabs in a normally launched default
+profile requires an explicitly installed extension bridge; Ares does not bypass
+that browser security boundary.
+
+For an opt-in real-browser acceptance pass against Expand Testing's public
+automation practice site, run `ARES_LIVE_BROWSER_HARNESS=1 pnpm test` (PowerShell:
+`$env:ARES_LIVE_BROWSER_HARNESS="1"; pnpm test`).
 
 > ⚠️ **CDP attach gives Ares control of that browser session** — every tab,
 > cookie, and logged-in account in the profile you exposed. Use a dedicated

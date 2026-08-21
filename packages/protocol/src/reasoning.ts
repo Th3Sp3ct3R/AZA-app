@@ -6,9 +6,9 @@
 // and each provider translates it at the wire edge, so the same setting works on
 // OpenAI and Ollama alike.
 
-export type ReasoningLevel = "off" | "low" | "medium" | "high" | "max";
+export type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-export const REASONING_LEVELS: readonly ReasoningLevel[] = ["off", "low", "medium", "high", "max"];
+export const REASONING_LEVELS: readonly ReasoningLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export function isReasoningLevel(value: unknown): value is ReasoningLevel {
   return typeof value === "string" && (REASONING_LEVELS as readonly string[]).includes(value);
@@ -23,31 +23,58 @@ export function reasoningEnabled(level: ReasoningLevel | undefined): level is Re
   return !!level && level !== "off";
 }
 
-/** Human-facing label. "max" reads as "Extra High". */
+/** Human-facing label shared by desktop and terminal surfaces. */
 export function reasoningLabel(level: ReasoningLevel): string {
   if (level === "off") return "Off";
-  return level === "max" ? "Extra High" : level.charAt(0).toUpperCase() + level.slice(1);
+  if (level === "xhigh") return "X-High";
+  return level.charAt(0).toUpperCase() + level.slice(1);
 }
 
 /**
- * OpenAI Responses `reasoning.effort`. The API accepts low | medium | high
- * (newer models also accept "minimal"). There is NO "xhigh" tier — sending one
- * is rejected — so "max" maps to the deepest valid value, "high".
- *
- * "off" returns "low" only for exhaustiveness — callers MUST check
- * reasoningEnabled() first and omit the reasoning field entirely when off.
+ * OpenAI Responses `reasoning.effort`. Current reasoning models accept the
+ * none→xhigh ladder. Ares's UI-only `max` ceiling maps to OpenAI's deepest wire
+ * value (`xhigh`) rather than silently collapsing to `high`.
  */
-export function openAIReasoningEffort(level: ReasoningLevel): "low" | "medium" | "high" {
+export function openAIReasoningEffort(level: ReasoningLevel): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" {
   switch (level) {
     case "off":
+      return "none";
+    case "minimal":
+      return "minimal";
     case "low":
       return "low";
     case "medium":
       return "medium";
     case "high":
-    case "max":
       return "high";
+    case "xhigh":
+    case "max":
+      return "xhigh";
   }
+}
+
+/** Claude Messages `output_config.effort`, model-capability clamped. */
+export function anthropicReasoningEffort(level: ReasoningLevel, model = ""): "low" | "medium" | "high" | "xhigh" | "max" {
+  const supportsXHigh = /(?:fable|mythos)-?5|opus-4-[78]|sonnet-5/i.test(model);
+  switch (level) {
+    case "off":
+    case "minimal":
+    case "low":
+      return "low";
+    case "medium":
+      return "medium";
+    case "high":
+      return "high";
+    case "xhigh":
+      return supportsXHigh ? "xhigh" : "high";
+    case "max":
+      return "max";
+  }
+}
+
+/** DeepSeek V4 exposes only high/max (plus a separate thinking toggle). */
+export function deepSeekReasoningEffort(level: ReasoningLevel): "high" | "max" {
+  return level === "xhigh" || level === "max" ? "max" : "high";
 }
 
 /**
@@ -62,13 +89,17 @@ export function thinkingBudgetTokens(level: ReasoningLevel): number {
   switch (level) {
     case "off":
       return 0;
+    case "minimal":
+      return 1_024;
     case "low":
       return 2_048;
     case "medium":
       return 8_192;
     case "high":
       return 16_384;
-    case "max":
+    case "xhigh":
       return 32_768;
+    case "max":
+      return 65_536;
   }
 }

@@ -45,6 +45,17 @@ jobs:
       - name: Build workspace
         run: pnpm build
 
+      # The gate. CI only runs on push/PR to main, so a tag could previously
+      # ship an installer that CI would have failed. Tests run here too, before
+      # anything is signed or published — a red suite aborts the release.
+      # Lower concurrency than CI on purpose. A handful of tests assert on wall
+      # clock (Bash timeout, scheduler intervals, daemon/garrison boot) and go
+      # flaky under a full 16-way parallel run on a loaded runner — a release
+      # gate that fails at random is a gate people learn to bypass. Raise this
+      # back to the CI default once those assertions no longer race.
+      - name: Test
+        run: node --import ./tests/_isolate-home.mjs --test --test-concurrency=2 tests/*.test.mjs
+
       # Bundle the embedded node + CLI runtime into tauri/src-tauri/runtime/.
       # tauri-build validates this resource path exists at compile time, and the
       # app launches the daemon/Garrison from it.
@@ -63,7 +74,13 @@ jobs:
           projectPath: tauri
           tagName: ${{ github.ref_name }}
           releaseName: "Ares ${{ github.ref_name }}"
-          releaseBody: "Automated release. The desktop app will offer this as an in-app update."
+          releaseBody: |
+            Ares 0.35.0 fixes the two things that got worse the longer you used it: the crash, and background work that never stopped.
+
+            - The Garrison ran out of memory and aborted (exit code 134). Every chat you sent to stayed fully loaded forever - nothing ever released one. Idle chats are now released and reloaded on demand, the daemon watches its own heap and sheds memory before it hits the ceiling, and it writes a crash record on the way down instead of dying silently.
+            - Background jobs no longer outlive their host. Pressing Stop ends the background work that turn started; closing Ares ends all of it; and starting Ares stops anything a previous run - or a crash - left behind. Each is recorded as suspended and resumable, and nothing ever restarts by itself. This is the fix for an app or game relaunching itself every few minutes with nothing on screen to explain it.
+            - You can see them now: a Background panel above the message box lists every job with Stop and Resume, and Ares gained a BackgroundTasks tool so it can list, stop and resume its own work instead of losing track of it.
+            - "The Garrison went down (exit code 134)" used to be followed by four lines of hex addresses. It now names the actual cause and what to do about it.
           releaseDraft: false
           prerelease: false
           args: --bundles nsis
@@ -102,6 +119,15 @@ jobs:
       - name: Build workspace
         run: pnpm build
 
+      # Same gate as the Windows job — this one runs the suite on Linux.
+      # Lower concurrency than CI on purpose. A handful of tests assert on wall
+      # clock (Bash timeout, scheduler intervals, daemon/garrison boot) and go
+      # flaky under a full 16-way parallel run on a loaded runner — a release
+      # gate that fails at random is a gate people learn to bypass. Raise this
+      # back to the CI default once those assertions no longer race.
+      - name: Test
+        run: node --import ./tests/_isolate-home.mjs --test --test-concurrency=2 tests/*.test.mjs
+
       - name: Build embedded runtime
         run: pnpm --filter ares-tauri build:runtime
 
@@ -117,7 +143,13 @@ jobs:
           projectPath: tauri
           tagName: ${{ github.ref_name }}
           releaseName: "Ares ${{ github.ref_name }}"
-          releaseBody: "Automated release. The desktop app will offer this as an in-app update."
+          releaseBody: |
+            Ares 0.35.0 fixes the two things that got worse the longer you used it: the crash, and background work that never stopped.
+
+            - The Garrison ran out of memory and aborted (exit code 134). Every chat you sent to stayed fully loaded forever - nothing ever released one. Idle chats are now released and reloaded on demand, the daemon watches its own heap and sheds memory before it hits the ceiling, and it writes a crash record on the way down instead of dying silently.
+            - Background jobs no longer outlive their host. Pressing Stop ends the background work that turn started; closing Ares ends all of it; and starting Ares stops anything a previous run - or a crash - left behind. Each is recorded as suspended and resumable, and nothing ever restarts by itself. This is the fix for an app or game relaunching itself every few minutes with nothing on screen to explain it.
+            - You can see them now: a Background panel above the message box lists every job with Stop and Resume, and Ares gained a BackgroundTasks tool so it can list, stop and resume its own work instead of losing track of it.
+            - "The Garrison went down (exit code 134)" used to be followed by four lines of hex addresses. It now names the actual cause and what to do about it.
           releaseDraft: false
           prerelease: false
           args: --bundles appimage,deb

@@ -1,56 +1,65 @@
-// secretRedact — a portable, dependency-free scrubber for credential-shaped
+// secretRedact - a portable, dependency-free scrubber for credential-shaped
 // substrings. Used anywhere untrusted or diagnostic text might be persisted
-// or displayed (crash logs, the browser App.tsx error surface, …) so a stray
-// API key or bearer token never survives a copy/paste or a written file.
+// or displayed (crash logs, browser error surfaces, etc.) so a stray API key
+// or bearer token never survives a copy/paste or a written file.
 //
 // Deliberately regex-based and conservative: false positives (over-redacting
 // something that merely looks like a secret) are cheap; false negatives
 // (leaking a real key) are not.
 
 const SECRET_PATTERNS: RegExp[] = [
-  // OpenAI/Anthropic-style API keys: sk-... . Real keys embed hyphens right
-  // after the prefix and inside the body (sk-ant-api03-..., sk-proj-...) — an
-  // alnum-only body (the original pattern) misses BOTH shapes entirely, which
-  // is the single most important key to catch since sk-ant-* is Anthropic's,
-  // Ares's default provider.
+  // OpenAI/Anthropic-style API keys. Real keys embed hyphens after the prefix
+  // and inside the body (sk-ant-api03-..., sk-proj-...).
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-  // HTTP Authorization headers: "Bearer <token>". Bounded to a real token
-  // charset (base64url/JWT-shaped) rather than a greedy \S+ — an unbounded
-  // \S+ consumes trailing JSON punctuation (closing quote/brace/comma) when
-  // the token sits inside a JSON string, corrupting the very crash-log JSONL
-  // this exists to keep parseable.
+  // Stripe secret/restricted keys use underscores rather than `sk-`. Test-mode
+  // keys are credentials too and routinely appear in local diagnostics.
+  /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]{12,}\b/g,
+  // Google API keys (Gemini/Maps/etc.).
+  /\bAIza[0-9A-Za-z_-]{20,}\b/g,
+  // Telegram bot tokens: numeric bot id, colon, then a long base64url secret.
+  /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/g,
+  // Standalone JWTs and other long, multi-segment dotted bearer-style tokens.
+  // Requiring three substantial segments avoids ordinary versions and hosts.
+  /\b[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]{6,}){2,}\b/g,
+  // HTTP Authorization headers. Bound the token to its real character set so
+  // trailing JSON punctuation is not consumed and serialization stays valid.
+  /\b(?:Proxy-)?Authorization\s*:\s*Basic\s+[A-Za-z0-9+/=]{8,}/gi,
   /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi,
+  // Credentials embedded in URL userinfo (https://user:password@host).
+  /\bhttps?:\/\/[^\s/@:]+:[^\s/@]+@/gi,
   // AWS access key IDs.
   /\bAKIA[0-9A-Z]{16}\b/g,
   // GitHub personal access tokens.
   /\bghp_[A-Za-z0-9]{20,}\b/g,
-  // Slack tokens: xoxb-, xoxa-, xoxp-, xoxr-, xoxs-
+  // Slack tokens: xoxb-, xoxa-, xoxp-, xoxr-, xoxs-.
   /\bxox[baprs]-[A-Za-z0-9-]+\b/g,
-  // Generic fallback: a key/token/secret/password/authorization-shaped field
-  // name followed by a long alnum/dash/underscore value — catches anything
-  // the named patterns above miss (custom provider keys, etc.). Allows an
-  // optional quote between the field name and the delimiter (["']?  before
-  // \s*[:=]) since crashLog.ts's primary caller feeds this JSON.stringify'd
-  // text, where every key is quoted ("token":"..."), not bare (token: "...").
-  /\b(api[_-]?key|token|secret|password|authorization)\b["']?\s*[:=]\s*["']?([A-Za-z0-9_-]{20,})["']?/gi,
 ];
+
+// Generic credential-shaped fields need special handling: crashLog serializes
+// an object to JSON *before* redaction, so replacing the whole `"token":"..."`
+// match would remove structural quotes and corrupt the JSONL. These expressions
+// capture the key/delimiter prefix and replace only the value, retaining its
+// original quote style. Quoted values intentionally accept punctuation, spaces,
+// and escaped characters; provider/OAuth tokens are not reliably alphanumeric.
+const DOUBLE_QUOTED_SECRET_FIELD =
+  /(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|client[_-]?secret|private[_-]?key|secret|password|passphrase|authorization|credential|cookie)\b["']?\s*[:=]\s*)"(?:\\.|[^"\\])*"/gi;
+const SINGLE_QUOTED_SECRET_FIELD =
+  /(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|client[_-]?secret|private[_-]?key|secret|password|passphrase|authorization|credential|cookie)\b["']?\s*[:=]\s*)'(?:\\.|[^'\\])*'/gi;
+const UNQUOTED_SECRET_FIELD =
+  /(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|client[_-]?secret|private[_-]?key|secret|password|passphrase|authorization|credential|cookie)\b["']?\s*[:=]\s*)([A-Za-z0-9._~+/=-]{6,})/gi;
 
 /**
  * Replace anything that looks like a credential in `text` with `[REDACTED]`.
- * Safe to call on arbitrary/untrusted strings — never throws.
+ * Safe to call on arbitrary/untrusted strings - never throws.
  */
 export function redactSecrets(text: string): string {
   if (!text) return text;
   let out = text;
   for (const pattern of SECRET_PATTERNS) {
-    out = out.replace(pattern, (match, ...groups) => {
-      // The generic field-name pattern has capture groups; keep the field
-      // name for readability and only blank the value.
-      if (groups.length >= 2 && typeof groups[0] === "string" && typeof groups[1] === "string") {
-        return `${groups[0]}: [REDACTED]`;
-      }
-      return "[REDACTED]";
-    });
+    out = out.replace(pattern, "[REDACTED]");
   }
+  out = out.replace(DOUBLE_QUOTED_SECRET_FIELD, (_match, prefix: string) => `${prefix}"[REDACTED]"`);
+  out = out.replace(SINGLE_QUOTED_SECRET_FIELD, (_match, prefix: string) => `${prefix}'[REDACTED]'`);
+  out = out.replace(UNQUOTED_SECRET_FIELD, (_match, prefix: string) => `${prefix}[REDACTED]`);
   return out;
 }
