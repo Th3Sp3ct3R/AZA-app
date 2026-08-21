@@ -76,6 +76,7 @@
         "transparent": false,
         "shadow": true
       }
-    ]
+    ],
+    "macOSPrivateApi": true
   }
 }
